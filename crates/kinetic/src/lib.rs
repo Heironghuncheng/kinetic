@@ -300,6 +300,34 @@ impl Model {
         Ok(text.model.run(&mut state, &ids, false).logits)
     }
 
+    /// The model's raw logits after every token of `tokens`: one
+    /// [`n_vocab`](Model::n_vocab) row per token, exactly the scores plain
+    /// decoding sees at each position, before any sampler. Score a token
+    /// sequence by summing, for every `tokens[i + 1]`, its log-softmax
+    /// under row `i`; the first row scores a token of your own.
+    ///
+    /// An embedding model has no logits; use [`embed`](Model::embed).
+    pub fn logits_rows(&self, tokens: &[u32]) -> Result<Vec<Vec<f32>>, Error> {
+        let text = self.as_text()?;
+        if tokens.is_empty() {
+            return Err("the tokens are empty".into());
+        }
+        if let Some(limit) = self.context_length() {
+            if tokens.len() > limit {
+                return Err(format!(
+                    "the tokens are {} long, over the {}-token context",
+                    tokens.len(),
+                    limit
+                )
+                .into());
+            }
+        }
+        let vocab = text.model.n_vocab();
+        let mut state = text.model.new_state();
+        let logits = text.model.run(&mut state, tokens, true).logits;
+        Ok(logits.chunks(vocab).map(<[f32]>::to_vec).collect())
+    }
+
     /// The text model, or the error an embedding model's callers get.
     fn as_text(&self) -> Result<&Text, Error> {
         match &*self.kind {

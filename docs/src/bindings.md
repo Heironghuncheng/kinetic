@@ -42,6 +42,7 @@ vectors = embedder.embed(["a cat", "a dog"])
 | `model.chat(messages, max_tokens=None, temperature=None, seed=None, stream=False)` | answers a list of `{"role": ..., "content": ...}` dicts; returns the text, or an iterator of pieces with `stream=True` |
 | `model.generate(prompt, max_tokens=None, temperature=None, seed=None, stream=False)` | continues `prompt` exactly as written, without the chat template |
 | `model.logits(prompt)` | the raw scores after `prompt`, one per vocabulary entry (`model.n_vocab` of them), before any sampler; the argmax is greedy decoding's next token |
+| `model.logits_rows(tokens)` | the raw scores after every token of `tokens`, one row per token: score a sequence by reading `tokens[i + 1]` under row `i` |
 | `model.embed(texts)` | one vector (a list of floats) per text, from an embedding model |
 | `kinetic.__version__` | the version, such as `"0.1.0"` |
 
@@ -190,8 +191,9 @@ fn main() -> Result<(), kinetic::Error> {
 `model.request()` starts from the file's recommended sampling; change its
 `sampling` (temperature, top-k, top-p, seed and the rest) and `max_tokens`
 fields before passing it. `generate` continues a raw prompt, `logits`
-returns the raw next-token scores and `embed` returns vectors from an
-embedding model. The `cuda` feature is on by
+returns the raw next-token scores, `logits_rows` the scores after every
+token of a sequence, and `embed` returns vectors from an embedding model.
+The `cuda` feature is on by
 default; `default-features = false` builds a CPU-only library.
 
 The crates below `kinetic` (`kinetic-models`, `kinetic-server` and the

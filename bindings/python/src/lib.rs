@@ -257,6 +257,13 @@ impl Model {
             .map_err(runtime_error)
     }
 
+    /// The raw logits after every token of `tokens`, one row per token:
+    /// score a sequence by reading `tokens[i + 1]` under row `i`.
+    fn logits_rows(&self, py: Python<'_>, tokens: Vec<u32>) -> PyResult<Vec<Vec<f32>>> {
+        py.allow_threads(|| self.inner.logits_rows(&tokens))
+            .map_err(runtime_error)
+    }
+
     fn __repr__(&self) -> String {
         format!("kinetic.Model({:?})", self.inner.name())
     }

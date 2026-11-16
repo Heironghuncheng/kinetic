@@ -90,7 +90,39 @@ fn logits_are_plain_decodings_next_token_scores() {
     assert!(model.logits("").is_err());
 }
 
-#[ignore = "needs KINETIC_TEST_EMBED_GGUF"]
+#[test]
+#[ignore = "needs KINETIC_TEST_GGUF"]
+fn logits_rows_score_every_position() {
+    let model = text_model();
+    let ids: Vec<u32> = (0..24u32).map(|i| 100 + i * 37).collect();
+    let rows = model.logits_rows(&ids).unwrap();
+    let n = model.n_vocab().unwrap();
+    assert_eq!(rows.len(), ids.len());
+    assert!(rows.iter().all(|r| r.len() == n));
+    assert!(rows.iter().all(|r| r.iter().all(|v| v.is_finite())));
+    // Reruns give the same bits.
+    assert_eq!(rows, model.logits_rows(&ids).unwrap());
+    // The last row is what logits gives for the same tokens, where the
+    // model adds no BOS of its own and the tokenizations then agree.
+    if model.special_tokens().0.is_none() {
+        let prompt = "Once upon a time";
+        let ids = model.tokenize(prompt, true);
+        assert_eq!(
+            model.logits_rows(&ids).unwrap().last().unwrap(),
+            &model.logits(prompt).unwrap()
+        );
+    }
+    // A sequence scores token by token: tokens[i + 1] under row i.
+    let logp = |row: &[f32], tok: u32| {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f64 = row.iter().map(|&l| f64::from(l - max).exp()).sum();
+        f64::from(row[tok as usize] - max) - sum.ln()
+    };
+    let score: f64 = (0..ids.len() - 1).map(|i| logp(&rows[i], ids[i + 1])).sum();
+    assert!(score.is_finite() && score < 0.0);
+    // An empty sequence is an error.
+    assert!(model.logits_rows(&[]).is_err());
+}
 fn an_embedding_model_has_no_logits() {
     let path = std::env::var("KINETIC_TEST_EMBED_GGUF").expect("set KINETIC_TEST_EMBED_GGUF");
     let model = Model::open(path).unwrap();
