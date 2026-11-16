@@ -36,6 +36,14 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   CUDA_ERROR_STREAM_CAPTURE_IMPLICIT. The zeros are queued on the model's
   own stream now, and a test builds recurrent state while a graph records.
 
+### Rust, C and Python API
+
+- `model.logits(prompt)` and `model.logits_chat(messages)` in the Rust
+  crate return the raw full-vocabulary logits of the next token, exactly
+  as plain decoding scores it; `model.n_vocab()` is how many values they
+  hold. The C API gains `kinetic_logits` and `kinetic_vocab_size`, and
+  Python `Model.logits` and `Model.n_vocab`.
+
 ### Models
 
 - Gemma 4 (`gemma4`) on the CPU and CUDA, with images through its `gemma4v`

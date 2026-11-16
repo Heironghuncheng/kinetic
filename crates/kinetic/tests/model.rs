@@ -60,6 +60,46 @@ fn generation_stops_when_asked() {
 }
 
 #[test]
+#[ignore = "needs KINETIC_TEST_GGUF"]
+fn logits_are_plain_decodings_next_token_scores() {
+    let model = text_model();
+    let prompt = "Once upon a time";
+    let logits = model.logits(prompt).unwrap();
+    let n = model.n_vocab().unwrap();
+    assert_eq!(logits.len(), n);
+    assert!(logits.iter().all(|v| v.is_finite()));
+    // Reruns give the same bits.
+    assert_eq!(logits, model.logits(prompt).unwrap());
+    // The argmax, ties to the lower token, is what greedy decoding picks.
+    let argmax = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1).then(a.0.cmp(&b.0)))
+        .unwrap()
+        .0 as u32;
+    let mut request = model.request();
+    request.sampling.temperature = 0.0;
+    request.max_tokens = Some(1);
+    let answer = model.generate(prompt, &request, &mut |_| true).unwrap();
+    assert_eq!(answer.output_ids[0], argmax);
+    // A chat prompt works too, through the model's own template.
+    let messages = [Message::new("user", "What is the capital of France?")];
+    assert_eq!(model.logits_chat(&messages).unwrap().len(), n);
+    // An embedding model has no logits, and an empty prompt is an error.
+    assert!(model.embed(&[""]).is_err());
+    assert!(model.logits("").is_err());
+}
+
+#[ignore = "needs KINETIC_TEST_EMBED_GGUF"]
+fn an_embedding_model_has_no_logits() {
+    let path = std::env::var("KINETIC_TEST_EMBED_GGUF").expect("set KINETIC_TEST_EMBED_GGUF");
+    let model = Model::open(path).unwrap();
+    assert!(model.n_vocab().is_none());
+    let err = model.logits("a cat").err().unwrap();
+    assert!(err.to_string().contains("embedding"), "{err}");
+}
+
+#[test]
 #[ignore = "needs KINETIC_TEST_EMBED_GGUF"]
 fn embeddings_have_the_model_width() {
     let path = std::env::var("KINETIC_TEST_EMBED_GGUF").expect("set KINETIC_TEST_EMBED_GGUF");

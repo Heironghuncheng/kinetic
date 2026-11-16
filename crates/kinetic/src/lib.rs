@@ -2,8 +2,9 @@
 //!
 //! [`Model::open`] loads a `.gguf` or `.ktc` file. A text model then
 //! [generates](Model::generate) after a raw prompt or [chats](Model::chat)
-//! through its own chat template; an embedding model [embeds](Model::embed)
-//! texts. Everything runs on this computer: a text model on the GPU when
+//! through its own chat template, and exposes the raw
+//! [logits](Model::logits) of the next token; an embedding model
+//! [embeds](Model::embed) texts. Everything runs on this computer: a text model on the GPU when
 //! the `cuda` feature is on and the model fits in its memory, otherwise on
 //! the CPU.
 //!
@@ -258,6 +259,82 @@ impl Model {
             .collect::<Result<Vec<_>, Error>>()?;
         let refs: Vec<&[u32]> = inputs.iter().map(Vec::as_slice).collect();
         Ok(e.embedder.embed(&refs))
+    }
+
+    /// How many values [`logits`](Model::logits) returns: the vocabulary
+    /// size. `None` for an embedding model.
+    pub fn n_vocab(&self) -> Option<usize> {
+        Some(self.as_text().ok()?.model.n_vocab())
+    }
+
+    /// The model's raw logits after `prompt`: one value per vocabulary
+    /// entry, exactly the scores plain decoding's sampler would see, before
+    /// any sampler. The argmax is what greedy decoding (`temperature` 0)
+    /// picks.
+    ///
+    /// `prompt` continues exactly as [`generate`](Model::generate) takes
+    /// it, with no chat template;
+    /// [`logits_chat`](Model::logits_chat) renders messages through the
+    /// template first. An embedding model has no logits; use
+    /// [`embed`](Model::embed).
+    pub fn logits(&self, prompt: &str) -> Result<Vec<f32>, Error> {
+        let text = self.as_text()?;
+        let ids = self.encode_prompt(prompt)?;
+        let mut state = text.model.new_state();
+        Ok(text.model.run(&mut state, &ids, false).logits)
+    }
+
+    /// [`Model::logits`] after `messages` rendered through the model's own
+    /// chat template, the generation prompt included.
+    pub fn logits_chat(&self, messages: &[Message]) -> Result<Vec<f32>, Error> {
+        let text = self.as_text()?;
+        let prompt = text.engine.chat_prompt(
+            &messages
+                .iter()
+                .map(|m| json!({"role": m.role, "content": m.content}))
+                .collect::<Vec<_>>(),
+            &Map::new(),
+        )?;
+        let ids = self.encode_prompt(&prompt.text)?;
+        let mut state = text.model.new_state();
+        Ok(text.model.run(&mut state, &ids, false).logits)
+    }
+
+    /// The text model, or the error an embedding model's callers get.
+    fn as_text(&self) -> Result<&Text, Error> {
+        match &*self.kind {
+            Kind::Text(text) => Ok(text),
+            Kind::Embedding(_) => {
+                Err(format!("{} is an embedding model; use embed", self.name).into())
+            }
+        }
+    }
+
+    /// Encodes a prompt the way generation does: special tokens written in
+    /// the text become their ids, and a template that writes BOS itself is
+    /// not doubled.
+    fn encode_prompt(&self, text: &str) -> Result<Vec<u32>, Error> {
+        let mut ids = self.tokenize(text, true);
+        let (bos, _) = self.special_tokens();
+        if let Some(bos) = bos {
+            if ids.len() > 1 && ids[0] == ids[1] && ids[0] == bos {
+                ids.remove(0);
+            }
+        }
+        if ids.is_empty() {
+            return Err("the prompt is empty".into());
+        }
+        if let Some(limit) = self.context_length() {
+            if ids.len() > limit {
+                return Err(format!(
+                    "the prompt is {} tokens, over the {}-token context",
+                    ids.len(),
+                    limit
+                )
+                .into());
+            }
+        }
+        Ok(ids)
     }
 
     fn engine(&self) -> Result<&Engine<'static>, Error> {

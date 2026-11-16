@@ -120,6 +120,13 @@ impl Model {
         self.inner.is_embedding()
     }
 
+    /// How many values `logits` returns: the vocabulary size. `None` for an
+    /// embedding model.
+    #[getter]
+    fn n_vocab(&self) -> Option<usize> {
+        self.inner.n_vocab()
+    }
+
     /// The beginning-of-sequence token id, if the model has one.
     #[getter]
     fn bos(&self) -> Option<u32> {
@@ -239,6 +246,14 @@ impl Model {
     fn embed(&self, py: Python<'_>, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
         let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
         py.allow_threads(|| self.inner.embed(&texts))
+            .map_err(runtime_error)
+    }
+
+    /// The model's raw logits after `prompt`: one value per vocabulary
+    /// entry, the scores before any sampler. The argmax is what greedy
+    /// decoding (`temperature` 0) picks.
+    fn logits(&self, py: Python<'_>, prompt: String) -> PyResult<Vec<f32>> {
+        py.allow_threads(|| self.inner.logits(&prompt))
             .map_err(runtime_error)
     }
 

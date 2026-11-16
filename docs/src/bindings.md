@@ -41,6 +41,7 @@ vectors = embedder.embed(["a cat", "a dog"])
 | `model.name` | the file name without its extension |
 | `model.chat(messages, max_tokens=None, temperature=None, seed=None, stream=False)` | answers a list of `{"role": ..., "content": ...}` dicts; returns the text, or an iterator of pieces with `stream=True` |
 | `model.generate(prompt, max_tokens=None, temperature=None, seed=None, stream=False)` | continues `prompt` exactly as written, without the chat template |
+| `model.logits(prompt)` | the raw scores after `prompt`, one per vocabulary entry (`model.n_vocab` of them), before any sampler; the argmax is greedy decoding's next token |
 | `model.embed(texts)` | one vector (a list of floats) per text, from an embedding model |
 | `kinetic.__version__` | the version, such as `"0.1.0"` |
 
@@ -154,6 +155,7 @@ documents every function:
 | `kinetic_session_generate(session, message, params, on_text, user_data)` | adds a user message, streams the answer to `on_text` (return `false` to stop) and adds it to the conversation; returns the number of tokens, or -1 |
 | `kinetic_params_default()` | no token limit, the model's temperature, no seed |
 | `kinetic_embedding_size(model)`, `kinetic_embed(model, text, out)` | vectors from an embedding model |
+| `kinetic_vocab_size(model)`, `kinetic_logits(model, text, out)` | the raw scores after `text`, one per vocabulary entry, before any sampler |
 | `kinetic_last_error()` | why the last failing call on this thread failed |
 | `kinetic_session_free`, `kinetic_model_free` | free them; a model is freed once its sessions are |
 
@@ -187,8 +189,9 @@ fn main() -> Result<(), kinetic::Error> {
 
 `model.request()` starts from the file's recommended sampling; change its
 `sampling` (temperature, top-k, top-p, seed and the rest) and `max_tokens`
-fields before passing it. `generate` continues a raw prompt and `embed`
-returns vectors from an embedding model. The `cuda` feature is on by
+fields before passing it. `generate` continues a raw prompt, `logits`
+returns the raw next-token scores and `embed` returns vectors from an
+embedding model. The `cuda` feature is on by
 default; `default-features = false` builds a CPU-only library.
 
 The crates below `kinetic` (`kinetic-models`, `kinetic-server` and the
