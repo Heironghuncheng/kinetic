@@ -299,18 +299,30 @@ impl Model {
         Ok(engine.logits(&ids, false)?)
     }
 
-    /// The model's raw logits after every token of `tokens`: one
-    /// [`n_vocab`](Model::n_vocab) row per token, exactly the scores plain
-    /// decoding sees at each position, before any sampler, from the backend
-    /// a request for them would use. Score a token sequence by summing,
-    /// for every `tokens[i + 1]`, its log-softmax under row `i`; the first
-    /// row scores a token of your own.
+    /// The model's raw logits after every token of `tokens`, as one flat
+    /// row-major buffer of `tokens.len() *`
+    /// [`n_vocab`](Model::n_vocab) values: row `i`, the `n_vocab` values
+    /// at `i * n_vocab`, scores the token after `tokens[i]`. Score a token
+    /// sequence by summing, for every `i < n - 1`, the log-softmax of
+    /// `tokens[i + 1]` under row `i`; the first row scores a token of your
+    /// own.
+    ///
+    /// One row per token means the buffer holds `tokens.len() * n_vocab`
+    /// floats — about 1 GB per thousand tokens at a 250,000-entry
+    /// vocabulary — so score long texts in chunks, as `kinetic perplexity`
+    /// does.
     ///
     /// An embedding model has no logits; use [`embed`](Model::embed).
-    pub fn logits_rows(&self, tokens: &[u32]) -> Result<Vec<Vec<f32>>, Error> {
+    pub fn logits_rows(&self, tokens: &[u32]) -> Result<Vec<f32>, Error> {
         let text = self.as_text()?;
         if tokens.is_empty() {
             return Err("the tokens are empty".into());
+        }
+        let vocab = text.model.n_vocab();
+        if let Some(&id) = tokens.iter().find(|&&t| t as usize >= vocab) {
+            return Err(
+                format!("token {id} is past the vocabulary, which has {vocab} entries").into(),
+            );
         }
         if let Some(limit) = self.context_length() {
             if tokens.len() > limit {
@@ -322,9 +334,7 @@ impl Model {
                 .into());
             }
         }
-        let vocab = text.model.n_vocab();
-        let flat = text.engine.logits(tokens, true)?;
-        Ok(flat.chunks(vocab).map(<[f32]>::to_vec).collect())
+        Ok(text.engine.logits(tokens, true)?)
     }
 
     /// The text model, or the error an embedding model's callers get.

@@ -257,11 +257,18 @@ impl Model {
             .map_err(runtime_error)
     }
 
-    /// The raw logits after every token of `tokens`, one row per token:
-    /// score a sequence by reading `tokens[i + 1]` under row `i`.
-    fn logits_rows(&self, py: Python<'_>, tokens: Vec<u32>) -> PyResult<Vec<Vec<f32>>> {
-        py.allow_threads(|| self.inner.logits_rows(&tokens))
-            .map_err(runtime_error)
+    /// The raw logits after every token of `tokens`, as bytes:
+    /// little-endian float32, row-major, `n_vocab` values per token, so
+    /// row `i` starts at `i * n_vocab * 4`. Read them, for example, with
+    /// numpy as
+    /// `np.frombuffer(b, dtype="<f4").reshape(len(tokens), model.n_vocab)`.
+    fn logits_rows<'py>(&self, py: Python<'py>, tokens: Vec<u32>) -> PyResult<Bound<'py, PyBytes>> {
+        let flat = py
+            .allow_threads(|| self.inner.logits_rows(&tokens))
+            .map_err(runtime_error)?;
+        let mut bytes = Vec::with_capacity(flat.len() * 4);
+        bytes.extend(flat.iter().flat_map(|v| v.to_le_bytes()));
+        Ok(PyBytes::new_bound(py, &bytes))
     }
 
     fn __repr__(&self) -> String {

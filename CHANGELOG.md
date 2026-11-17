@@ -45,8 +45,10 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   they hold. The C API gains `kinetic_logits` and `kinetic_vocab_size`,
   and Python `Model.logits` and `Model.n_vocab`.
 - `model.logits_rows(tokens)` returns the raw logits after every token of
-  a token sequence, one row per token, so sequences can be scored token
-  by token as perplexity does.
+  a token sequence as one flat row-major buffer, one `n_vocab`-value row
+  per token, with token ids past the vocabulary rejected; Python returns
+  it as little-endian float32 bytes, so sequences can be scored token by
+  token as perplexity does.
 
 ### Models
 

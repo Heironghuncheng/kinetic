@@ -42,7 +42,7 @@ vectors = embedder.embed(["a cat", "a dog"])
 | `model.chat(messages, max_tokens=None, temperature=None, seed=None, stream=False)` | answers a list of `{"role": ..., "content": ...}` dicts; returns the text, or an iterator of pieces with `stream=True` |
 | `model.generate(prompt, max_tokens=None, temperature=None, seed=None, stream=False)` | continues `prompt` exactly as written, without the chat template |
 | `model.logits(prompt)` | the raw scores after `prompt`, one per vocabulary entry (`model.n_vocab` of them), before any sampler; the argmax is greedy decoding's next token |
-| `model.logits_rows(tokens)` | the raw scores after every token of `tokens`, one row per token: score a sequence by reading `tokens[i + 1]` under row `i` |
+| `model.logits_rows(tokens)` | the raw scores after every token of `tokens`, as bytes: little-endian float32, row-major, `n_vocab` values per token — read with `np.frombuffer(b, dtype="<f4").reshape(len(tokens), model.n_vocab)` |
 | `model.embed(texts)` | one vector (a list of floats) per text, from an embedding model |
 | `kinetic.__version__` | the version, such as `"0.1.0"` |
 
@@ -195,6 +195,10 @@ returns the raw next-token scores, `logits_rows` the scores after every
 token of a sequence, and `embed` returns vectors from an embedding model.
 The `cuda` feature is on by
 default; `default-features = false` builds a CPU-only library.
+
+`logits_rows` holds one row per token, `tokens.len() * n_vocab` floats —
+about 1 GB per thousand tokens at a 250,000-entry vocabulary — so score
+long texts in chunks, as `kinetic perplexity` does.
 
 The crates below `kinetic` (`kinetic-models`, `kinetic-server` and the
 others) are the engine itself. Their APIs are public so that the tools in
