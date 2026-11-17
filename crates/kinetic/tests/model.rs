@@ -85,8 +85,7 @@ fn logits_are_plain_decodings_next_token_scores() {
     // A chat prompt works too, through the model's own template.
     let messages = [Message::new("user", "What is the capital of France?")];
     assert_eq!(model.logits_chat(&messages).unwrap().len(), n);
-    // An embedding model has no logits, and an empty prompt is an error.
-    assert!(model.embed(&[""]).is_err());
+    // An empty prompt is an error.
     assert!(model.logits("").is_err());
 }
 
@@ -126,6 +125,9 @@ fn logits_rows_score_every_position() {
     let err = model.logits_rows(&[u32::MAX]).err().unwrap();
     assert!(err.to_string().contains("past the vocabulary"), "{err}");
 }
+
+#[test]
+#[ignore = "needs KINETIC_TEST_EMBED_GGUF"]
 fn an_embedding_model_has_no_logits() {
     let path = std::env::var("KINETIC_TEST_EMBED_GGUF").expect("set KINETIC_TEST_EMBED_GGUF");
     let model = Model::open(path).unwrap();
