@@ -269,8 +269,9 @@ impl Model {
 
     /// The model's raw logits after `prompt`: one value per vocabulary
     /// entry, exactly the scores plain decoding's sampler would see, before
-    /// any sampler. The argmax is what greedy decoding (`temperature` 0)
-    /// picks.
+    /// any sampler, from the backend a request for them would use, so they
+    /// are that device's own. The argmax is what greedy decoding
+    /// (`temperature` 0) picks.
     ///
     /// `prompt` continues exactly as [`generate`](Model::generate) takes
     /// it, with no chat template;
@@ -278,17 +279,16 @@ impl Model {
     /// template first. An embedding model has no logits; use
     /// [`embed`](Model::embed).
     pub fn logits(&self, prompt: &str) -> Result<Vec<f32>, Error> {
-        let text = self.as_text()?;
+        self.engine()?;
         let ids = self.encode_prompt(prompt)?;
-        let mut state = text.model.new_state();
-        Ok(text.model.run(&mut state, &ids, false).logits)
+        Ok(self.engine()?.logits(&ids, false)?)
     }
 
     /// [`Model::logits`] after `messages` rendered through the model's own
     /// chat template, the generation prompt included.
     pub fn logits_chat(&self, messages: &[Message]) -> Result<Vec<f32>, Error> {
-        let text = self.as_text()?;
-        let prompt = text.engine.chat_prompt(
+        let engine = self.engine()?;
+        let prompt = engine.chat_prompt(
             &messages
                 .iter()
                 .map(|m| json!({"role": m.role, "content": m.content}))
@@ -296,15 +296,15 @@ impl Model {
             &Map::new(),
         )?;
         let ids = self.encode_prompt(&prompt.text)?;
-        let mut state = text.model.new_state();
-        Ok(text.model.run(&mut state, &ids, false).logits)
+        Ok(engine.logits(&ids, false)?)
     }
 
     /// The model's raw logits after every token of `tokens`: one
     /// [`n_vocab`](Model::n_vocab) row per token, exactly the scores plain
-    /// decoding sees at each position, before any sampler. Score a token
-    /// sequence by summing, for every `tokens[i + 1]`, its log-softmax
-    /// under row `i`; the first row scores a token of your own.
+    /// decoding sees at each position, before any sampler, from the backend
+    /// a request for them would use. Score a token sequence by summing,
+    /// for every `tokens[i + 1]`, its log-softmax under row `i`; the first
+    /// row scores a token of your own.
     ///
     /// An embedding model has no logits; use [`embed`](Model::embed).
     pub fn logits_rows(&self, tokens: &[u32]) -> Result<Vec<Vec<f32>>, Error> {
@@ -323,9 +323,8 @@ impl Model {
             }
         }
         let vocab = text.model.n_vocab();
-        let mut state = text.model.new_state();
-        let logits = text.model.run(&mut state, tokens, true).logits;
-        Ok(logits.chunks(vocab).map(<[f32]>::to_vec).collect())
+        let flat = text.engine.logits(tokens, true)?;
+        Ok(flat.chunks(vocab).map(<[f32]>::to_vec).collect())
     }
 
     /// The text model, or the error an embedding model's callers get.
