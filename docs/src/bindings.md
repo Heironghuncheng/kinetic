@@ -41,7 +41,7 @@ vectors = embedder.embed(["a cat", "a dog"])
 | `model.name` | the file name without its extension |
 | `model.chat(messages, max_tokens=None, temperature=None, seed=None, stream=False)` | answers a list of `{"role": ..., "content": ...}` dicts; returns the text, or an iterator of pieces with `stream=True` |
 | `model.generate(prompt, max_tokens=None, temperature=None, seed=None, stream=False)` | continues `prompt` exactly as written, without the chat template |
-| `model.logits(prompt)` | the raw scores after `prompt`, one per vocabulary entry (`model.n_vocab` of them), before any sampler; the argmax is greedy decoding's next token |
+| `model.logits(prompt)` | the raw scores after `prompt`, one per vocabulary entry (`model.n_vocab` of them), before any sampler; the argmax is greedy decoding's next token unless the top two sit within the head kernels' rounding of each other, in which case they may differ — each is exact for its own kernel |
 | `model.logits_rows(tokens)` | the raw scores after every token of `tokens`, as bytes: little-endian float32, row-major, `n_vocab` values per token — read with `np.frombuffer(b, dtype="<f4").reshape(len(tokens), model.n_vocab)` |
 | `model.embed(texts)` | one vector (a list of floats) per text, from an embedding model |
 | `kinetic.__version__` | the version, such as `"0.1.0"` |

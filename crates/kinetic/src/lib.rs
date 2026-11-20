@@ -270,8 +270,11 @@ impl Model {
     /// The model's raw logits after `prompt`: one value per vocabulary
     /// entry, exactly the scores plain decoding's sampler would see, before
     /// any sampler, from the backend a request for them would use, so they
-    /// are that device's own. The argmax is what greedy decoding
-    /// (`temperature` 0) picks.
+    /// are that device's own. Greedy decoding (`temperature` 0) picks
+    /// through a fused top-1 on the device and this row comes from the
+    /// head read; when the top two scores sit within the rounding of the
+    /// two, the argmax and greedy's pick can differ — each is exact for
+    /// its own kernel.
     ///
     /// `prompt` continues exactly as [`generate`](Model::generate) takes
     /// it, with no chat template;
