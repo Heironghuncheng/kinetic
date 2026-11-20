@@ -225,6 +225,12 @@ impl Kernels {
         self.attn_flash.is_some() || !self.tensor_cores
     }
 
+    /// Whether the device has the tensor-core instructions the kernels use;
+    /// see [`DeviceInfo::tensor_cores`](crate::DeviceInfo::tensor_cores).
+    pub fn tensor_cores(&self) -> bool {
+        self.tensor_cores
+    }
+
     /// Whether the products of large batches multiply in f16 pairs: on
     /// devices without tensor cores, where the binary that runs is for sm_60
     /// or sm_70, whose f16 arithmetic is twice as fast as f32. They are then
