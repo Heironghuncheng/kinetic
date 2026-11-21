@@ -9,7 +9,9 @@
 
 use half::f16;
 use kinetic_gguf::{Gguf, TensorInfo, TensorOut, TensorSource, TensorType, Value};
-use kinetic_models::cuda::{CudaModel, CudaState, Placement, Run};
+use std::cell::Cell;
+
+use kinetic_models::cuda::{CudaModel, CudaRunner, CudaState, Placement, Run};
 use kinetic_models::speculative::{Decoder, Greedy, Lookup, Policy};
 
 struct Memory {
@@ -404,13 +406,15 @@ fn greedy_tokens_match_the_cpu(gpu: &CudaModel, model: &kinetic_models::Model) {
     }
     assert_eq!(got, want);
 }
-fn exactness(gpu: &CudaModel, model: &kinetic_models::Model) {
+fn exactness<'m>(gpu: &CudaModel<'m>, model: &kinetic_models::Model<'m>) {
     a_batch_matches_token_by_token(gpu);
     rollback_leaves_the_state_as_if_never_run(gpu);
     a_host_copy_restores_the_state(gpu, model);
     a_reset_state_is_a_fresh_one(gpu);
     shared_passes_match_running_alone(gpu);
     speculative_greedy_is_plain_greedy(gpu);
+    prompt_cuts_change_no_bit(gpu);
+    truncating_to_a_mark_matches_stopping_there(gpu, model);
 }
 
 /// The GPU's logits after every token of a prompt and of single steps are
@@ -560,4 +564,48 @@ fn speculative_greedy_is_plain_greedy(gpu: &CudaModel) {
         decoder.step(gpu, &mut Greedy, &mut state, &mut context, limit, |_| false);
     }
     assert_eq!(context.split_off(prompt.len()), want);
+}
+
+/// A prompt long enough to run in prefill passes gives the same bits cut
+/// anywhere on the prefill grid.
+fn prompt_cuts_change_no_bit(gpu: &CudaModel) {
+    let prompt: Vec<u32> = (0..96).map(|i| (i * 7 % 59) as u32).collect();
+    let run = |cuts: &[usize]| {
+        let mut state = gpu.new_state().unwrap();
+        let (mut hidden, mut logits) = (Vec::new(), Vec::new());
+        for part in cuts.windows(2) {
+            let out = gpu
+                .run(&mut state, &prompt[part[0]..part[1]], false)
+                .unwrap();
+            hidden.extend(bits(&out.hidden));
+            logits = bits(&out.logits);
+        }
+        (hidden, logits)
+    };
+    assert!(run(&[0, 96]) == run(&[0, 32, 64, 96]));
+}
+
+/// A state cut back to a mark, as the server cuts a conversation it
+/// continues differently, gives what a state that stopped there gives.
+fn truncating_to_a_mark_matches_stopping_there<'m>(
+    gpu: &CudaModel<'m>,
+    model: &kinetic_models::Model<'m>,
+) {
+    use kinetic_models::warm::Runner;
+    let runner = CudaRunner {
+        gpu,
+        model,
+        spare: Cell::new(None),
+    };
+    let mut state = gpu.new_state().unwrap();
+    gpu.run(&mut state, &PROMPT[..8], false).unwrap();
+    runner.mark(&mut state);
+    gpu.run(&mut state, &PROMPT[8..], false).unwrap();
+    assert_eq!(gpu.truncate(model, &mut state, 8).unwrap(), 8);
+    let got = gpu.run(&mut state, &NEXT, true).unwrap().logits;
+
+    let mut plain = gpu.new_state().unwrap();
+    gpu.run(&mut plain, &PROMPT[..8], false).unwrap();
+    let want = gpu.run(&mut plain, &NEXT, true).unwrap().logits;
+    assert_eq!(bits(&got), bits(&want));
 }
