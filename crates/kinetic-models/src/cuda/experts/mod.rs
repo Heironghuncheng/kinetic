@@ -19,7 +19,8 @@
 //! device, so where an expert ran never changes a token's result.
 
 mod cache;
-mod host32;
+mod exact;
+mod form;
 mod offload;
 mod place;
 mod plan;
@@ -30,7 +31,7 @@ mod work;
 
 use kinetic_cuda::{
     expert_block, DeviceBuffer, DeviceMatrix, ExpertArena, ExpertMix, ExpertProduct, GateLogits,
-    GemvInput, Kernels, Q8kRows, Routing, Stream, EXPERT_TYPES, Q8K_BLOCK,
+    GemvInput, Kernels, Q8kRows, Routing, Stream, Q8K_BLOCK,
 };
 use kinetic_quant::{Matrix, TensorType};
 
@@ -67,9 +68,9 @@ impl CudaExperts {
         shared: bool,
     ) -> Result<CudaExperts, LoadError> {
         check_types(moe)?;
-        if moe.norms.is_some() || moe.glu == Glu::Gelu || moe.scales.iter().any(Option::is_some) {
+        if moe.norms.is_some() || moe.glu == Glu::Gelu {
             return Err(LoadError(
-                "expert scales, norms and GELU experts do not run on CUDA yet".into(),
+                "expert norms and GELU experts do not run on CUDA yet".into(),
             ));
         }
         let routers = [Some(&moe.router), next];
@@ -143,7 +144,8 @@ impl CudaExperts {
         let (d, n_exp, picks_per) = (moe.router.cols, self.n_experts, moe.n_used);
         let gating = moe.gating.clone();
         let g = self.gates.rows();
-        quantize(k, moe.gate.ty, h, n, d, &mut work.hq, &mut work.hd, stream)?;
+        let ty = form::device_type(moe.gate.ty);
+        quantize(k, ty, h, n, d, &mut work.hq, &mut work.hd, stream)?;
         // SAFETY: the host reads the buffer only after the synchronization
         // below.
         unsafe {
@@ -212,7 +214,8 @@ impl CudaExperts {
         let moe = &off.moes[l];
         let (d, picks_per) = (moe.router.cols, moe.n_used);
         let a = n * picks_per;
-        quantize(k, moe.gate.ty, h, n, d, &mut work.hq, &mut work.hd, stream)?;
+        let ty = form::device_type(moe.gate.ty);
+        quantize(k, ty, h, n, d, &mut work.hq, &mut work.hd, stream)?;
         let routing = Routing {
             gates: &work.gates,
             tokens: n,
@@ -299,7 +302,7 @@ impl CudaExperts {
         let moe = &off.moes[l];
         let layout = off.layouts[l];
         let product = |first_group, n_groups, gated: bool| ExpertProduct {
-            ty: if gated { moe.gate.ty } else { moe.down.ty },
+            ty: form::device_type(if gated { moe.gate.ty } else { moe.down.ty }),
             groups: &work.groups,
             first_group,
             n_groups,
@@ -314,6 +317,10 @@ impl CudaExperts {
                 Glu::Situ { beta, linear } => Some((beta, linear)),
                 Glu::Gelu => unreachable!("GELU experts are refused at upload"),
             },
+            scales: (layout.scales > 0).then_some((
+                layout.gate + layout.up + layout.down,
+                if gated { 0 } else { 2 },
+            )),
         };
         let hq = Q8kRows {
             qs: &work.hq,
@@ -329,7 +336,7 @@ impl CudaExperts {
         }
         quantize(
             k,
-            moe.down.ty,
+            form::device_type(moe.down.ty),
             &work.act,
             assignments,
             moe.down.cols,
@@ -371,9 +378,9 @@ fn quantize(
 
 /// [`Moe::run_experts`] as the device computes it, bit for bit.
 fn run_host(moe: &Moe, h: &[f32], jobs: &[Job]) -> Vec<f32> {
-    match host32::handles(moe) {
-        true => host32::run_experts(moe, h, jobs),
-        false => moe.run_experts(h, jobs),
+    match exact::host_path_is_exact(moe) {
+        true => moe.run_experts(h, jobs),
+        false => exact::run_experts(moe, h, jobs),
     }
 }
 
@@ -392,10 +399,7 @@ fn predict(gates: &[f32], gating: &Gating, n_exp: usize, k: usize, g: usize) -> 
 }
 
 fn check_types(m: &Moe) -> Result<(), LoadError> {
-    let ok = [m.gate.ty, m.down.ty]
-        .iter()
-        .all(|t| EXPERT_TYPES.contains(t))
-        && m.gate.ty == m.up.ty;
+    let ok = [m.gate.ty, m.down.ty].into_iter().all(form::supported) && m.gate.ty == m.up.ty;
     if ok {
         Ok(())
     } else {

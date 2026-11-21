@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use kinetic_quant::grids::MXFP4_VALUES;
 use kinetic_quant::iq::{IQ2XS_GRID, IQ2XXS_GRID, IQ3XXS_GRID, IQ4NL_VALUES};
 use kinetic_quant::TensorType;
 
@@ -11,7 +12,7 @@ use crate::module::LaunchConfig;
 use crate::stream::Stream;
 
 /// Weight types the expert kernels read, in the order of their kernels.
-pub const EXPERT_TYPES: [TensorType; 10] = [
+pub const EXPERT_TYPES: [TensorType; 12] = [
     TensorType::IQ2XXS,
     TensorType::IQ2XS,
     TensorType::IQ3XXS,
@@ -22,19 +23,22 @@ pub const EXPERT_TYPES: [TensorType; 10] = [
     TensorType::Q5K,
     TensorType::Q6K,
     TensorType::IQ4NL,
+    TensorType::NVFP4,
+    TensorType::Q8_0,
 ];
 
 /// Kernel names, by index into [`EXPERT_TYPES`].
 pub(crate) const MOE_NAMES: [&str; EXPERT_TYPES.len()] = [
     "iq2_xxs", "iq2_xs", "iq3_xxs", "iq4_xs", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq4_nl",
+    "nvfp4", "q8_0",
 ];
 
 /// Values per quantization block of the inputs of experts of type `ty`:
-/// [`Q8K_BLOCK`], or 32 for types in blocks of 32, whose inputs are
-/// quantized as GEMV inputs are (see [`Kernels::quantize_q8`]).
+/// [`Q8K_BLOCK`], or 32 for types scaled per 16 or 32 values, whose inputs
+/// are quantized as GEMV inputs are (see [`Kernels::quantize_q8`]).
 pub fn expert_block(ty: TensorType) -> usize {
     match ty {
-        TensorType::IQ4NL => 32,
+        TensorType::IQ4NL | TensorType::NVFP4 | TensorType::Q8_0 => 32,
         _ => Q8K_BLOCK,
     }
 }
@@ -63,6 +67,7 @@ impl ExpertTables {
         bytes.extend(IQ2XS_GRID.as_flattened());
         bytes.extend(IQ3XXS_GRID.as_flattened());
         bytes.extend(IQ4NL_VALUES.map(|v| v as u8));
+        bytes.extend(MXFP4_VALUES.map(|v| v as u8));
         Ok(ExpertTables(DeviceBuffer::from_slice(ctx, &bytes)?))
     }
 }
@@ -118,6 +123,9 @@ pub struct ExpertProduct<'a> {
     /// The beta and linear beta of SITU, which a gated product then takes
     /// in place of SiLU.
     pub situ: Option<(f32, f32)>,
+    /// Where each slot holds its expert's f32 scales of the gate, up and
+    /// down products, and which of them the first matrix takes.
+    pub scales: Option<(usize, usize)>,
 }
 
 /// Mixes expert outputs into each token's result; see [`Kernels::moe_combine`].
@@ -163,6 +171,8 @@ struct MoeParams {
     situ: u32,
     beta: f32,
     linear: f32,
+    scales: u32,
+    scale_index: u32,
 }
 
 /// Most experts per layer [`Kernels::moe_route`] chooses from.
@@ -418,7 +428,7 @@ impl Kernels {
             return Ok(());
         }
         let block = expert_block(p.ty);
-        if !p.cols.is_multiple_of(block) {
+        if !p.cols.is_multiple_of(block.max(p.ty.block_len())) {
             return Err(Error::Shape(format!(
                 "expert product over {} columns",
                 p.cols
@@ -448,6 +458,8 @@ impl Kernels {
             situ: u32::from(p.situ.is_some()),
             beta: p.situ.map_or(0.0, |s| s.0),
             linear: p.situ.map_or(0.0, |s| s.1),
+            scales: p.scales.map_or(0, |s| s.0 as u32),
+            scale_index: p.scales.map_or(0, |s| s.1 as u32),
         };
         let kernel = if p.second.is_some() {
             &self.moe_gate_up[index]

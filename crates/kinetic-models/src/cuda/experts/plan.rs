@@ -119,11 +119,13 @@ mod tests {
             gate: 100,
             up: 100,
             down: 100,
+            scales: 0,
         };
         let large = SlotLayout {
             gate: 200,
             up: 200,
             down: 200,
+            scales: 0,
         };
         let (pools, pool_of) = share_cache(&[small, large, small], 10, 6000);
         assert_eq!(pool_of, [0, 1, 0]);

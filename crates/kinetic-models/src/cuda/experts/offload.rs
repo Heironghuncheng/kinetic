@@ -116,14 +116,8 @@ impl<'m> Offload<'m> {
         dense_bytes: usize,
     ) -> Result<Offload<'m>, LoadError> {
         let err = super::cuda_error;
-        let layouts: Vec<SlotLayout> = moes
-            .iter()
-            .map(|m| SlotLayout {
-                gate: m.gate.expert_bytes(),
-                up: m.up.expert_bytes(),
-                down: m.down.expert_bytes(),
-            })
-            .collect();
+        let layouts: Vec<SlotLayout> = moes.iter().map(super::form::layout).collect();
+
         let n_experts = moes[0].n_experts();
         let region = layouts.iter().map(SlotLayout::bytes).max().unwrap_or(0);
         let staging = Staging {
@@ -277,7 +271,7 @@ impl<'m> Offload<'m> {
             let slot_bytes = self.plan.pools[pool].slot_bytes;
             for e in 0..slots {
                 let at = e * region;
-                let len = stage(
+                let len = super::form::stage(
                     &self.moes[0],
                     e,
                     &mut self.staging.demand.as_mut_slice()[at..],
@@ -306,15 +300,4 @@ impl<'m> Offload<'m> {
             slowdown: 1.0,
         })
     }
-}
-
-/// Copies expert `e`'s gate, up and down matrices from the file to the
-/// start of `dst` and returns their length.
-pub(super) fn stage(moe: &Moe, e: usize, dst: &mut [u8]) -> usize {
-    let mut at = 0;
-    for m in [moe.gate.expert(e), moe.up.expert(e), moe.down.expert(e)] {
-        dst[at..at + m.data.len()].copy_from_slice(m.data);
-        at += m.data.len();
-    }
-    at
 }

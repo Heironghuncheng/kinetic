@@ -10,6 +10,8 @@ use kinetic_quant::{Matrix, TensorType};
 use rayon::prelude::*;
 
 use super::ACTIVATION_CHUNK;
+#[cfg(feature = "cuda")]
+pub(crate) use kernels::packed_dot;
 #[cfg(all(test, feature = "cuda"))]
 pub(crate) use kernels::scale_offsets;
 use kernels::Unpacked;

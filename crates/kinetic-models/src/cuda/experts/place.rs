@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use kinetic_cpu::pool;
 
-use super::offload::{stage, Offload, DEMAND_STAGING, PREFETCH_STAGING, TRANSIT_SLOTS};
+use super::form::stage;
+use super::offload::{Offload, DEMAND_STAGING, PREFETCH_STAGING, TRANSIT_SLOTS};
 use super::Gpu;
 use crate::blocks::{Job, Pick};
 

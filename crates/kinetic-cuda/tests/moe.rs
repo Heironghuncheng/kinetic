@@ -83,6 +83,12 @@ fn random_matrix(ty: TensorType, rows: usize, cols: usize, rng: &mut Lcg) -> Vec
         .map(|_| rng.next() as u8)
         .collect();
     for blk in data.chunks_exact_mut(size) {
+        if ty == TensorType::NVFP4 {
+            // E4M3 scales near one: 0x30 to 0x37 hold 0.5 to 0.94
+            let scales = [0x30, 0x33, 0x35, 0x37].map(|s: u8| s | (rng.next() as u8 & 1));
+            blk[..4].copy_from_slice(&scales);
+            continue;
+        }
         for &at in half_fields(ty) {
             let d = f16::from_f32(0.001 + rng.f32().abs() * 0.01);
             blk[at..at + 2].copy_from_slice(&d.to_le_bytes());
@@ -213,6 +219,7 @@ fn gated_and_plain_products_match_the_reference() {
                 rows,
                 cols,
                 situ,
+                scales: None,
             };
             let mut y = DeviceBuffer::<f32>::new(&g.ctx, assigned.len() * rows).unwrap();
             let x = Q8kRows { qs: &qs, ds: &ds };

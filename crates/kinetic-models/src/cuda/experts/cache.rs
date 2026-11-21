@@ -7,11 +7,13 @@ pub(super) struct SlotLayout {
     pub gate: usize,
     pub up: usize,
     pub down: usize,
+    /// The expert's scales of its three products, if it has them.
+    pub scales: usize,
 }
 
 impl SlotLayout {
     pub fn bytes(&self) -> usize {
-        self.gate + self.up + self.down
+        self.gate + self.up + self.down + self.scales
     }
 }
 

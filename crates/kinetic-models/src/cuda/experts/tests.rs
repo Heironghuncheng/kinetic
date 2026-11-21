@@ -6,7 +6,7 @@ use kinetic_cuda::{
 };
 use kinetic_quant::{Matrix, TensorType};
 
-use super::Gpu;
+use super::{form, Gpu};
 use crate::blocks::{scale_offsets, Experts, Gating, Glu, Job, Moe};
 
 fn gpu() -> Option<Gpu> {
@@ -69,6 +69,10 @@ fn device_experts_equal_host_experts_bit_for_bit() {
         (TensorType::Q4K, TensorType::Q6K, situ, 256),
         (TensorType::IQ4NL, TensorType::IQ4NL, situ, 288),
         (TensorType::IQ4NL, TensorType::IQ4NL, Glu::Silu, 96),
+        (TensorType::NVFP4, TensorType::NVFP4, situ, 256),
+        (TensorType::NVFP4, TensorType::Q5K, situ, 256),
+        (TensorType::Q8_0, TensorType::NVFP4, Glu::Silu, 192),
+        (TensorType::IQ2S, TensorType::IQ3S, situ, 256),
     ] {
         let gate = random_experts(gate_ty, f, d, count, &mut seed);
         let up = random_experts(gate_ty, f, d, count, &mut seed);
@@ -94,7 +98,11 @@ fn device_experts_equal_host_experts_bit_for_bit() {
             gating: Gating::Softmax,
             glu,
             weight_scale: 1.0,
-            scales: Default::default(),
+            // per-expert scales, as the NVFP4 files carry them
+            scales: match gate_ty {
+                TensorType::NVFP4 => [0.5, 1.25, 2.0].map(|s| Some(vec![s, -s, 3.0 * s])),
+                _ => Default::default(),
+            },
             norms: None,
         };
         let h: Vec<f32> = random_bytes(tokens * d, &mut seed)
@@ -105,18 +113,14 @@ fn device_experts_equal_host_experts_bit_for_bit() {
         let jobs = [(2, 0), (2, 1), (2, 3), (0, 2)].map(|(expert, row)| Job { row, expert });
         let want = super::run_host(&moe, &h, &jobs);
 
-        let (ge, ue, de) = (
-            moe.gate.expert_bytes(),
-            moe.up.expert_bytes(),
-            moe.down.expert_bytes(),
-        );
-        let slot_bytes = ge + ue + de;
-        let mut arena = Vec::new();
-        for e in 0..count {
-            for m in [moe.gate.expert(e), moe.up.expert(e), moe.down.expert(e)] {
-                arena.extend_from_slice(m.data);
-            }
+        let layout = form::layout(&moe);
+        let (ge, ue, de) = (layout.gate, layout.up, layout.down);
+        let slot_bytes = layout.bytes();
+        let mut arena = vec![0; count * slot_bytes];
+        for (e, slot) in arena.chunks_exact_mut(slot_bytes).enumerate() {
+            form::stage(&moe, e, slot);
         }
+        let scales = (layout.scales > 0).then_some(ge + ue + de);
         let arena = DeviceBuffer::from_slice(&g.ctx, &arena).unwrap();
         let arena = ExpertArena {
             data: &arena,
@@ -145,7 +149,8 @@ fn device_experts_equal_host_experts_bit_for_bit() {
         let hs = DeviceBuffer::from_slice(&g.ctx, &h).unwrap();
         let mut hq = DeviceBuffer::<i8>::new(&g.ctx, tokens * d).unwrap();
         let mut hd = DeviceBuffer::<f32>::new(&g.ctx, tokens * d / 16).unwrap();
-        super::quantize(k, gate_ty, &hs, tokens, d, &mut hq, &mut hd, stream).unwrap();
+        let (gate_dev, down_dev) = (form::device_type(gate_ty), form::device_type(down_ty));
+        super::quantize(k, gate_dev, &hs, tokens, d, &mut hq, &mut hd, stream).unwrap();
         let mut act = DeviceBuffer::<f32>::new(&g.ctx, a * f).unwrap();
         let mut actq = DeviceBuffer::<i8>::new(&g.ctx, a * f).unwrap();
         let mut actd = DeviceBuffer::<f32>::new(&g.ctx, a * f / 16).unwrap();
@@ -165,20 +170,21 @@ fn device_experts_equal_host_experts_bit_for_bit() {
                 Glu::Silu => None,
                 Glu::Situ { beta, linear } => Some((beta, linear)),
             },
+            scales: scales.map(|at| (at, if second.is_some() { 0 } else { 2 })),
         };
         // SAFETY: the groups cover the four assignments, whose slots hold
         // the experts at these offsets and whose inputs are rows of `h`.
         unsafe {
             let x = Q8kRows { qs: &hq, ds: &hd };
-            let p = product(gate_ty, Some(&inputs), 0, Some(ge), f, d);
+            let p = product(gate_dev, Some(&inputs), 0, Some(ge), f, d);
             k.moe_product(&p, arena, &tables, &x, &mut act, stream)
                 .unwrap();
-            super::quantize(k, down_ty, &act, a, f, &mut actq, &mut actd, stream).unwrap();
+            super::quantize(k, down_dev, &act, a, f, &mut actq, &mut actd, stream).unwrap();
             let x = Q8kRows {
                 qs: &actq,
                 ds: &actd,
             };
-            let p = product(down_ty, None, ge + ue, None, d, f);
+            let p = product(down_dev, None, ge + ue, None, d, f);
             k.moe_product(&p, arena, &tables, &x, &mut out, stream)
                 .unwrap();
         }
