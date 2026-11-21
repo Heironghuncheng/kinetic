@@ -9,10 +9,19 @@ use crate::error::{Error, Result};
 use crate::memory::DeviceBuffer;
 use crate::pipeline::Kernel;
 
-/// A kernel as build.rs wrote it for the driver: SPIR-V for Vulkan, Metal
-/// shader source for Metal.
+/// A kernel as build.rs wrote it for the driver: SPIR-V for Vulkan, for
+/// subgroups of 32 and of 64, Metal shader source for Metal.
 #[cfg(not(metal_driver))]
 macro_rules! spirv {
+    ($name:literal) => {
+        [
+            include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")).as_slice(),
+            include_bytes!(concat!(env!("OUT_DIR"), "/", $name, "_64.spv")).as_slice(),
+        ]
+    };
+}
+#[cfg(not(metal_driver))]
+macro_rules! matrix_spirv {
     ($name:literal) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
     };
@@ -68,13 +77,14 @@ pub struct Kernels {
 }
 
 /// The weight types with kernels on the matrix units, and those kernels,
-/// as build.rs compiles them.
+/// as build.rs compiles them: for subgroups of 32 alone, which
+/// `Features::matrix_f16` asks for.
 #[cfg(not(metal_driver))]
 const MATRIX_TYPES: [(TensorType, &str, &[u8]); 4] = [
-    (TensorType::Q8_0, "mm_q8_0", spirv!("mm_q8_0")),
-    (TensorType::Q4K, "mm_q4_k", spirv!("mm_q4_k")),
-    (TensorType::Q5K, "mm_q5_k", spirv!("mm_q5_k")),
-    (TensorType::Q6K, "mm_q6_k", spirv!("mm_q6_k")),
+    (TensorType::Q8_0, "mm_q8_0", matrix_spirv!("mm_q8_0")),
+    (TensorType::Q4K, "mm_q4_k", matrix_spirv!("mm_q4_k")),
+    (TensorType::Q5K, "mm_q5_k", matrix_spirv!("mm_q5_k")),
+    (TensorType::Q6K, "mm_q6_k", matrix_spirv!("mm_q6_k")),
 ];
 
 /// Most tokens of a prompt pass on the matrix units; every state holds
@@ -123,7 +133,7 @@ impl Kernels {
             mm: match matrix {
                 true => MATRIX_TYPES
                     .iter()
-                    .map(|&(ty, name, spirv)| Ok((ty, gemv(name, spirv)?)))
+                    .map(|&(ty, name, spirv)| Ok((ty, gemv(name, [spirv; 2])?)))
                     .collect::<Result<_>>()?,
                 false => Vec::new(),
             },
