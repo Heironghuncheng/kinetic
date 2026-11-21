@@ -14,10 +14,10 @@ const THREADS: u32 = 128;
 
 /// The recent gated inputs of a short convolution, a ring indexed by position.
 pub struct ConvState {
-    ring: DeviceBuffer<f32>,
-    channels: usize,
-    taps: usize,
-    ring_len: usize,
+    pub(crate) ring: DeviceBuffer<f32>,
+    pub(crate) channels: usize,
+    pub(crate) taps: usize,
+    pub(crate) ring_len: usize,
 }
 
 impl ConvState {
