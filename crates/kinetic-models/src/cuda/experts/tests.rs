@@ -152,6 +152,7 @@ fn device_experts_equal_host_experts_bit_for_bit() {
             second,
             rows,
             cols,
+            situ: None,
         };
         // SAFETY: the groups cover the four assignments, whose slots hold
         // the experts at these offsets and whose inputs are rows of `h`.
@@ -204,6 +205,7 @@ fn device_sigmoid_routing_picks_what_the_host_picks() {
         stride,
         sigmoid: true,
         bias: Some(&bias_dev),
+        scale: 1.0,
     };
     g.kernels
         .moe_route(&routing, &mut experts, &mut weights, &g.stream)
@@ -244,6 +246,7 @@ fn device_routing_picks_what_the_host_picks() {
         stride,
         sigmoid: false,
         bias: None,
+        scale: 1.0,
     };
     let (kn, stream) = (&g.kernels, &g.stream);
     kn.moe_route(&routing, &mut experts, &mut weights, stream)

@@ -1,6 +1,4 @@
-use kinetic_cuda::{
-    DeviceBuffer, ExpertGroup, PinnedBuffer, Stream, EXPERT_GROUP, MAX_BATCH, Q8K_BLOCK,
-};
+use kinetic_cuda::{DeviceBuffer, ExpertGroup, PinnedBuffer, Stream, EXPERT_GROUP, MAX_BATCH};
 
 use super::place::Place;
 use super::Gpu;
@@ -68,18 +66,20 @@ impl ExpertWork {
         } = *dims;
         let assigned = rows * picks;
         let f32s = |len: usize| DeviceBuffer::<f32>::new(ctx, len.max(1));
+        // two scales per 32 values, the most any expert type's inputs take
+        let scales = |len: usize| f32s(len / 16);
         let u32s = |len: usize| DeviceBuffer::<u32>::new(ctx, len.max(1));
         let i8s = |len: usize| DeviceBuffer::<i8>::new(ctx, len.max(1));
         Ok(ExpertWork {
             gates: f32s(rows * scores)?,
             chunk_gates: f32s(MAX_BATCH * scores)?,
             hq: i8s(rows * d)?,
-            hd: f32s(rows * d / Q8K_BLOCK)?,
+            hd: scales(rows * d)?,
             groups: u32s(4 * assigned)?,
             inputs: u32s(assigned)?,
             act: f32s(assigned * n_ff)?,
             actq: i8s(assigned * n_ff)?,
-            actd: f32s(assigned * n_ff / Q8K_BLOCK)?,
+            actd: scales(assigned * n_ff)?,
             out: f32s(assigned * d)?,
             rows: u32s(assigned)?,
             weights: f32s(assigned)?,

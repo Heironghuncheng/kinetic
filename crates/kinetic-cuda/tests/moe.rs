@@ -5,6 +5,7 @@
 use std::rc::Rc;
 
 use half::f16;
+use kinetic_cuda::expert_block;
 use kinetic_cuda::{
     Context, Device, DeviceBuffer, Error, ExpertArena, ExpertGroup, ExpertMix, ExpertProduct,
     ExpertTables, GateLogits, Kernels, Q8kRows, Stream, EXPERT_TYPES, Q8K_BLOCK,
@@ -78,7 +79,7 @@ fn half_fields(ty: TensorType) -> &'static [usize] {
 /// holds a NaN or an infinity.
 fn random_matrix(ty: TensorType, rows: usize, cols: usize, rng: &mut Lcg) -> Vec<u8> {
     let size = ty.block_bytes();
-    let mut data: Vec<u8> = (0..rows * cols / 256 * size)
+    let mut data: Vec<u8> = (0..rows * cols / ty.block_len() * size)
         .map(|_| rng.next() as u8)
         .collect();
     for blk in data.chunks_exact_mut(size) {
@@ -96,28 +97,40 @@ fn dense(ty: TensorType, data: &[u8], len: usize) -> Vec<f32> {
     out
 }
 
-/// The quantization the host applies: `d = max|x| / 127`, values rounded
-/// half away from zero.
-fn quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+/// The quantization the host applies per `block` values: `d = max|x| / 127`,
+/// values rounded half away from zero, or in blocks of 32 half to even.
+fn quantize(x: &[f32], block: usize) -> (Vec<i8>, Vec<f32>) {
     let mut qs = Vec::new();
     let mut ds = Vec::new();
-    for block in x.chunks_exact(Q8K_BLOCK) {
+    for block in x.chunks_exact(block) {
         let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let d = amax / 127.0;
         let inv = if d == 0.0 { 0.0 } else { 1.0 / d };
-        qs.extend(
-            block
-                .iter()
-                .map(|v| (v * inv).round().clamp(-127.0, 127.0) as i8),
-        );
+        qs.extend(block.iter().map(|v| match block.len() {
+            32 if d == 0.0 => 0,
+            32 => (v / d).round_ties_even() as i8,
+            _ => (v * inv).round().clamp(-127.0, 127.0) as i8,
+        }));
         ds.push(d);
     }
     (qs, ds)
 }
 
-fn quantized(g: &Gpu, x: &[f32], cols: usize) -> (DeviceBuffer<i8>, DeviceBuffer<f32>) {
+fn quantized(
+    g: &Gpu,
+    x: &[f32],
+    cols: usize,
+    block: usize,
+) -> (DeviceBuffer<i8>, DeviceBuffer<f32>) {
     let xs = DeviceBuffer::from_slice(&g.ctx, x).unwrap();
     let mut qs = DeviceBuffer::<i8>::new(&g.ctx, x.len()).unwrap();
+    if block == 32 {
+        let mut ds = DeviceBuffer::<f32>::new(&g.ctx, x.len() / 16).unwrap();
+        g.kernels
+            .quantize_q8(&xs, x.len(), &mut qs, &mut ds, &g.stream)
+            .unwrap();
+        return (qs, ds);
+    }
     let mut ds = DeviceBuffer::<f32>::new(&g.ctx, x.len() / Q8K_BLOCK).unwrap();
     g.kernels
         .quantize_q8k(&xs, x.len() / cols, cols, &mut qs, &mut ds, &g.stream)
@@ -132,8 +145,8 @@ fn quantization_matches_the_host() {
     let mut x: Vec<f32> = (0..4 * Q8K_BLOCK).map(|_| rng.f32() * 3.0).collect();
     x[Q8K_BLOCK..2 * Q8K_BLOCK].fill(0.0);
     x[7] = 127.5 / 127.0 * 3.0;
-    let (qs, ds) = quantized(&g, &x, 2 * Q8K_BLOCK);
-    let (want_qs, want_ds) = quantize(&x);
+    let (qs, ds) = quantized(&g, &x, 2 * Q8K_BLOCK, Q8K_BLOCK);
+    let (want_qs, want_ds) = quantize(&x, Q8K_BLOCK);
     assert_eq!(qs.to_vec().unwrap(), want_qs);
     let ds: Vec<u32> = ds.to_vec().unwrap().iter().map(|d| d.to_bits()).collect();
     assert_eq!(ds, want_ds.iter().map(|d| d.to_bits()).collect::<Vec<_>>());
@@ -146,7 +159,8 @@ fn gated_and_plain_products_match_the_reference() {
     let (rows, cols, slots) = (40, 512, 3);
     let mut rng = Lcg(5);
     for ty in EXPERT_TYPES {
-        let matrix = rows * cols / 256 * ty.block_bytes();
+        let block = expert_block(ty);
+        let matrix = rows * cols / ty.block_len() * ty.block_bytes();
         // Each slot holds a first and a second matrix.
         let host: Vec<u8> = (0..2 * slots)
             .flat_map(|_| random_matrix(ty, rows, cols, &mut rng))
@@ -157,12 +171,12 @@ fn gated_and_plain_products_match_the_reference() {
             slot_bytes: 2 * matrix,
         };
         let x: Vec<f32> = (0..2 * cols).map(|_| rng.f32()).collect();
-        let (qs, ds) = quantized(&g, &x, cols);
-        let (hq, hd) = quantize(&x);
+        let (qs, ds) = quantized(&g, &x, cols, block);
+        let (hq, hd) = quantize(&x, block);
         let x_ref: Vec<f32> = hq
             .iter()
             .enumerate()
-            .map(|(i, &q)| q as f32 * hd[i / Q8K_BLOCK])
+            .map(|(i, &q)| q as f32 * hd[i / block])
             .collect();
         // Assignments by slot: slot 2 twice, then slots 0 and 1.
         let assigned: [(u32, u32); 4] = [(2, 0), (2, 1), (0, 1), (1, 0)];
@@ -186,7 +200,7 @@ fn gated_and_plain_products_match_the_reference() {
         let words: Vec<u32> = groups.iter().flat_map(ExpertGroup::words).collect();
         let groups_buf = DeviceBuffer::from_slice(&g.ctx, &words).unwrap();
         let inputs = DeviceBuffer::from_slice(&g.ctx, &assigned.map(|a| a.1)).unwrap();
-        for gated in [false, true] {
+        for (gated, situ) in [(false, None), (true, None), (true, Some((4.0, 25.0)))] {
             let product = ExpertProduct {
                 ty,
                 groups: &groups_buf,
@@ -198,6 +212,7 @@ fn gated_and_plain_products_match_the_reference() {
                 second: gated.then_some(matrix),
                 rows,
                 cols,
+                situ,
             };
             let mut y = DeviceBuffer::<f32>::new(&g.ctx, assigned.len() * rows).unwrap();
             let x = Q8kRows { qs: &qs, ds: &ds };
@@ -223,16 +238,19 @@ fn gated_and_plain_products_match_the_reference() {
                             .map(|(&a, &b)| a as f64 * b as f64)
                             .sum()
                     };
-                    let want = if gated {
-                        let gate = row(&first);
-                        gate / (1.0 + (-gate).exp()) * row(&second)
-                    } else {
-                        row(&first)
+                    let (gate, up) = (row(&first), row(&second));
+                    let want = match situ {
+                        _ if !gated => gate,
+                        None => gate / (1.0 + (-gate).exp()) * up,
+                        Some((beta, linear)) => {
+                            let clip = |x: f64, b: f32| b as f64 * (x / b as f64).tanh();
+                            clip(gate, beta) / (1.0 + (-gate).exp()) * clip(up, linear)
+                        }
                     };
                     let got = y[a * rows + r] as f64;
                     assert!(
                         (got - want).abs() <= 1e-4 + 1e-4 * want.abs(),
-                        "{ty} gated {gated} assignment {a} row {r}: {got} vs {want}"
+                        "{ty} gated {gated} {situ:?} assignment {a} row {r}: {got} vs {want}"
                     );
                 }
             }

@@ -301,6 +301,13 @@ __device__ __forceinline__ float exact_silu(float x) {
     return __fdiv_rn(x, __fadd_rn(1.0f, exact_exp(-x)));
 }
 
+// b tanh(x / b), tanh taken as 1 - 2 / (e^2y + 1) through `exact_exp`.
+__device__ __forceinline__ float exact_soft_clip(float x, float b) {
+    const float y = __fdiv_rn(x, b);
+    const float e = exact_exp(__fmul_rn(2.0f, y));
+    return __fmul_rn(b, __fsub_rn(1.0f, __fdiv_rn(2.0f, __fadd_rn(e, 1.0f))));
+}
+
 struct MoeParams {
     const uint8_t* arena;
     unsigned long long slot_bytes;
@@ -319,10 +326,23 @@ struct MoeParams {
     unsigned second;
     unsigned rows;
     unsigned cols;
+    // Gated products take SITU with these betas in place of SiLU.
+    unsigned situ;
+    float beta;
+    float linear;
 };
 
+// silu(g) u, or SITU: beta tanh(g / beta) sigmoid(g) times u, itself
+// soft-clipped by `linear` unless that is zero.
+__device__ __forceinline__ float moe_glu(const MoeParams& p, float g, float u) {
+    if (!p.situ) return __fmul_rn(exact_silu(g), u);
+    const float up = p.linear == 0.0f ? u : exact_soft_clip(u, p.linear);
+    const float sig = __fdiv_rn(1.0f, __fadd_rn(1.0f, exact_exp(-g)));
+    return __fmul_rn(__fmul_rn(exact_soft_clip(g, p.beta), sig), up);
+}
+
 // Each warp computes rows of every assignment in its group, reading each
-// weight once for all of them. With `GATED`, y = silu(gate x) * up x,
+// weight once for all of them. With `GATED`, y = glu(gate x, up x),
 // otherwise y = first x; y holds one row of `rows` values per assignment.
 template <class F, bool GATED>
 __device__ void moe_rows(const MoeParams& p) {
@@ -377,30 +397,122 @@ __device__ void moe_rows(const MoeParams& p) {
         }
         if (lane == 0) {
             for (unsigned t = 0; t < count; ++t) {
-                const float v = GATED ? __fmul_rn(exact_silu(acc[0][t]), acc[1][t]) : acc[0][t];
+                const float v = GATED ? moe_glu(p, acc[0][t], acc[1][t]) : acc[0][t];
                 p.y[static_cast<size_t>(g.y + t) * p.rows + r] = v;
             }
         }
     }
 }
 
-#define MOE_KERNELS(name, F)                                                                 \
+// Types in blocks of 32 values, whose inputs are quantized per 32 as GEMV
+// inputs are: an int8 copy and (d, d * sum) per block. Each lane takes
+// eight values of one of the eight blocks a warp covers per step.
+struct Iq4Nl {
+    static constexpr unsigned BYTES = 18;
+    static constexpr unsigned TABLE = IQ4NL_OFFSET;
+    static __device__ __forceinline__ float scale(const uint8_t* b) { return half_at(b); }
+    // Values 8 part .. 8 part + 8: the low nibbles of the 16 bytes, then
+    // the high ones.
+    static __device__ __forceinline__ void lane(const uint8_t* b, unsigned part, const uint8_t* table,
+                                                int w[2]) {
+        const uint8_t* q = b + 2 + 8 * (part % 2);
+        const unsigned shift = part < 2 ? 0 : 4;
+#pragma unroll
+        for (unsigned h = 0; h < 2; ++h) {
+            unsigned v = 0;
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j) v |= static_cast<unsigned>(table[q[4 * h + j] >> shift & 0xf]) << (8 * j);
+            w[h] = static_cast<int>(v);
+        }
+    }
+};
+
+// `moe_rows` for types in blocks of 32: each block gives an exact integer
+// sum, and the blocks of a row are added in order, each times the product
+// of the two scales.
+template <class F, bool GATED>
+__device__ void moe_rows32(const MoeParams& p) {
+    extern __shared__ int8_t shared[];
+    const uint4 g = p.groups[blockIdx.y];
+    const unsigned count = g.z, blocks = p.cols / 32;
+    if (count == 0) return;
+    int8_t* xs = shared;
+    float* ds = reinterpret_cast<float*>(xs + MOE_GROUP * p.cols);
+    const uint8_t* table = p.tables + F::TABLE;
+    for (unsigned t = 0; t < count; ++t) {
+        const unsigned a = g.y + t;
+        const size_t row = p.inputs ? p.inputs[a] : a;
+        for (unsigned i = threadIdx.x; i < p.cols / 4; i += blockDim.x)
+            reinterpret_cast<int*>(xs + t * p.cols)[i] = reinterpret_cast<const int*>(p.xq + row * p.cols)[i];
+        for (unsigned i = threadIdx.x; i < blocks; i += blockDim.x)
+            ds[t * blocks + i] = p.xd[2 * (row * blocks + i)];
+    }
+    __syncthreads();
+
+    const unsigned lane = threadIdx.x % WARP, part = lane % 4;
+    const uint8_t* slot = p.arena + p.slot_bytes * g.x;
+    const size_t row_bytes = static_cast<size_t>(blocks) * F::BYTES;
+    const unsigned warps = gridDim.x * MOE_WARPS;
+    for (unsigned r = blockIdx.x * MOE_WARPS + threadIdx.x / WARP; r < p.rows; r += warps) {
+        float acc[2][MOE_GROUP] = {};
+#pragma unroll
+        for (unsigned m = 0; m < (GATED ? 2 : 1); ++m) {
+            const uint8_t* w = slot + (m == 0 ? p.first : p.second) + r * row_bytes;
+            for (unsigned b0 = 0; b0 < blocks; b0 += WARP / 4) {
+                const unsigned b = b0 + lane / 4;
+                const bool live = b < blocks;
+                int wq[2] = {0, 0};
+                float wd = 0.0f;
+                if (live) {
+                    F::lane(w + b * F::BYTES, part, table, wq);
+                    wd = F::scale(w + b * F::BYTES);
+                }
+#pragma unroll
+                for (unsigned t = 0; t < MOE_GROUP; ++t) {
+                    if (t >= count) break;
+                    int sum = 0;
+                    if (live) {
+                        const int* x = reinterpret_cast<const int*>(xs + t * p.cols + b * 32 + 8 * part);
+                        sum = dp4a(wq[1], x[1], dp4a(wq[0], x[0], 0));
+                    }
+                    sum += __shfl_xor_sync(FULL_MASK, sum, 1);
+                    sum += __shfl_xor_sync(FULL_MASK, sum, 2);
+                    const float term = live ? __fmul_rn(__fmul_rn(wd, ds[t * blocks + b]), static_cast<float>(sum)) : 0.0f;
+#pragma unroll
+                    for (unsigned j = 0; j < WARP / 4; ++j) {
+                        const float v = __shfl_sync(FULL_MASK, term, 4 * j);
+                        if (b0 + j < blocks) acc[m][t] = __fadd_rn(acc[m][t], v);
+                    }
+                }
+            }
+        }
+        if (lane == 0) {
+            for (unsigned t = 0; t < count; ++t) {
+                const float v = GATED ? moe_glu(p, acc[0][t], acc[1][t]) : acc[0][t];
+                p.y[static_cast<size_t>(g.y + t) * p.rows + r] = v;
+            }
+        }
+    }
+}
+
+#define MOE_KERNELS(name, F, ROWS)                                                           \
     extern "C" __global__ void __launch_bounds__(MOE_THREADS) moe_gate_up_##name(MoeParams p) { \
-        moe_rows<F, true>(p);                                                                \
+        ROWS<F, true>(p);                                                                    \
     }                                                                                        \
     extern "C" __global__ void __launch_bounds__(MOE_THREADS) moe_down_##name(MoeParams p) {    \
-        moe_rows<F, false>(p);                                                               \
+        ROWS<F, false>(p);                                                                   \
     }
 
-MOE_KERNELS(iq2_xxs, Iq2Xxs)
-MOE_KERNELS(iq2_xs, Iq2Xs)
-MOE_KERNELS(iq3_xxs, Iq3Xxs)
-MOE_KERNELS(iq4_xs, Iq4Xs)
-MOE_KERNELS(q2_k, Q2K)
-MOE_KERNELS(q3_k, Q3K)
-MOE_KERNELS(q4_k, Q4K)
-MOE_KERNELS(q5_k, Q5K)
-MOE_KERNELS(q6_k, Q6K)
+MOE_KERNELS(iq2_xxs, Iq2Xxs, moe_rows)
+MOE_KERNELS(iq2_xs, Iq2Xs, moe_rows)
+MOE_KERNELS(iq3_xxs, Iq3Xxs, moe_rows)
+MOE_KERNELS(iq4_xs, Iq4Xs, moe_rows)
+MOE_KERNELS(q2_k, Q2K, moe_rows)
+MOE_KERNELS(q3_k, Q3K, moe_rows)
+MOE_KERNELS(q4_k, Q4K, moe_rows)
+MOE_KERNELS(q5_k, Q5K, moe_rows)
+MOE_KERNELS(q6_k, Q6K, moe_rows)
+MOE_KERNELS(iq4_nl, Iq4Nl, moe_rows32)
 
 // Routing on the device, for layers whose experts all have a slot.
 
@@ -421,6 +533,8 @@ struct RouteParams {
     unsigned sigmoid;
     // Added to each expert's probability to choose, not to weigh, or null.
     const float* bias;
+    // Multiplies the weights once they are shares.
+    float scale;
 };
 
 // Per token, the softmax (or sigmoid) of the logits, then the `k` likeliest experts,
@@ -479,7 +593,7 @@ extern "C" __global__ void moe_route(RouteParams p) {
     }
     if (lane == 0) {
         const float total = fmaxf(picked, 6.1035156e-5f);
-        for (unsigned j = 0; j < p.k; ++j) weights[j] = __fdiv_rn(weights[j], total);
+        for (unsigned j = 0; j < p.k; ++j) weights[j] = __fmul_rn(__fdiv_rn(weights[j], total), p.scale);
     }
 }
 

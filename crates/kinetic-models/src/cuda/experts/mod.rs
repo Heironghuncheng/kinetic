@@ -28,8 +28,8 @@ mod tests;
 mod work;
 
 use kinetic_cuda::{
-    DeviceBuffer, DeviceMatrix, ExpertArena, ExpertMix, ExpertProduct, GateLogits, GemvInput,
-    Q8kRows, Routing, EXPERT_TYPES,
+    expert_block, DeviceBuffer, DeviceMatrix, ExpertArena, ExpertMix, ExpertProduct, GateLogits,
+    GemvInput, Kernels, Q8kRows, Routing, Stream, EXPERT_TYPES, Q8K_BLOCK,
 };
 use kinetic_quant::{Matrix, TensorType};
 
@@ -143,7 +143,7 @@ impl CudaExperts {
         let (d, n_exp, picks_per) = (moe.router.cols, self.n_experts, moe.n_used);
         let gating = moe.gating.clone();
         let g = self.gates.rows();
-        k.quantize_q8k(h, n, d, &mut work.hq, &mut work.hd, stream)?;
+        quantize(k, moe.gate.ty, h, n, d, &mut work.hq, &mut work.hd, stream)?;
         // SAFETY: the host reads the buffer only after the synchronization
         // below.
         unsafe {
@@ -157,6 +157,10 @@ impl CudaExperts {
         let picks: Vec<Pick> = gates
             .chunks_exact(g)
             .flat_map(|row| gating.pick(&mut row[..n_exp].to_vec(), picks_per))
+            .map(|p| Pick {
+                weight: p.weight * moe.weight_scale,
+                ..p
+            })
             .collect();
         let place = off.route(l, &picks, gpu)?;
         let assigned = work.assign(&picks, &place, stream)?;
@@ -208,7 +212,7 @@ impl CudaExperts {
         let moe = &off.moes[l];
         let (d, picks_per) = (moe.router.cols, moe.n_used);
         let a = n * picks_per;
-        k.quantize_q8k(h, n, d, &mut work.hq, &mut work.hd, stream)?;
+        quantize(k, moe.gate.ty, h, n, d, &mut work.hq, &mut work.hd, stream)?;
         let routing = Routing {
             gates: &work.gates,
             tokens: n,
@@ -217,6 +221,7 @@ impl CudaExperts {
             stride: self.gates.rows(),
             sigmoid: matches!(moe.gating, Gating::Sigmoid { .. }),
             bias: self.bias.as_ref(),
+            scale: moe.weight_scale,
         };
         k.moe_route(&routing, &mut work.experts, &mut work.weights, stream)?;
         let slots = &off.resident.as_ref().expect("resident experts")[l];
@@ -304,6 +309,10 @@ impl CudaExperts {
             second: gated.then_some(layout.gate),
             rows: if gated { moe.gate.rows } else { moe.down.rows },
             cols: if gated { moe.gate.cols } else { moe.down.cols },
+            situ: match moe.glu {
+                Glu::Silu => None,
+                Glu::Situ { beta, linear } => Some((beta, linear)),
+            },
         };
         let hq = Q8kRows {
             qs: &work.hq,
@@ -317,7 +326,9 @@ impl CudaExperts {
             // of the batch.
             unsafe { k.moe_product(&p, arena, &off.tables, &hq, &mut work.act, stream)? };
         }
-        k.quantize_q8k(
+        quantize(
+            k,
+            moe.down.ty,
             &work.act,
             assignments,
             moe.down.cols,
@@ -335,6 +346,25 @@ impl CudaExperts {
             unsafe { k.moe_product(&p, arena, &off.tables, &act, &mut work.out, stream)? };
         }
         Ok(())
+    }
+}
+
+/// Queues quantizing `rows` rows of `cols` values of `x` for experts of type
+/// `ty`, in its blocks.
+#[allow(clippy::too_many_arguments)]
+fn quantize(
+    k: &Kernels,
+    ty: TensorType,
+    x: &DeviceBuffer<f32>,
+    rows: usize,
+    cols: usize,
+    qs: &mut DeviceBuffer<i8>,
+    ds: &mut DeviceBuffer<f32>,
+    stream: &Stream,
+) -> kinetic_cuda::Result<()> {
+    match expert_block(ty) {
+        Q8K_BLOCK => k.quantize_q8k(x, rows, cols, qs, ds, stream),
+        _ => k.quantize_q8(x, rows * cols, qs, ds, stream),
     }
 }
 

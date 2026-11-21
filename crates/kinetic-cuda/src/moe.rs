@@ -11,7 +11,7 @@ use crate::module::LaunchConfig;
 use crate::stream::Stream;
 
 /// Weight types the expert kernels read, in the order of their kernels.
-pub const EXPERT_TYPES: [TensorType; 9] = [
+pub const EXPERT_TYPES: [TensorType; 10] = [
     TensorType::IQ2XXS,
     TensorType::IQ2XS,
     TensorType::IQ3XXS,
@@ -21,12 +21,23 @@ pub const EXPERT_TYPES: [TensorType; 9] = [
     TensorType::Q4K,
     TensorType::Q5K,
     TensorType::Q6K,
+    TensorType::IQ4NL,
 ];
 
 /// Kernel names, by index into [`EXPERT_TYPES`].
 pub(crate) const MOE_NAMES: [&str; EXPERT_TYPES.len()] = [
-    "iq2_xxs", "iq2_xs", "iq3_xxs", "iq4_xs", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k",
+    "iq2_xxs", "iq2_xs", "iq3_xxs", "iq4_xs", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq4_nl",
 ];
+
+/// Values per quantization block of the inputs of experts of type `ty`:
+/// [`Q8K_BLOCK`], or 32 for types in blocks of 32, whose inputs are
+/// quantized as GEMV inputs are (see [`Kernels::quantize_q8`]).
+pub fn expert_block(ty: TensorType) -> usize {
+    match ty {
+        TensorType::IQ4NL => 32,
+        _ => Q8K_BLOCK,
+    }
+}
 
 /// Most assignments of one expert an [`ExpertGroup`] holds.
 pub const EXPERT_GROUP: usize = 8;
@@ -80,7 +91,7 @@ impl ExpertGroup {
     }
 }
 
-/// Inputs quantized per [`Q8K_BLOCK`] values, as the host quantizes them.
+/// Inputs quantized per [`expert_block`] values, as the host quantizes them.
 pub struct Q8kRows<'a> {
     pub qs: &'a DeviceBuffer<i8>,
     pub ds: &'a DeviceBuffer<f32>,
@@ -104,6 +115,9 @@ pub struct ExpertProduct<'a> {
     pub second: Option<usize>,
     pub rows: usize,
     pub cols: usize,
+    /// The beta and linear beta of SITU, which a gated product then takes
+    /// in place of SiLU.
+    pub situ: Option<(f32, f32)>,
 }
 
 /// Mixes expert outputs into each token's result; see [`Kernels::moe_combine`].
@@ -146,6 +160,9 @@ struct MoeParams {
     second: u32,
     rows: u32,
     cols: u32,
+    situ: u32,
+    beta: f32,
+    linear: f32,
 }
 
 /// Most experts per layer [`Kernels::moe_route`] chooses from.
@@ -166,6 +183,8 @@ pub struct Routing<'a> {
     pub sigmoid: bool,
     /// Added to each expert's probability to choose it, but not to weigh it.
     pub bias: Option<&'a DeviceBuffer<f32>>,
+    /// Multiplies the weights after they are shares of the chosen.
+    pub scale: f32,
 }
 
 #[repr(C)]
@@ -179,6 +198,7 @@ struct RouteParams {
     stride: u32,
     sigmoid: u32,
     bias: u64,
+    scale: f32,
 }
 
 #[repr(C)]
@@ -245,6 +265,7 @@ impl Kernels {
             stride: r.stride as u32,
             sigmoid: u32::from(r.sigmoid),
             bias: r.bias.map_or(0, |b| b.device_ptr()),
+            scale: r.scale,
         };
         let config =
             LaunchConfig::linear((r.tokens as u32).div_ceil(ROUTE_WARPS), ROUTE_WARPS * 32);
@@ -342,6 +363,34 @@ impl Kernels {
         unsafe { self.quantize_q8k.launch(config, stream, &mut args) }
     }
 
+    /// Queues quantizing the first `len` values of `x`, a multiple of 32,
+    /// into `qs` and, per block of 32, the scale and the scale times the
+    /// sum of the block into `ds`, as GEMV inputs are quantized.
+    pub fn quantize_q8(
+        &self,
+        x: &DeviceBuffer<f32>,
+        len: usize,
+        qs: &mut DeviceBuffer<i8>,
+        ds: &mut DeviceBuffer<f32>,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !len.is_multiple_of(32) {
+            return Err(Error::Shape(format!("{len} values in blocks of 32")));
+        }
+        x.check_holds(len, "quantized input")?;
+        qs.check_holds(len, "quantized values")?;
+        ds.check_holds(len / 16, "quantized scales")?;
+        if len == 0 {
+            return Ok(());
+        }
+        let (src, q, d, n) = (x.device_ptr(), qs.device_ptr(), ds.device_ptr(), len as u32);
+        let mut args = [arg(&src), arg(&q), arg(&d), arg(&n)];
+        let config = LaunchConfig::linear(n.div_ceil(256), 256);
+        // SAFETY: matches `quantize_q8(const float*, int8_t*, float2*,
+        // unsigned)`; sizes were checked above.
+        unsafe { self.quantize_q8.launch(config, stream, &mut args) }
+    }
+
     /// Queues `y[a] = W x[input of a]` for every assignment `a`, `W` being a
     /// matrix of the expert its group names. `y` receives one row of `rows`
     /// values per assignment.
@@ -368,7 +417,8 @@ impl Kernels {
         if p.n_groups == 0 {
             return Ok(());
         }
-        if !p.cols.is_multiple_of(Q8K_BLOCK) {
+        let block = expert_block(p.ty);
+        if !p.cols.is_multiple_of(block) {
             return Err(Error::Shape(format!(
                 "expert product over {} columns",
                 p.cols
@@ -395,13 +445,17 @@ impl Kernels {
             second: p.second.unwrap_or(0) as u32,
             rows: p.rows as u32,
             cols: p.cols as u32,
+            situ: u32::from(p.situ.is_some()),
+            beta: p.situ.map_or(0.0, |s| s.0),
+            linear: p.situ.map_or(0.0, |s| s.1),
         };
         let kernel = if p.second.is_some() {
             &self.moe_gate_up[index]
         } else {
             &self.moe_down[index]
         };
-        let staged = EXPERT_GROUP * (p.cols + 4 * p.cols / Q8K_BLOCK);
+        // the inputs and one scale per block for each of a group's assignments
+        let staged = EXPERT_GROUP * (p.cols + 4 * p.cols / block);
         let config = LaunchConfig {
             grid: [
                 (p.rows as u32).div_ceil(MOE_WARPS * MOE_WARP_ROWS),
