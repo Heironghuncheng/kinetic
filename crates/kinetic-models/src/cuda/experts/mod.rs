@@ -18,11 +18,8 @@
 //! `blocks/moe/kernels.rs`), and outputs are mixed in pick order on the
 //! device, so where an expert ran never changes a token's result.
 
-mod cache;
 mod offload;
 mod place;
-mod plan;
-mod stats;
 #[cfg(test)]
 mod tests;
 mod work;
@@ -35,6 +32,7 @@ use kinetic_quant::{Matrix, TensorType};
 
 use super::{cuda_error, Gpu};
 use crate::blocks::{Gating, Moe, Pick};
+use crate::offload::{cache, plan, stats};
 use crate::LoadError;
 
 pub(super) use offload::Offload;

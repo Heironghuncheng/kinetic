@@ -3,7 +3,7 @@
 
 /// Where one layer's expert matrices sit inside a slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SlotLayout {
+pub(crate) struct SlotLayout {
     pub gate: usize,
     pub up: usize,
     pub down: usize,
@@ -27,7 +27,7 @@ struct Pool {
     protected: Vec<bool>,
 }
 
-pub(super) struct ExpertCache {
+pub(crate) struct ExpertCache {
     pools: Vec<Pool>,
     /// The pool of each layer.
     pool_of: Vec<usize>,
