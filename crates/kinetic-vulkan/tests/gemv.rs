@@ -7,8 +7,8 @@ use std::rc::Rc;
 use half::f16;
 use kinetic_quant::{dequantize, Matrix, TensorType};
 use kinetic_vulkan::{
-    Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Error, GemvInput, Instance, Kernels, Out,
-    Rows,
+    Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Error, Gating, GemvInput, Instance,
+    Kernels, Out, Rows,
 };
 
 struct Gpu {
@@ -269,6 +269,152 @@ fn f32_matches_reference() {
 #[test]
 fn tall_matrix_matches_reference() {
     check(TensorType::Q8_0, 4 * 65535 + 9, 32);
+}
+
+/// Expert products: each job of a pass of `tokens` tokens against the f64
+/// reference of its expert and input row, and with the bits it has when its
+/// token runs alone.
+fn check_experts(ty: TensorType, rows: usize, cols: usize) {
+    let (count, used, tokens) = (3, 2, 5);
+    for gpu in gpus() {
+        let mut rng = Lcg(ty as u64 + 21);
+        let data = random_matrix(ty, count * rows, cols, &mut rng);
+        let m = Matrix::new(ty, &data, count * rows, cols);
+        let x: Vec<f32> = (0..tokens * cols).map(|_| rng.f32() * 3.0).collect();
+        let experts: Vec<u32> = (0..tokens * used).map(|_| rng.next() % 3).collect();
+        let picks: Vec<u32> = experts.iter().flat_map(|&e| [e, 0]).collect();
+        let out = Out {
+            stride: rows + 4,
+            offset: 2,
+        };
+        let w = DeviceMatrix::upload(&gpu.device, &m).unwrap();
+        let picks = DeviceBuffer::from_slice(&gpu.device, &picks).unwrap();
+        let mut input = GemvInput::batch(&gpu.device, cols, tokens).unwrap();
+        let mut batch = Batch::new(&gpu.device, tokens, 1, 64, 0).unwrap();
+        let mut run = |n: usize| {
+            batch.set(n, 0, 0..0, None).unwrap();
+            let y = DeviceBuffer::new(&gpu.device, tokens * used * out.stride).unwrap();
+            let mut commands = Commands::new(&gpu.device).unwrap();
+            batch.record_upload(&mut commands).unwrap();
+            input.upload(&gpu.kernels, &x, &mut commands).unwrap();
+            gpu.kernels
+                .gemv_experts(
+                    &w,
+                    count,
+                    used,
+                    &picks,
+                    &input,
+                    used,
+                    &y,
+                    out,
+                    &batch,
+                    &mut commands,
+                )
+                .unwrap();
+            commands.submit().unwrap();
+            y.to_vec().unwrap()
+        };
+        let (alone, all) = (run(1), run(tokens));
+        let name = &gpu.device.info().name;
+        let xe = effective_input(ty, &x, &input);
+        let mut row = vec![0.0; cols];
+        for (job, &e) in experts.iter().enumerate() {
+            let xs = &xe[job / used * cols..][..cols];
+            for r in 0..rows {
+                dequantize(ty, m.row(e as usize * rows + r), &mut row).unwrap();
+                let exact: f64 = row.iter().zip(xs).map(|(&a, &b)| a as f64 * b as f64).sum();
+                let magnitude: f64 = row
+                    .iter()
+                    .zip(xs)
+                    .map(|(&a, &b)| (a as f64 * b as f64).abs())
+                    .sum();
+                let got = all[job * out.stride + out.offset + r];
+                assert!(
+                    (got as f64 - exact).abs() <= 1e-5 * magnitude + 1e-6,
+                    "{name}: {ty} job {job} row {r}: got {got}, expected {exact}"
+                );
+                if job < used {
+                    let one = alone[job * out.stride + out.offset + r];
+                    assert_eq!(one.to_bits(), got.to_bits(), "{name}: {ty} job {job} alone");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn experts_match_reference() {
+    check_experts(TensorType::Q4K, 37, 5 * 256);
+    check_experts(TensorType::Q5K, 37, 3 * 256);
+    check_experts(TensorType::Q6K, 37, 5 * 256);
+    check_experts(TensorType::Q8_0, 37, 41 * 32);
+    check_experts(TensorType::F16, 37, 41 * 32);
+    check_experts(TensorType::F32, 37, 41 * 32);
+}
+
+/// Routing against the same choice made on the host: the experts exactly,
+/// their weights within rounding.
+#[test]
+fn routing_picks_what_the_host_picks() {
+    let (experts, used, tokens) = (40, 4, 6);
+    for gpu in gpus() {
+        for gating in [Gating::Softmax, Gating::Sigmoid] {
+            let mut rng = Lcg(5);
+            let mut logits: Vec<f32> = (0..tokens * experts).map(|_| rng.f32() * 4.0).collect();
+            // A tie, which the lower index wins.
+            logits[3] = logits[7];
+            let bias: Vec<f32> = match gating {
+                Gating::Softmax => vec![0.0; experts],
+                Gating::Sigmoid => (0..experts).map(|_| rng.f32() * 0.1).collect(),
+            };
+            let device_logits = DeviceBuffer::from_slice(&gpu.device, &logits).unwrap();
+            let device_bias = DeviceBuffer::from_slice(&gpu.device, &bias).unwrap();
+            let picks = DeviceBuffer::new(&gpu.device, 2 * tokens * used).unwrap();
+            let mut batch = Batch::new(&gpu.device, tokens, 1, 64, 0).unwrap();
+            batch.set(tokens, 0, 0..0, None).unwrap();
+            let mut commands = Commands::new(&gpu.device).unwrap();
+            batch.record_upload(&mut commands).unwrap();
+            gpu.kernels
+                .route(
+                    &batch,
+                    gating,
+                    &device_logits,
+                    &device_bias,
+                    experts,
+                    used,
+                    &picks,
+                    &mut commands,
+                )
+                .unwrap();
+            commands.submit().unwrap();
+            let picks = picks.to_vec().unwrap();
+            let name = &gpu.device.info().name;
+            for (t, row) in logits.chunks_exact(experts).enumerate() {
+                let probs: Vec<f32> = match gating {
+                    Gating::Sigmoid => row.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect(),
+                    Gating::Softmax => {
+                        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let e: Vec<f32> = row.iter().map(|&x| (x - max).exp()).collect();
+                        let sum: f32 = e.iter().sum();
+                        e.iter().map(|v| v / sum).collect()
+                    }
+                };
+                let score = |e: usize| probs[e] + bias[e];
+                let mut order: Vec<usize> = (0..experts).collect();
+                order.sort_by(|&a, &b| score(b).total_cmp(&score(a)).then(a.cmp(&b)));
+                let sum: f32 = order[..used].iter().map(|&e| probs[e]).sum();
+                for (s, &e) in order[..used].iter().enumerate() {
+                    let at = 2 * (t * used + s);
+                    let weight = f32::from_bits(picks[at + 1]);
+                    assert_eq!(picks[at], e as u32, "{name}: {gating:?} token {t} pick {s}");
+                    assert!(
+                        (weight - probs[e] / sum).abs() < 1e-5,
+                        "{name}: {gating:?} token {t} pick {s} weight {weight}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

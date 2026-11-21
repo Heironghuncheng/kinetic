@@ -21,6 +21,14 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
     ("gemv_q4_k", "", &["gemv", "k4", "gemv_q4_k"]),
     ("gemv_q5_k", "", &["gemv", "k4", "gemv_q5_k"]),
     ("gemv_q6_k", "", &["gemv", "gemv_q6_k"]),
+    ("experts_f32", "", &["experts", "gemv_f32"]),
+    ("experts_f16", "", &["experts", "gemv_f16"]),
+    ("experts_q8_0", "", &["experts", "gemv_q8_0"]),
+    ("experts_q4_k", "", &["experts", "k4", "gemv_q4_k"]),
+    ("experts_q5_k", "", &["experts", "k4", "gemv_q5_k"]),
+    ("experts_q6_k", "", &["experts", "gemv_q6_k"]),
+    ("route", "", &["route"]),
+    ("mix_experts", "", &["mix_experts"]),
     ("quantize_q8", "", &["quantize_q8"]),
     ("read_sum", "", &["read_sum"]),
     ("norm", "", &["norm", "put_q8"]),
@@ -118,7 +126,12 @@ fn main() {
         if metal {
             let mut parts = parts.to_vec();
             parts.extend(METAL_PARTS.iter().filter(|p| p.0 == name).map(|p| p.1));
-            let source = source(constants, &parts, &["shaders/metal", "shaders"]);
+            // The expert kernels take one row per subgroup on every driver.
+            let dirs: &[&str] = match name.starts_with("experts") {
+                true => &["shaders"],
+                false => &["shaders/metal", "shaders"],
+            };
+            let source = source(constants, &parts, dirs);
             let (module, info) = parse(name, &source);
             fs::write(out.join(format!("{name}.metal")), msl(name, &module, &info))
                 .expect("write Metal source");

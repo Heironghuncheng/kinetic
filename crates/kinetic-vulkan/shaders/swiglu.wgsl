@@ -1,9 +1,11 @@
 // The gated feed-forward activation of each token row, written as a GEMV
 // input: out = silu(gate) * up, where a row of `gu` holds the `len` gate
-// values followed by the `len` up values.
+// values followed by the `len` up values. A token has `per_token` rows: one,
+// or one per expert it runs.
 
 struct Shape {
     len: u32,
+    per_token: u32,
 }
 
 var<immediate> shape: Shape;
@@ -23,7 +25,7 @@ fn main(
     let i = group.x * 256u + tid;
     let row = group.y;
     // `len` is a multiple of 32, so subgroups leave whole.
-    if row >= batch[0] || i >= shape.len {
+    if row >= batch[0] * shape.per_token || i >= shape.len {
         return;
     }
     let g = gu[2u * row * shape.len + i];

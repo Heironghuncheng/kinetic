@@ -59,6 +59,14 @@ pub struct Kernels {
     /// cooperative f16 matrices (`Features::matrix_f16`).
     #[cfg(not(metal_driver))]
     pub(crate) mm: Vec<(TensorType, Rc<Kernel>)>,
+    pub(crate) experts_f32: Rc<Kernel>,
+    pub(crate) experts_f16: Rc<Kernel>,
+    pub(crate) experts_q8_0: Rc<Kernel>,
+    pub(crate) experts_q4_k: Rc<Kernel>,
+    pub(crate) experts_q5_k: Rc<Kernel>,
+    pub(crate) experts_q6_k: Rc<Kernel>,
+    pub(crate) route: Rc<Kernel>,
+    pub(crate) mix_experts: Rc<Kernel>,
     pub(crate) quantize_q8: Rc<Kernel>,
     pub(crate) norm: Rc<Kernel>,
     pub(crate) swiglu: Rc<Kernel>,
@@ -103,6 +111,7 @@ impl Kernels {
     pub fn load_with(device: &Rc<Device>, matrix: bool) -> Result<Kernels> {
         let gemv = |name, spirv| Kernel::new(device, name, spirv, 6, 5);
         let attend = |name, spirv| Kernel::new(device, name, spirv, 7, 9);
+        let experts = |name, spirv| Kernel::new(device, name, spirv, 7, 7);
         #[cfg(not(metal_driver))]
         let matrix = matrix && device.info().features.matrix_f16;
         #[cfg(metal_driver)]
@@ -137,9 +146,17 @@ impl Kernels {
                     .collect::<Result<_>>()?,
                 false => Vec::new(),
             },
+            experts_f32: experts("experts_f32", spirv!("experts_f32"))?,
+            experts_f16: experts("experts_f16", spirv!("experts_f16"))?,
+            experts_q8_0: experts("experts_q8_0", spirv!("experts_q8_0"))?,
+            experts_q4_k: experts("experts_q4_k", spirv!("experts_q4_k"))?,
+            experts_q5_k: experts("experts_q5_k", spirv!("experts_q5_k"))?,
+            experts_q6_k: experts("experts_q6_k", spirv!("experts_q6_k"))?,
+            route: Kernel::new(device, "route", spirv!("route"), 4, 3)?,
+            mix_experts: Kernel::new(device, "mix_experts", spirv!("mix_experts"), 5, 3)?,
             quantize_q8: Kernel::new(device, "quantize_q8", spirv!("quantize_q8"), 3, 1)?,
             norm: Kernel::new(device, "norm", spirv!("norm"), 8, 4)?,
-            swiglu: Kernel::new(device, "swiglu", spirv!("swiglu"), 5, 1)?,
+            swiglu: Kernel::new(device, "swiglu", spirv!("swiglu"), 5, 2)?,
             argmax: Kernel::new(device, "argmax", spirv!("argmax"), 3, 1)?,
             rope: Kernel::new(device, "rope", spirv!("rope"), 5, 13)?,
             short_conv: Kernel::new(device, "short_conv", spirv!("short_conv"), 7, 3)?,

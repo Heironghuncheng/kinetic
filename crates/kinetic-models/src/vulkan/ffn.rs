@@ -44,7 +44,7 @@ impl VulkanFfn {
             Ok(())
         })?;
         let act = w.activations(n_ff);
-        k.swiglu(&w.batch, &w.gu, act, c)?;
+        k.swiglu(&w.batch, 1, &w.gu, act, c)?;
         let out = Out {
             stride: w.d,
             offset: 0,
