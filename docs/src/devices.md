@@ -108,10 +108,11 @@ with drafting and Warm Start; MoE models and the other architectures are
 [coming](roadmap.md). Under `auto`, Vulkan is tried after CUDA, so an NVIDIA
 GPU uses CUDA and an AMD or Intel GPU uses Vulkan.
 
-The Vulkan kernels need subgroups of 32. NVIDIA, Intel and AMD's RDNA GPUs
-have them; AMD's older GCN and Vega GPUs, among them the integrated graphics
-of many Ryzen APUs, only run subgroups of 64, which no driver changes, so
-models run on the CPU there and `kinetic doctor` says so.
+The Vulkan kernels run in subgroups of 32 where the GPU offers them, as
+NVIDIA, Intel and AMD's RDNA GPUs do. AMD's older GCN and Vega GPUs, among
+them the integrated graphics of many Ryzen APUs, only run subgroups of 64;
+there each half of a subgroup does the work of a subgroup of 32, and models
+run on them as on the others.
 
 On GPUs with cooperative f16 matrices (`VK_KHR_cooperative_matrix`, such as
 AMD's RDNA3 cards and NVIDIA's RTX cards), prompts run on the matrix units:

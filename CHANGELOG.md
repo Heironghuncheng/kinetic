@@ -24,6 +24,9 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   through MoltenVK or KosmicKrisp: it opts into portability drivers, finds
   Homebrew's loader and accepts devices whose subgroups are 32 wide without
   being asked.
+- AMD's GCN and Vega GPUs through Vulkan. They only run subgroups of 64, so
+  every kernel is also built for them, with each half of a subgroup doing
+  the work of a subgroup of 32; `kinetic doctor` no longer turns them away.
 
 ### Fixed
 
