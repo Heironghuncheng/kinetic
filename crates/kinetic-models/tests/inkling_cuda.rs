@@ -34,11 +34,26 @@ const VOCAB: u64 = 64;
 /// Long enough for the windowed layers to wrap their caches.
 const WINDOW: u32 = 4;
 
-/// The tensors of the model and their types: every other layer windowed,
-/// blocks of two layers and a core of one block that runs three times.
-fn tensors(dense: TensorType) -> Vec<(String, Vec<u64>, TensorType)> {
-    let (heads, hd, rel, taps, experts, ff, rank) = (2, 64, 2, 4, 4, 96, 32);
-    let (f32, q8, iq4) = (TensorType::F32, dense, TensorType::IQ4NL);
+/// Passes of the core.
+const PASSES: usize = 3;
+
+/// A variant of the tiny model: the types of its dense weights and of its
+/// experts, how many of the four experts each token uses, and whether the
+/// file unrolls the loop as Unsloth's do.
+#[derive(Clone, Copy, Debug)]
+struct Tiny {
+    dense: TensorType,
+    experts: TensorType,
+    used: u32,
+    unrolled: bool,
+}
+
+/// The tensors of the model in the looped layout, with their types: every
+/// other layer windowed, blocks of two layers and a core of one block that
+/// runs three times. NVFP4 experts come with per-expert scales.
+fn tensors(c: &Tiny) -> Vec<(String, Vec<u64>, TensorType)> {
+    let (heads, hd, rel, taps, experts, ff, rank) = (2, 64, 2, 4, 4, 128, 32);
+    let (f32, q8, exps) = (TensorType::F32, c.dense, c.experts);
     let mut t: Vec<(String, Vec<u64>, TensorType)> = vec![
         ("token_embd.weight".into(), vec![D, VOCAB], q8),
         ("token_embd_norm.weight".into(), vec![D], f32),
@@ -82,8 +97,12 @@ fn tensors(dense: TensorType) -> Vec<(String, Vec<u64>, TensorType)> {
         add("ffn_norm.weight", vec![D], f32);
         add("ffn_gate_inp.weight", vec![D, experts], f32);
         add("exp_probs_b.bias", vec![experts], f32);
-        add("ffn_gate_up_exps.weight", vec![D, 2 * ff, experts], iq4);
-        add("ffn_down_exps.weight", vec![ff, D, experts], iq4);
+        add("ffn_gate_up_exps.weight", vec![D, 2 * ff, experts], exps);
+        add("ffn_down_exps.weight", vec![ff, D, experts], exps);
+        if exps == TensorType::NVFP4 {
+            add("ffn_gate_up_exps.scale", vec![experts], f32);
+            add("ffn_down_exps.scale", vec![experts], f32);
+        }
         if LOOP.contains(&i) {
             add("loop_msg_query.weight", vec![D, 4], f32);
             for x in ["q", "k", "v", "ffn"] {
@@ -100,12 +119,15 @@ fn tensors(dense: TensorType) -> Vec<(String, Vec<u64>, TensorType)> {
     t
 }
 
-/// Small values that vary with the tensor `k` and position `i`; norms and
-/// clips around one. The controls are kept gentle: with full-size ones the
-/// looped model is chaotic, and a weight changed by a part in a thousand
-/// moves the CPU's own logits as much as the device's rounding does.
+/// Small values that vary with the tensor `k` and position `i`; norms,
+/// clips and expert scales around one. The controls are kept gentle: with
+/// full-size ones the looped model is chaotic, and a weight changed by a
+/// part in a thousand moves the CPU's own logits as much as the device's
+/// rounding does.
 fn data(k: usize, name: &str, n: usize, ty: TensorType) -> Vec<u8> {
     let step = |i: usize| ((i * (2 * k + 3)) % 17) as i32 - 8;
+    let codes =
+        |b: usize, len: usize| (0..len).map(move |j| ((b * len + j) * (2 * k + 5) % 251) as u8);
     match ty {
         TensorType::Q8_0 => (0..n / 32)
             .flat_map(|b| {
@@ -117,17 +139,27 @@ fn data(k: usize, name: &str, n: usize, ty: TensorType) -> Vec<u8> {
         TensorType::IQ4NL => (0..n / 32)
             .flat_map(|b| {
                 let mut block = f16::from_f32(0.001).to_le_bytes().to_vec();
-                block.extend((0..16).map(|j| ((b * 16 + j) * (2 * k + 5) % 251) as u8));
+                block.extend(codes(b, 16));
                 block
             })
             .collect(),
+        // E4M3 scale bytes 2 to 6 give 0.002 to 0.006
+        TensorType::NVFP4 => (0..n / 64)
+            .flat_map(|b| {
+                (0..4)
+                    .map(move |g| (2 + (b + g) % 5) as u8)
+                    .chain(codes(b, 32))
+            })
+            .collect(),
         _ => {
-            let shift = if name.contains("norm") || name.contains("_clip") {
-                1.0
-            } else {
-                0.0
-            };
+            let shift =
+                if name.contains("norm") || name.contains("_clip") || name.ends_with(".scale") {
+                    1.0
+                } else {
+                    0.0
+                };
             let gain = if name.contains("ctrl") { 0.2 } else { 1.0 };
+
             (0..n)
                 .flat_map(|i| (step(i) as f32 * 0.07 * gain + shift).to_le_bytes())
                 .collect()
@@ -135,35 +167,89 @@ fn data(k: usize, name: &str, n: usize, ty: TensorType) -> Vec<u8> {
     }
 }
 
-/// The model with its dense weights of type `dense` and `used` of its four
-/// experts per token.
-fn tiny_model(dense: TensorType, used: u32) -> Memory {
-    let arch = "inkling2_loop";
-    let per_layer = |v: Value| Value::Array(vec![v; N_PHYS]);
+/// The variant's tensors with their data, in its layout. Unsloth's unrolls
+/// the loop into `block_count`, names the controls `attn`, `k`, `v` and
+/// `mlp` and keeps the message queries of all core layers in two tables;
+/// its data is that of the looped layout.
+fn tensors_with_data(c: &Tiny) -> Vec<(String, Vec<u64>, TensorType, Vec<u8>)> {
+    let looped = tensors(c)
+        .into_iter()
+        .enumerate()
+        .map(|(k, (name, dims, ty))| {
+            let data = data(k, &name, dims.iter().product::<u64>() as usize, ty);
+            (name, dims, ty, data)
+        });
+    if !c.unrolled {
+        return looped.collect();
+    }
+    let (mut t, mut res, mut kv) = (Vec::new(), Vec::new(), Vec::new());
+    for (name, dims, ty, data) in looped {
+        if name.ends_with("loop_msg_query.weight") {
+            let q = |j: usize| &data[j * 4 * D as usize..][..4 * D as usize];
+            res.extend([q(0), q(3)].concat());
+            kv.extend([q(1), q(2)].concat());
+            continue;
+        }
+        let renamed = ["q", "k", "v", "ffn"]
+            .into_iter()
+            .zip(["attn", "k", "v", "mlp"])
+            .fold(name, |n, (from, to)| {
+                n.replace(&format!("loop_{from}_ctrl_"), &format!("loop_{to}_"))
+            });
+        t.push((renamed, dims, ty, data));
+    }
+    let rows = 2 * LOOP.len() as u64;
+    t.push((
+        "loop_res_query.weight".into(),
+        vec![D, rows],
+        TensorType::F32,
+        res,
+    ));
+    t.push((
+        "loop_kv_res_query.weight".into(),
+        vec![D, rows],
+        TensorType::F32,
+        kv,
+    ));
+    t
+}
+
+fn tiny_model(c: Tiny) -> Memory {
+    let arch = if c.unrolled {
+        "inkling2"
+    } else {
+        "inkling2_loop"
+    };
+    let slots = match c.unrolled {
+        true => N_PHYS + (PASSES - 1) * LOOP.len(),
+        false => N_PHYS,
+    };
+    let per_layer = |v: Value| Value::Array(vec![v; slots]);
     let mut metadata = vec![(
         "general.architecture".to_string(),
         Value::String(arch.into()),
     )];
-    let keys = [
-        ("block_count", Value::U32(N_PHYS as u32)),
+    let mut keys = vec![
+        ("block_count", Value::U32(slots as u32)),
         ("context_length", Value::U32(128)),
         ("embedding_length", Value::U32(D as u32)),
-        ("feed_forward_length", Value::U32(96)),
+        ("feed_forward_length", Value::U32(128)),
         ("attention.head_count", per_layer(Value::U32(2))),
         ("attention.head_count_kv", per_layer(Value::U32(1))),
         ("attention.layer_norm_rms_epsilon", Value::F32(1e-6)),
         ("expert_count", Value::U32(4)),
-        ("expert_used_count", Value::U32(used)),
+        ("expert_used_count", Value::U32(c.used)),
         ("attention.key_length", Value::U32(64)),
         ("attention.value_length", Value::U32(64)),
         ("vocab_size", Value::U32(VOCAB as u32)),
         ("vocab_size_unpadded", Value::U32(60)),
-        ("expert_feed_forward_length", Value::U32(96)),
+        ("expert_feed_forward_length", Value::U32(128)),
         ("rope.dimension_count", Value::U32(0)),
         ("attention.sliding_window", Value::U32(WINDOW)),
+        // the core's layers alternate too, so each pass repeats the pattern
         (
             "attention.sliding_window_pattern",
-            Value::Array((0..N_PHYS).map(|i| Value::Bool(i % 2 == 0)).collect()),
+            Value::Array((0..slots).map(|i| Value::Bool(i % 2 == 0)).collect()),
         ),
         ("shortconv.l_cache", Value::U32(4)),
         ("expert_weights_scale", Value::F32(2.0)),
@@ -177,34 +263,38 @@ fn tiny_model(dense: TensorType, used: u32) -> Memory {
         ("attention.relative_clip", Value::F32(0.8)),
         ("attention.log_scale_floor", Value::U32(2)),
         ("attention.log_scale_alpha", Value::F32(0.5)),
-        ("loop.start", Value::U32(LOOP.start as u32)),
-        ("loop.end", Value::U32(LOOP.end as u32)),
-        ("loop.count", Value::U32(3)),
         ("loop.gate_rank", Value::U32(32)),
-        ("loop.varying", Value::Bool(false)),
     ];
+    keys.extend(match c.unrolled {
+        true => vec![
+            ("num_loops", Value::U32(PASSES as u32)),
+            ("loop.core_start", Value::U32(LOOP.start as u32)),
+            ("loop.core_end", Value::U32(LOOP.end as u32)),
+        ],
+        false => vec![
+            ("loop.start", Value::U32(LOOP.start as u32)),
+            ("loop.end", Value::U32(LOOP.end as u32)),
+            ("loop.count", Value::U32(PASSES as u32)),
+            ("loop.varying", Value::Bool(false)),
+        ],
+    });
     metadata.extend(keys.into_iter().map(|(k, v)| (format!("{arch}.{k}"), v)));
-    let tensors = tensors(dense);
+    let tensors = tensors_with_data(&c);
     let out: Vec<TensorOut> = tensors
         .iter()
-        .map(|(name, dims, ty)| TensorOut {
+        .map(|(name, dims, ty, _)| TensorOut {
             name: name.clone(),
             dims: dims.clone(),
             ty: *ty,
         })
         .collect();
     let mut bytes = Vec::new();
-    kinetic_gguf::write(&mut bytes, &metadata, &out, |k| {
-        let (name, dims, ty) = &tensors[k];
-        Ok(data(k, name, dims.iter().product::<u64>() as usize, *ty))
-    })
-    .unwrap();
+    kinetic_gguf::write(&mut bytes, &metadata, &out, |k| Ok(tensors[k].3.clone())).unwrap();
     Memory {
         header: Gguf::parse(&bytes).unwrap(),
         bytes,
     }
 }
-
 const PROMPT: [u32; 12] = [1, 40, 10, 23, 50, 7, 31, 12, 33, 6, 45, 24];
 const NEXT: [u32; 6] = [30, 3, 59, 7, 17, 9];
 
@@ -218,49 +308,102 @@ fn bits(x: &[f32]) -> Vec<u32> {
 ///
 /// With f32 dense weights and every expert used, the device follows the
 /// CPU within its rounding. With the file's types and two experts of four,
-/// rounding may change which experts run, so that model checks exactness
-/// alone.
+/// rounding may change which experts run, so those models check exactness
+/// alone. Both layouts of the published files, and their two expert types
+/// that the device reads in their own bytes, run every check.
 #[test]
 #[ignore = "needs a CUDA device"]
 fn inkling_on_cuda_matches_the_cpu_and_changes_no_bit() {
-    for (dense, used) in [(TensorType::F32, 4), (TensorType::Q8_0, 2)] {
-        let file = tiny_model(dense, used);
-        let model = kinetic_models::load(&file).unwrap();
-        let gpu = CudaModel::load(&model, 128).unwrap();
-        assert!(
-            gpu.plan()
-                .is_some_and(|p| p.pools.iter().all(|p| p.slots == p.layers * 4)),
-            "every expert on the device"
-        );
-        if dense == TensorType::F32 {
-            logits_match_the_cpu(&gpu, &model);
-        }
-        exactness(&gpu, &model);
-    }
+    for experts in [TensorType::IQ4NL, TensorType::NVFP4] {
+        let mut looped_logits = None;
+        for unrolled in [false, true] {
+            let close = Tiny {
+                dense: TensorType::F32,
+                experts,
+                used: 4,
+                unrolled,
+            };
+            let file = tiny_model(close);
+            let model = kinetic_models::load(&file).unwrap();
+            let gpu = CudaModel::load(&model, 128).unwrap();
+            assert!(
+                gpu.plan()
+                    .is_some_and(|p| p.pools.iter().all(|p| p.slots == p.layers * 4)),
+                "every expert on the device"
+            );
+            let logits = logits_match_the_cpu(&gpu, &model);
+            greedy_tokens_match_the_cpu(&gpu, &model);
+            // the layouts hold one model
+            assert_eq!(
+                looped_logits.get_or_insert_with(|| logits.clone()),
+                &logits,
+                "{close:?}"
+            );
+            drop(gpu);
 
-    // Three slots of one layer's experts for all 24: most picks run on the
-    // host or come over for a batch, and the result must not depend on
-    // where they ran.
-    let file = tiny_model(TensorType::Q8_0, 2);
-    let model = kinetic_models::load(&file).unwrap();
-    let slot = (2 * 96 * 64 + 64 * 96) / 32 * 18;
-    let placement = Placement {
-        expert_cache: Some(3 * slot),
-        ..Placement::default()
-    };
-    let gpu = CudaModel::load_with(&model, 128, placement).unwrap();
-    let plan = gpu.plan().unwrap();
-    assert_eq!(
-        plan.pools.iter().map(|p| p.slots).sum::<usize>(),
-        3,
-        "{plan}"
-    );
-    exactness(&gpu, &model);
-    let stats = gpu.stats().unwrap();
-    eprintln!("offloaded experts: {stats:?}");
-    assert!(stats.host_experts > 0 && stats.loaded > 0, "{stats:?}");
+            let exact = Tiny {
+                dense: TensorType::Q8_0,
+                used: 2,
+                ..close
+            };
+            let file = tiny_model(exact);
+            let model = kinetic_models::load(&file).unwrap();
+            let gpu = CudaModel::load(&model, 128).unwrap();
+            exactness(&gpu, &model);
+            drop(gpu);
+
+            // Three slots for all 24 experts: most picks run on the host or
+            // come over for a batch, and the result must not depend on
+            // where they ran.
+            let slot = gpu_slot_bytes(experts);
+            let placement = Placement {
+                expert_cache: Some(3 * slot),
+                ..Placement::default()
+            };
+            let gpu = CudaModel::load_with(&model, 128, placement).unwrap();
+            let plan = gpu.plan().unwrap();
+            assert_eq!(
+                plan.pools.iter().map(|p| p.slots).sum::<usize>(),
+                3,
+                "{plan}"
+            );
+            exactness(&gpu, &model);
+            let stats = gpu.stats().unwrap();
+            eprintln!("{exact:?} offloaded: {stats:?}");
+            assert!(stats.host_experts > 0 && stats.loaded > 0, "{stats:?}");
+        }
+    }
 }
 
+/// Device bytes of one expert of the tiny model with experts of `ty`, and
+/// with NVFP4 its three scales.
+fn gpu_slot_bytes(ty: TensorType) -> usize {
+    let values = 3 * 128 * 64;
+    match ty {
+        TensorType::NVFP4 => values / 64 * 36 + 12,
+        _ => values / 32 * 18,
+    }
+}
+
+/// Greedy decoding from the prompt picks the same tokens on both.
+fn greedy_tokens_match_the_cpu(gpu: &CudaModel, model: &kinetic_models::Model) {
+    let argmax = kinetic_models::speculative::argmax;
+    let mut cpu = model.new_state();
+    let mut dev = gpu.new_state().unwrap();
+    let mut want = vec![argmax(&model.run(&mut cpu, &PROMPT, false).logits)];
+    let mut got = vec![argmax(&gpu.run(&mut dev, &PROMPT, false).unwrap().logits)];
+    for _ in 0..12 {
+        want.push(argmax(
+            &model.run(&mut cpu, &want[want.len() - 1..], false).logits,
+        ));
+        got.push(argmax(
+            &gpu.run(&mut dev, &got[got.len() - 1..], false)
+                .unwrap()
+                .logits,
+        ));
+    }
+    assert_eq!(got, want);
+}
 fn exactness(gpu: &CudaModel, model: &kinetic_models::Model) {
     a_batch_matches_token_by_token(gpu);
     rollback_leaves_the_state_as_if_never_run(gpu);
@@ -271,9 +414,13 @@ fn exactness(gpu: &CudaModel, model: &kinetic_models::Model) {
 }
 
 /// The GPU's logits after every token of a prompt and of single steps are
-/// the CPU's within the rounding of the device's f16 cache and its own
-/// order of sums.
-fn logits_match_the_cpu(gpu: &CudaModel, model: &kinetic_models::Model) {
+/// the CPU's within the device's rounding: its f16 cache and inputs of
+/// quantized products in blocks of 32. The first token, which no earlier
+/// rounding reaches through attention, within two parts in a thousand; later
+/// ones, where the tiny looped model amplifies rounding about as much as a
+/// part-in-a-thousand change of its weights moves the CPU's own logits,
+/// within three parts in a hundred, which still catches any wiring error.
+fn logits_match_the_cpu(gpu: &CudaModel, model: &kinetic_models::Model) -> Vec<f32> {
     let mut cpu = model.new_state();
     let mut want = model.run(&mut cpu, &PROMPT, true).logits;
     let mut state = gpu.new_state().unwrap();
@@ -297,10 +444,12 @@ fn logits_match_the_cpu(gpu: &CudaModel, model: &kinetic_models::Model) {
     let worst = rows.iter().fold(0.0f32, |m, &r| m.max(r));
     let scale = want.iter().fold(0.0f32, |m, w| m.max(w.abs()));
     eprintln!("largest logit difference from the CPU per token: {rows:?} (logits up to {scale})");
+    assert!(rows[0] <= 2e-3 * scale.max(1.0), "first token: {rows:?}");
     assert!(
-        worst <= 0.01 * scale.max(1.0),
+        worst <= 0.03 * scale.max(1.0),
         "{worst} against logits up to {scale}"
     );
+    got
 }
 
 fn a_batch_matches_token_by_token(gpu: &CudaModel) {
