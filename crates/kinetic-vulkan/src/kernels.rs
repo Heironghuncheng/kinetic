@@ -55,6 +55,7 @@ pub struct Kernels {
     pub(crate) gemv_q6_k_many: Rc<Kernel>,
     pub(crate) gemv_q5_k: Rc<Kernel>,
     pub(crate) gemv_q6_k: Rc<Kernel>,
+    pub(crate) gemv_iq4_nl: Rc<Kernel>,
     /// Products of prompt passes on the matrix units, on devices with
     /// cooperative f16 matrices (`Features::matrix_f16`).
     #[cfg(not(metal_driver))]
@@ -65,6 +66,7 @@ pub struct Kernels {
     pub(crate) experts_q4_k: Rc<Kernel>,
     pub(crate) experts_q5_k: Rc<Kernel>,
     pub(crate) experts_q6_k: Rc<Kernel>,
+    pub(crate) experts_iq4_nl: Rc<Kernel>,
     pub(crate) route: Rc<Kernel>,
     pub(crate) mix_experts: Rc<Kernel>,
     pub(crate) quantize_q8: Rc<Kernel>,
@@ -138,6 +140,7 @@ impl Kernels {
             )?,
             gemv_q5_k: gemv("gemv_q5_k", spirv!("gemv_q5_k"))?,
             gemv_q6_k: gemv("gemv_q6_k", spirv!("gemv_q6_k"))?,
+            gemv_iq4_nl: gemv("gemv_iq4_nl", spirv!("gemv_iq4_nl"))?,
             #[cfg(not(metal_driver))]
             mm: match matrix {
                 true => MATRIX_TYPES
@@ -152,6 +155,7 @@ impl Kernels {
             experts_q4_k: experts("experts_q4_k", spirv!("experts_q4_k"))?,
             experts_q5_k: experts("experts_q5_k", spirv!("experts_q5_k"))?,
             experts_q6_k: experts("experts_q6_k", spirv!("experts_q6_k"))?,
+            experts_iq4_nl: experts("experts_iq4_nl", spirv!("experts_iq4_nl"))?,
             route: Kernel::new(device, "route", spirv!("route"), 4, 3)?,
             mix_experts: Kernel::new(device, "mix_experts", spirv!("mix_experts"), 5, 3)?,
             quantize_q8: Kernel::new(device, "quantize_q8", spirv!("quantize_q8"), 3, 1)?,

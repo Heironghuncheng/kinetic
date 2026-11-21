@@ -74,7 +74,7 @@ fn random_matrix(ty: TensorType, rows: usize, cols: usize, rng: &mut Lcg) -> Vec
             let scale_offsets: &[usize] = match ty {
                 TensorType::Q4K | TensorType::Q5K => &[0, 2],
                 TensorType::Q6K => &[208],
-                TensorType::Q8_0 => &[0],
+                TensorType::Q8_0 | TensorType::IQ4NL => &[0],
                 _ => unreachable!(),
             };
             let mut data: Vec<u8> = (0..blocks * size).map(|_| rng.next() as u8).collect();
@@ -256,6 +256,11 @@ fn q8_0_matches_reference() {
 }
 
 #[test]
+fn iq4_nl_matches_reference() {
+    check(TensorType::IQ4NL, 37, 41 * 32);
+}
+
+#[test]
 fn f16_matches_reference() {
     check(TensorType::F16, 37, 41 * 32);
 }
@@ -348,6 +353,7 @@ fn experts_match_reference() {
     check_experts(TensorType::Q5K, 37, 3 * 256);
     check_experts(TensorType::Q6K, 37, 5 * 256);
     check_experts(TensorType::Q8_0, 37, 41 * 32);
+    check_experts(TensorType::IQ4NL, 37, 41 * 32);
     check_experts(TensorType::F16, 37, 41 * 32);
     check_experts(TensorType::F32, 37, 41 * 32);
 }
