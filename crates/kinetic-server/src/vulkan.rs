@@ -49,10 +49,12 @@ fn vulkan_error(e: kinetic_vulkan::Error) -> LoadError {
 
 impl<'a> VulkanBackend<'a> {
     /// Uploads `model` to the first Vulkan device that can run it, for
-    /// sequences of up to `context` tokens. Fails when no device is usable
-    /// or the model needs something the Vulkan kernels lack.
-    pub fn new(model: &'a Model<'a>, context: usize) -> Result<Self, LoadError> {
-        let gpu = VulkanModel::load(model, context)?;
+    /// sequences of up to `context` tokens, with prompt passes on its matrix
+    /// units if `matrix` and it has them; see [`VulkanModel::matrix`].
+    /// Fails when no device is usable or the model needs something the
+    /// Vulkan kernels lack.
+    pub fn new(model: &'a Model<'a>, context: usize, matrix: bool) -> Result<Self, LoadError> {
+        let gpu = VulkanModel::load(model, context, matrix)?;
         let state = gpu.new_state().map_err(vulkan_error)?;
         // the drafter's cache shares the memory, so a full device fails here
         // and not on the first request
@@ -65,7 +67,16 @@ impl<'a> VulkanBackend<'a> {
             }),
             warm: None,
             cpu: CpuBackend::new(model),
-            device: format!("{} ({})", gpu.device_name(), kinetic_vulkan::API),
+            // receipts class devices by this name, so it says which path
+            // gives the prompt's bits
+            device: match gpu.matrix() {
+                true => format!(
+                    "{} ({}, cooperative matrices)",
+                    gpu.device_name(),
+                    kinetic_vulkan::API
+                ),
+                false => format!("{} ({})", gpu.device_name(), kinetic_vulkan::API),
+            },
             model,
             gpu,
         })
@@ -73,8 +84,18 @@ impl<'a> VulkanBackend<'a> {
 
     /// [`VulkanBackend::new`] that never drafts, so every token costs one
     /// forward pass, as benchmarks want.
-    pub fn plain(model: &'a Model<'a>, context: usize) -> Result<Self, LoadError> {
-        VulkanBackend::new(model, context).map(Self::without_drafts)
+    pub fn plain(model: &'a Model<'a>, context: usize, matrix: bool) -> Result<Self, LoadError> {
+        VulkanBackend::new(model, context, matrix).map(Self::without_drafts)
+    }
+
+    /// The kernel path that decides the bits, for keying warm states and
+    /// receipts: `vulkan`, or `vulkan-coopmat` where prompt passes run on
+    /// the matrix units.
+    pub fn class(&self) -> &'static str {
+        match self.gpu.matrix() {
+            true => "vulkan-coopmat",
+            false => "vulkan",
+        }
     }
 
     /// Turns RAD-1 off: every token costs one forward pass.

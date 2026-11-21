@@ -1078,14 +1078,15 @@ fn vulkan_backend<'a>(
     runtime: &RuntimeArgs,
     context: usize,
 ) -> Option<std::result::Result<Placed<'a>, kinetic_models::LoadError>> {
+    let matrix = !runtime.is_off(Tech::Coopmat);
     Some(
-        kinetic_server::VulkanBackend::new(model, context).map(|gpu| {
+        kinetic_server::VulkanBackend::new(model, context, matrix).map(|gpu| {
             let gpu = match runtime.is_off(Tech::Rad1) {
                 true => gpu.without_drafts(),
                 false => gpu,
             };
             let name = gpu.device().to_owned();
-            let gpu = match warm_cache(model, path, runtime, Some("vulkan")) {
+            let gpu = match warm_cache(model, path, runtime, Some(gpu.class())) {
                 Some(w) => gpu.with_warm(w),
                 None => gpu,
             };

@@ -165,7 +165,9 @@ impl<D> Decoder<D> {
     where
         D: Drafter<M>,
     {
+        model.set_prompt(state, true);
         let (_, hidden) = model.score(state, tokens, false);
+        model.set_prompt(state, false);
         self.drafter.observe(model, tokens, &hidden);
         self.next = None;
     }
@@ -183,7 +185,9 @@ impl<D> Decoder<D> {
         D: Drafter<M>,
     {
         let tokens = &context[start..];
+        model.set_prompt(state, true);
         let (scores, hidden) = policy.score(model, state, tokens, false);
+        model.set_prompt(state, false);
         self.drafter.observe(model, tokens, &hidden);
         self.next = Some(policy.choose(model, &scores, 0, context));
     }

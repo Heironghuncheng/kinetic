@@ -127,6 +127,12 @@ fn rerun_runtime(
     } else {
         Device::Cpu
     });
+    let mut off = vec![Tech::Rad1, Tech::WarmStart, Tech::ZeroWait, Tech::Convoy];
+    // prompts on a device's matrix units give their own bits; the class,
+    // made from the device's name, says whether they ran there
+    if !class.ends_with(", cooperative matrices)") {
+        off.push(Tech::Coopmat);
+    }
     Ok(RuntimeArgs {
         context: int("ctx-size"),
         threads,
@@ -145,9 +151,7 @@ fn rerun_runtime(
         chat_template_file: None,
         lora: Vec::new(),
         lora_scaled: Vec::new(),
-        off: OffArg {
-            off: vec![Tech::Rad1, Tech::WarmStart, Tech::ZeroWait, Tech::Convoy],
-        },
+        off: OffArg { off },
         rope: RopeArgs {
             rope_scaling: parse("rope-scaling")
                 .map(|v| RopeKind::from_str(&v, true))

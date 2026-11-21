@@ -113,6 +113,16 @@ have them; AMD's older GCN and Vega GPUs, among them the integrated graphics
 of many Ryzen APUs, only run subgroups of 64, which no driver changes, so
 models run on the CPU there and `kinetic doctor` says so.
 
+On GPUs with cooperative f16 matrices (`VK_KHR_cooperative_matrix`, such as
+AMD's RDNA3 cards), prompts run on the matrix units: Q8_0 and K-quant
+products of passes of up to 512 tokens take 16x16x16 f16 products into f32,
+about three times as fast as the decode kernels on long prompts. The status
+line says so, `(Vulkan, cooperative matrices)`. As on CUDA, a prompt's state
+then differs slightly from the same tokens decoded one at a time; where the
+prompt is cut changes no bit, and decoding and drafts give exactly what they
+give without it. Warm Start and receipts keep states made this way apart
+from the others, and `--off coopmat` runs prompts with the decode kernels.
+
 ## Dense models larger than the GPU
 
 When a dense model does not fit in GPU memory, Kinetic puts as many of its

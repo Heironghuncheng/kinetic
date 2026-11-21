@@ -43,6 +43,10 @@ pub struct Kernels {
     pub(crate) gemv_q6_k_many: Rc<Kernel>,
     pub(crate) gemv_q5_k: Rc<Kernel>,
     pub(crate) gemv_q6_k: Rc<Kernel>,
+    /// Products of prompt passes on the matrix units, on devices with
+    /// cooperative f16 matrices (`Features::matrix_f16`).
+    #[cfg(not(metal_driver))]
+    pub(crate) mm: Option<MatrixKernels>,
     pub(crate) quantize_q8: Rc<Kernel>,
     pub(crate) norm: Rc<Kernel>,
     pub(crate) swiglu: Rc<Kernel>,
@@ -60,11 +64,30 @@ pub struct Kernels {
     pub(crate) single: DeviceBuffer<u32>,
 }
 
+/// The kernels on the matrix units, by weight type.
+#[cfg(not(metal_driver))]
+pub(crate) struct MatrixKernels {
+    pub(crate) q8_0: Rc<Kernel>,
+    pub(crate) q4_k: Rc<Kernel>,
+    pub(crate) q5_k: Rc<Kernel>,
+    pub(crate) q6_k: Rc<Kernel>,
+}
+
 impl Kernels {
     /// Builds the pipelines for the kernels embedded in this crate.
     pub fn load(device: &Rc<Device>) -> Result<Kernels> {
+        Kernels::load_with(device, true)
+    }
+
+    /// [`Kernels::load`], with prompt passes on the matrix units only if
+    /// `matrix` and the device has them; see [`Kernels::matrix`].
+    pub fn load_with(device: &Rc<Device>, matrix: bool) -> Result<Kernels> {
         let gemv = |name, spirv| Kernel::new(device, name, spirv, 6, 5);
         let attend = |name, spirv| Kernel::new(device, name, spirv, 7, 9);
+        #[cfg(not(metal_driver))]
+        let matrix = matrix && device.info().features.matrix_f16;
+        #[cfg(metal_driver)]
+        let _ = matrix;
         Ok(Kernels {
             gemv_f32: gemv("gemv_f32", spirv!("gemv_f32"))?,
             gemv_f16: gemv("gemv_f16", spirv!("gemv_f16"))?,
@@ -87,6 +110,17 @@ impl Kernels {
             )?,
             gemv_q5_k: gemv("gemv_q5_k", spirv!("gemv_q5_k"))?,
             gemv_q6_k: gemv("gemv_q6_k", spirv!("gemv_q6_k"))?,
+            #[cfg(not(metal_driver))]
+            mm: matrix
+                .then(|| -> Result<MatrixKernels> {
+                    Ok(MatrixKernels {
+                        q8_0: gemv("mm_q8_0", spirv!("mm_q8_0"))?,
+                        q4_k: gemv("mm_q4_k", spirv!("mm_q4_k"))?,
+                        q5_k: gemv("mm_q5_k", spirv!("mm_q5_k"))?,
+                        q6_k: gemv("mm_q6_k", spirv!("mm_q6_k"))?,
+                    })
+                })
+                .transpose()?,
             quantize_q8: Kernel::new(device, "quantize_q8", spirv!("quantize_q8"), 3, 1)?,
             norm: Kernel::new(device, "norm", spirv!("norm"), 8, 4)?,
             swiglu: Kernel::new(device, "swiglu", spirv!("swiglu"), 5, 1)?,
@@ -102,6 +136,29 @@ impl Kernels {
             read_sum: Kernel::new(device, "read_sum", spirv!("read_sum"), 2, 1)?,
             single: DeviceBuffer::from_slice(device, &[1, 0, 0, 1])?,
         })
+    }
+
+    /// Whether prompt passes run their products on the matrix units, in
+    /// f16 terms: close to the GEMV's sums, not equal; see
+    /// [`Kernels::exact_prompt`].
+    pub fn matrix(&self) -> bool {
+        #[cfg(metal_driver)]
+        return false;
+        #[cfg(not(metal_driver))]
+        self.mm.is_some()
+    }
+
+    /// Most tokens worth running as one prompt pass, or 0 where the device
+    /// has no kernels of its own for such passes; see
+    /// [`Commands::set_prompt`].
+    pub fn prompt_batch(&self) -> usize {
+        #[cfg(metal_driver)]
+        return 64;
+        #[cfg(not(metal_driver))]
+        match self.mm {
+            Some(_) => 512,
+            None => 0,
+        }
     }
 
     /// Reads all of `data` once and adds its sum as 32-bit words to `out[0]`.
