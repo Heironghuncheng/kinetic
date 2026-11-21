@@ -311,7 +311,7 @@ fn chat(engine: &Engine, req: ChatRequest, out: &mut impl Write) -> Result<(), A
     };
     if !req.common.stream() {
         let c = engine
-            .complete_with_logprobs(&prompt, &request, log.as_ref(), &mut |_, _| true)
+            .complete_chat_with_logprobs(&prompt, &request, log.as_ref(), &mut |_, _| true)
             .map_err(invalid)?;
         let ids = call_ids(&c);
         let mut body = api::chat_response(&meta, &c, &ids);
@@ -330,9 +330,9 @@ fn chat(engine: &Engine, req: ChatRequest, out: &mut impl Write) -> Result<(), A
     let mut events = Events::new(out, Some(first));
     let mut sent = 0;
     let c = engine
-        .complete_with_logprobs(&prompt, &request, log.as_ref(), &mut |part, generated| {
+        .complete_chat_with_logprobs(&prompt, &request, log.as_ref(), &mut |part, count| {
             let mut lp = log.as_ref().map(|log| {
-                let tokens = log.range(sent, generated);
+                let tokens = log.range(sent, count);
                 sent += tokens.len();
                 logprobs::chat(&tokens, piece)
             });
