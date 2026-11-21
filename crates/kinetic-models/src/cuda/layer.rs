@@ -9,6 +9,7 @@ use super::experts::{CudaExperts, ExpertWork, Offload};
 use super::ffn::CudaFfn;
 use super::mamba2::CudaMamba2;
 use super::per_layer::CudaLayerInput;
+use super::relative::{CudaRelative, RelState};
 use super::scratch::{Needs, Scratch};
 use super::short_conv::CudaShortConv;
 use super::{cuda_error, Gpu};
@@ -23,6 +24,8 @@ pub(super) enum CudaMixer {
     Mamba2(CudaMamba2),
     /// Mixers that read the same input, with their outputs summed.
     Parallel(Vec<CudaMixer>),
+    /// Attention by relative distance, run by its network.
+    Relative(CudaRelative),
 }
 
 pub(super) enum LayerState {
@@ -31,6 +34,7 @@ pub(super) enum LayerState {
     ShortConv(ConvState),
     Mamba2(SsmState),
     Parallel(Vec<LayerState>),
+    Relative(RelState),
 }
 
 impl LayerState {
@@ -41,6 +45,7 @@ impl LayerState {
             LayerState::ShortConv(s) => s.size_bytes(),
             LayerState::Mamba2(s) => s.size_bytes(),
             LayerState::Parallel(s) => s.iter().map(LayerState::size_bytes).sum(),
+            LayerState::Relative(s) => s.size_bytes(),
         }
     }
 }
@@ -72,6 +77,8 @@ impl CudaMixer {
             CudaMixer::ShortConv(s) => s.size_bytes(),
             CudaMixer::Mamba2(m) => m.size_bytes(),
             CudaMixer::Parallel(ms) => ms.iter().map(CudaMixer::size_bytes).sum(),
+            CudaMixer::Relative(r) if r.shared => 0,
+            CudaMixer::Relative(r) => r.weights.size_bytes(),
         }
     }
 
@@ -91,6 +98,9 @@ impl CudaMixer {
                     .map(|m| m.new_state(gpu, capacity, rows))
                     .collect::<kinetic_cuda::Result<_>>()?,
             ),
+            CudaMixer::Relative(r) => {
+                LayerState::Relative(r.weights.new_state(gpu, capacity, rows)?)
+            }
         })
     }
 
@@ -106,6 +116,8 @@ impl CudaMixer {
                 .zip(ss)
                 .flat_map(|(m, s)| m.needs(s, rows))
                 .collect(),
+            // its network keeps its buffers
+            (CudaMixer::Relative(_), _) => Vec::new(),
             _ => unreachable!("state does not belong to this mixer"),
         }
     }
@@ -144,6 +156,7 @@ impl CudaMixer {
                 }
                 Ok(())
             }
+            (CudaMixer::Relative(_), _) => unreachable!("relative attention runs in its network"),
             _ => unreachable!("state does not belong to this mixer"),
         }
     }
@@ -157,7 +170,7 @@ impl CudaMixer {
             CudaMixer::DeltaNet(d) => d.needs(1),
             CudaMixer::ShortConv(c) => c.needs(),
             CudaMixer::Mamba2(m) => m.needs(1),
-            CudaMixer::Parallel(_) => return None,
+            CudaMixer::Parallel(_) | CudaMixer::Relative(_) => return None,
         };
         Some((needs.proj, needs.width))
     }
@@ -169,7 +182,9 @@ impl CudaMixer {
             CudaMixer::DeltaNet(d) => d.project(gpu, s, n),
             CudaMixer::ShortConv(c) => c.project(gpu, s, n),
             CudaMixer::Mamba2(m) => m.project(gpu, s, n),
-            CudaMixer::Parallel(_) => unreachable!("parallel mixers run whole"),
+            CudaMixer::Parallel(_) | CudaMixer::Relative(_) => {
+                unreachable!("parallel and relative mixers run whole")
+            }
         }
     }
 
@@ -199,7 +214,9 @@ impl CudaMixer {
             CudaMixer::DeltaNet(d) => d.output(gpu, s, n),
             CudaMixer::ShortConv(c) => c.output(gpu, s, n),
             CudaMixer::Mamba2(m) => m.output(gpu, s, n),
-            CudaMixer::Parallel(_) => unreachable!("parallel mixers run whole"),
+            CudaMixer::Parallel(_) | CudaMixer::Relative(_) => {
+                unreachable!("parallel and relative mixers run whole")
+            }
         }
     }
 
@@ -290,6 +307,24 @@ impl CudaLayer {
             kv_source: l.mixer.kv_source(),
             input: None,
         })
+    }
+
+    /// A layer slot of a network, which runs it and keeps the rest of the
+    /// layer.
+    pub fn in_network(mixer: CudaMixer, eps: f32) -> CudaLayer {
+        CudaLayer {
+            mixer_norm: None,
+            mixer,
+            mixer_out_norm: None,
+            ffn_norm: None,
+            ffn: None,
+            experts: None,
+            ffn_out_norm: None,
+            residual_scale: 1.0,
+            eps,
+            kv_source: None,
+            input: None,
+        }
     }
 
     pub fn size_bytes(&self) -> usize {

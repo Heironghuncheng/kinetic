@@ -28,8 +28,10 @@ mod lanes;
 mod layer;
 mod mamba2;
 mod mtp;
+mod network;
 mod pass;
 mod per_layer;
+mod relative;
 mod scratch;
 mod short_conv;
 mod split;
@@ -54,6 +56,7 @@ use experts::{CudaExperts, ExpertWork, Offload};
 use fold::CudaFolding;
 use kinetic_cuda::Flow;
 use layer::{copy_lent, CudaLayer, LayerState, Routed};
+use network::CudaNetwork;
 use pass::{PassRows, PASS_ROWS};
 use per_layer::{CudaLayerInput, CudaPerLayer};
 use scratch::{Scratch, Spare, Work};
@@ -187,6 +190,8 @@ pub struct CudaModel<'m> {
     folded: bool,
     output_norm: DeviceBuffer<f32>,
     layers: Vec<CudaLayer>,
+    /// Runs `layers` in a model whose layers do not run one after another.
+    network: Option<CudaNetwork>,
     /// The layers after `layers`, on further devices in turn.
     shards: Vec<Shard>,
     per_layer: Option<CudaPerLayer>,
@@ -371,9 +376,17 @@ impl<'m> CudaModel<'m> {
             .map(|(g, _)| batch_rows(&g.kernels, context, prefill))
             .fold(batch_rows(&gpu.kernels, context, prefill), usize::min);
         let mut shard_layers = Vec::new();
+        let mut network = None;
         let (embd, front, layers) = match moes {
             Some(_) => {
-                let layers = upload_experts_layers(&gpu, model)?;
+                let layers = match &model.network {
+                    Some(net) => {
+                        let (layers, net) = network::upload(&gpu, model, net)?;
+                        network = Some(net);
+                        layers
+                    }
+                    None => upload_experts_layers(&gpu, model)?,
+                };
                 // A tied head or a prediction block reads the table.
                 let device = tied
                     || model
@@ -446,6 +459,7 @@ impl<'m> CudaModel<'m> {
             embd_folding: fold(&model.embd_folding)?,
             folded: model.folded,
             layers,
+            network,
             shards,
             per_layer,
             rows,
@@ -504,6 +518,7 @@ impl<'m> CudaModel<'m> {
                 .layers
                 .iter()
                 .filter_map(|l| l.experts.as_ref())
+                .chain(self.network.iter().flat_map(CudaNetwork::experts))
                 .map(CudaExperts::score_rows)
                 .max()
                 .unwrap_or(0),
@@ -560,7 +575,8 @@ impl<'m> CudaModel<'m> {
             Embeddings::Host => 0,
         };
         let per_layer = self.per_layer.as_ref().map_or(0, CudaPerLayer::size_bytes);
-        embd + output + layers + mtp + per_layer
+        let network = self.network.as_ref().map_or(0, CudaNetwork::size_bytes);
+        embd + output + layers + mtp + per_layer + network
     }
 
     /// Free and total device memory in bytes.
@@ -604,6 +620,9 @@ impl<'m> CudaModel<'m> {
             0,
             self.folded,
         )?;
+        if let Some(net) = &self.network {
+            work.net = Some(net.buffers(&self.gpu, &self.layers, rows)?);
+        }
         for shard in &self.shards {
             let layers: Vec<&CudaLayer> = shard.layers.iter().collect();
             // no head there; the batch comes over whole, grid and all
@@ -818,7 +837,8 @@ impl<'m> CudaModel<'m> {
             hidden: vec![0.0; tokens.len() * d],
             logits: Vec::new(),
         };
-        if self.routes_on_host() && since.is_none() && !all_rows && tokens.len() > MAX_BATCH {
+        let passes = self.routes_on_host() && self.network.is_none();
+        if passes && since.is_none() && !all_rows && tokens.len() > MAX_BATCH {
             self.forward_passes(state, tokens, logits, &mut out)?;
             return Ok(out);
         }
@@ -1102,6 +1122,17 @@ impl<'m> CudaModel<'m> {
 
     /// Queues the main device's layers over the batch in `work`.
     fn queue_main(&self, work: &mut Work, flow: Flow) -> kinetic_cuda::Result<()> {
+        if let Some(net) = &self.network {
+            let offload = self.offload.as_ref().expect("a network has experts");
+            let output_norm = &self.output_norm;
+            return net.queue(
+                &self.gpu,
+                &self.layers,
+                work,
+                &mut offload.borrow_mut(),
+                output_norm,
+            );
+        }
         let n = work.batch.len();
         let s = &mut work.scratch;
         if let Some(p) = &self.per_layer {
@@ -1373,6 +1404,11 @@ fn slices(rows: Range<usize>) -> impl Iterator<Item = Range<usize>> {
 /// The routed experts of the layers that have them, in order; the dense
 /// layers come before them (LFM2 MoE).
 fn routed_experts<'m>(model: &Model<'m>) -> Result<Option<Vec<Moe<'m>>>, LoadError> {
+    // later passes of a loop route to the experts of their physical layer
+    if let Some(net) = &model.network {
+        let physical = &model.layers[..net.wiring.len()];
+        return Ok(physical.iter().map(|l| l.experts.clone()).collect());
+    }
     let moes: Vec<Moe<'m>> = model
         .layers
         .iter()

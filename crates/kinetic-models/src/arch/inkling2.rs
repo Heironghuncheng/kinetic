@@ -37,32 +37,32 @@ const UNROLLED_CONTROLS: [&str; 4] = ["attn", "k", "v", "mlp"];
 pub(crate) struct Network<'a> {
     d: usize,
     eps: f32,
-    embd_norm: Vec<f32>,
+    pub(crate) embd_norm: Vec<f32>,
     /// The query that mixes the blocks into the input of the output norm.
-    out_query: Vec<f32>,
+    pub(crate) out_query: Vec<f32>,
     /// Layers per block.
-    block: usize,
+    pub(crate) block: usize,
     /// One per physical layer.
-    wiring: Vec<Wiring<'a>>,
-    core: Option<Core>,
+    pub(crate) wiring: Vec<Wiring<'a>>,
+    pub(crate) core: Option<Core>,
 }
 
 /// The physical layers `start..end` run `passes` times; pass `p > 0` keeps
 /// its states in the layers after the physical ones.
-struct Core {
-    start: usize,
-    end: usize,
-    passes: usize,
+pub(crate) struct Core {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) passes: usize,
 }
 
-struct Wiring<'a> {
+pub(crate) struct Wiring<'a> {
     /// One query for the input of a windowed layer, one each for the
     /// query, key and value inputs of a full one; the first layer has none.
-    attn_query: Option<Vec<f32>>,
-    ffn_query: Vec<f32>,
+    pub(crate) attn_query: Option<Vec<f32>>,
+    pub(crate) ffn_query: Vec<f32>,
     /// Layers of the core: queries for the messages to the query, key,
     /// value and feed-forward inputs, and their controls.
-    looped: Option<(Vec<f32>, [Control<'a>; 4])>,
+    pub(crate) looped: Option<(Vec<f32>, [Control<'a>; 4])>,
 }
 
 fn build<'a>(l: &Loader<'a>, b: &Basics) -> Result<Stack<'a>, LoadError> {
