@@ -85,7 +85,7 @@ impl VulkanModel<'_> {
         let (dev, d) = (&self.gpu.device, self.n_embd);
         let batch = Batch::new(dev, MAX_BATCH, 1, self.context, self.ropes.words())?;
         let layers = std::slice::from_ref(&mtp.layer);
-        let work = Work::new(&self.gpu, layers, d, batch, self.n_vocab())?;
+        let work = Work::new(&self.gpu, layers, None, d, batch, self.n_vocab())?;
         let layer = mtp.layer.new_state(dev, self.context, MAX_BATCH)?;
         let joined = GemvInput::batch(dev, 2 * d, MAX_BATCH)?;
         let joined_host = HostBuffer::new(dev, MAX_BATCH * 2 * d)?;
@@ -131,7 +131,10 @@ impl VulkanModel<'_> {
             &w.batch,
             &w.x,
             None,
-            &mtp.layer.mixer_norm,
+            mtp.layer
+                .mixer_norm
+                .as_ref()
+                .expect("layers of a stream have input norms"),
             self.eps,
             &w.h,
             &mut c,

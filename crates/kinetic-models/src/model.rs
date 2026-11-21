@@ -563,6 +563,7 @@ impl Model<'_> {
                 &mut state.layers,
                 &self.taps,
                 &mut tapped,
+                None,
             );
         } else {
             for (i, layer) in self.layers.iter().enumerate() {
@@ -788,6 +789,30 @@ impl Model<'_> {
             network.norm_embeddings(&mut x);
         }
         x
+    }
+
+    /// The stream after each layer a network runs, in the order it runs
+    /// them, for `tokens` from an empty state: where a device's pass first
+    /// departs from these shows the layer to look at. Empty for a model
+    /// whose layers run on one residual stream.
+    pub fn trace_layers(&self, tokens: &[u32]) -> Vec<Vec<f32>> {
+        let Some(network) = &self.network else {
+            return Vec::new();
+        };
+        let mut state = self.new_state();
+        let mut trace = Vec::new();
+        let x = self.embed(tokens);
+        network.forward(
+            &self.layers,
+            x,
+            0,
+            None,
+            &mut state.layers,
+            &[],
+            &mut [],
+            Some(&mut trace),
+        );
+        trace
     }
 
     pub(crate) fn embed(&self, tokens: &[u32]) -> Vec<f32> {

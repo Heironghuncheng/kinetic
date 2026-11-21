@@ -440,7 +440,8 @@ impl Network<'_> {
     /// through `layers`, the physical ones and then those of every later
     /// pass of the core, and returns the input of the output norm. The
     /// input of each layer visit in `taps`, counted in the order the layers
-    /// run, goes to its slot of `tapped`.
+    /// run, goes to its slot of `tapped`. With `trace`, the stream after
+    /// each layer is pushed to it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward(
         &self,
@@ -451,6 +452,7 @@ impl Network<'_> {
         states: &mut [MixerState],
         taps: &[usize],
         tapped: &mut [Vec<f32>],
+        mut trace: Option<&mut Vec<Vec<f32>>>,
     ) -> Vec<f32> {
         let mut cur = x;
         let d = self.d;
@@ -490,6 +492,9 @@ impl Network<'_> {
                         tree,
                         &mut states[slot],
                     );
+                    if let Some(t) = trace.as_deref_mut() {
+                        t.push(cur.clone());
+                    }
                 }
             }
         }

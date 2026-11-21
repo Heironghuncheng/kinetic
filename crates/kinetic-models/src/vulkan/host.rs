@@ -55,6 +55,13 @@ impl VulkanLayer {
             LayerState::Attention(c) => save_cache(c, self.window(), pos),
             LayerState::ShortConv(ring) => Ok(vec![ring_past(ring, pos)?]),
             LayerState::DeltaNet(s) => Ok(vec![s.save()?, ring_past(s.ring(), pos)?]),
+            LayerState::Relative(s) => {
+                let mut bufs = save_cache(&s.kv, self.window(), pos)?;
+                for ring in &s.rings {
+                    bufs.push(ring_past(ring, pos)?);
+                }
+                Ok(bufs)
+            }
         }
     }
 
@@ -66,6 +73,13 @@ impl VulkanLayer {
             LayerState::DeltaNet(s) => {
                 s.load(bufs[0])?;
                 load_ring(s.ring_mut(), bufs[1], pos)
+            }
+            LayerState::Relative(s) => {
+                load_cache(&mut s.kv, self.window(), pos, bufs[0], bufs[1])?;
+                for (ring, past) in s.rings.iter_mut().zip(&bufs[2..]) {
+                    load_ring(ring, past, pos)?;
+                }
+                Ok(())
             }
         }
     }
@@ -79,7 +93,7 @@ impl VulkanModel<'_> {
         assert!(state.checkpoint.is_none(), "host copy inside a checkpoint");
         let mut host = model.new_state();
         host.pos = state.pos;
-        let layers = self.layers.iter().zip(&state.layers).zip(&mut host.layers);
+        let layers = self.slot_layers().zip(&state.layers).zip(&mut host.layers);
         for ((layer, s), hs) in layers {
             for (dst, src) in hs.buffers_mut().into_iter().zip(layer.save(s, state.pos)?) {
                 *dst = src;
@@ -102,7 +116,7 @@ impl VulkanModel<'_> {
     pub fn load_state(&self, dev: &mut VulkanState, state: &State) -> R<()> {
         dev.pos = state.pos;
         dev.checkpoint = None;
-        let layers = self.layers.iter().zip(&mut dev.layers).zip(&state.layers);
+        let layers = self.slot_layers().zip(&mut dev.layers).zip(&state.layers);
         for ((layer, s), hs) in layers {
             layer.load(s, state.pos, &hs.buffers())?;
         }
@@ -117,7 +131,7 @@ impl VulkanModel<'_> {
             return Ok(());
         }
         let mut layers = Vec::with_capacity(self.layers.len());
-        let all = self.layers.iter().zip(&state.layers).zip(&model.layers);
+        let all = self.slot_layers().zip(&state.layers).zip(&model.layers);
         for ((layer, s), host) in all {
             layers.push(match host.mixer.needs_mark() {
                 true => {

@@ -1,6 +1,7 @@
 use kinetic_vulkan::{Batch, DeviceBuffer, GemvInput, HostBuffer};
 
 use super::layer::VulkanLayer;
+use super::network::{NetWork, VulkanNetwork};
 use super::Gpu;
 
 /// The buffers one sequence runs its passes in.
@@ -26,6 +27,8 @@ pub(super) struct Work {
     ffn: Vec<GemvInput>,
     /// The buffers of routed experts, if any layer has them.
     pub experts: Option<ExpertWork>,
+    /// The buffers of a network's pass, if the model has one.
+    pub net: Option<NetWork>,
     pub logits: DeviceBuffer<f32>,
     pub best: DeviceBuffer<u32>,
     /// The logits of the head's rows, when a run asks for them.
@@ -89,11 +92,12 @@ fn by_width(inputs: &[GemvInput], width: usize) -> &GemvInput {
 }
 
 impl Work {
-    /// Buffers for `layers` of width `d` run on `batch`, with an output
-    /// head of `vocab` rows.
+    /// Buffers for `layers` of width `d`, in `network` if they run in one,
+    /// run on `batch`, with an output head of `vocab` rows.
     pub fn new(
         gpu: &Gpu,
         layers: &[VulkanLayer],
+        network: Option<&VulkanNetwork>,
         d: usize,
         batch: Batch,
         vocab: usize,
@@ -141,6 +145,7 @@ impl Work {
         };
         Ok(Work {
             experts,
+            net: network.map(|n| NetWork::new(gpu, n, d, rows)).transpose()?,
             d,
             x: f32s(rows * d)?,
             y: f32s(rows * d)?,
@@ -179,6 +184,7 @@ impl Work {
             .sum();
         let floats = self.x.len() + self.y.len() + self.proj.len() + self.rec.len() + self.gu.len();
         let experts = self.experts.as_ref().map_or(0, ExpertWork::size_bytes);
-        4 * (floats + self.logits.len()) + inputs + experts
+        let net = self.net.as_ref().map_or(0, NetWork::size_bytes);
+        4 * (floats + self.logits.len()) + inputs + experts + net
     }
 }

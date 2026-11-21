@@ -23,6 +23,8 @@ mod host;
 mod layer;
 mod moe;
 mod mtp;
+mod network;
+mod relative;
 mod rope;
 mod short_conv;
 mod target;
@@ -33,7 +35,7 @@ use std::rc::Rc;
 
 use kinetic_quant::{dequantize_row, Matrix};
 use kinetic_vulkan::{
-    Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Graph, Instance, Kernels, Out,
+    Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Graph, HostBuffer, Instance, Kernels, Out,
     PhysicalDevice, Rows,
 };
 
@@ -41,6 +43,7 @@ use crate::model::{embed_into, Mark};
 use crate::{Forward, LoadError, Model};
 use layer::{LayerState, VulkanLayer};
 use mtp::VulkanMtp;
+use network::VulkanNetwork;
 
 pub use host::VulkanRunner;
 pub use mtp::VulkanMtpState;
@@ -119,6 +122,10 @@ pub struct VulkanModel<'m> {
     output_rows: Matrix<'m>,
     output_norm: DeviceBuffer<f32>,
     layers: Vec<VulkanLayer>,
+    /// The layer of each state slot: each layer's own, or for a network
+    /// the physical layer a pass of its core runs.
+    slots: Vec<usize>,
+    network: Option<VulkanNetwork>,
     mtp: Option<VulkanMtp>,
     ropes: RopeTables,
     /// Most tokens a prompt pass runs: what the device's kernels ask for,
@@ -233,8 +240,17 @@ impl<'m> VulkanModel<'m> {
         };
         let prompt_batch = gpu.kernels.prompt_batch().max(MAX_BATCH);
         let mut ropes = RopeTables::new(prompt_batch);
-        let layers = model
-            .layers
+        let network = model
+            .network
+            .as_ref()
+            .map(|n| VulkanNetwork::upload(&gpu, n, model.n_embd))
+            .transpose()?;
+        let slots = match &network {
+            Some(n) => n.slots(),
+            None => (0..model.layers.len()).collect(),
+        };
+        let uploaded = slots.iter().max().map_or(0, |&s| s + 1);
+        let layers = model.layers[..uploaded]
             .iter()
             .map(|l| VulkanLayer::upload(&gpu, l, &mut ropes))
             .collect::<Result<Vec<_>, _>>()?;
@@ -263,6 +279,8 @@ impl<'m> VulkanModel<'m> {
             mtp,
             output_norm: gpu.vector(&model.output_norm)?,
             layers,
+            slots,
+            network,
             ropes,
             prompt_batch,
             matrix: gpu.kernels.matrix(),
@@ -327,12 +345,19 @@ impl<'m> VulkanModel<'m> {
         let dev = &self.gpu.device;
         let new_work = |rows, head_rows| {
             let batch = Batch::new(dev, rows, head_rows, self.context, self.ropes.words())?;
-            Work::new(&self.gpu, &self.layers, self.n_embd, batch, self.n_vocab())
+            let net = self.network.as_ref();
+            Work::new(
+                &self.gpu,
+                &self.layers,
+                net,
+                self.n_embd,
+                batch,
+                self.n_vocab(),
+            )
         };
         let work = new_work(MAX_BATCH, MAX_BATCH)?;
         let layers = self
-            .layers
-            .iter()
+            .slot_layers()
             .map(|l| l.new_state(dev, self.context, self.prompt_batch))
             .collect::<kinetic_vulkan::Result<Vec<_>>>()?;
         let vocab = self.n_vocab();
@@ -353,8 +378,8 @@ impl<'m> VulkanModel<'m> {
                 .map(|rows| {
                     let work = new_work(rows, 1)?;
                     Ok(PromptPass {
-                        step: self.record(&work, &layers, false, true)?,
-                        step_logits: self.record(&work, &layers, true, true)?,
+                        step: self.record(&work, &layers, false, true, None)?,
+                        step_logits: self.record(&work, &layers, true, true, None)?,
                         work,
                     })
                 })
@@ -365,8 +390,8 @@ impl<'m> VulkanModel<'m> {
             pos: 0,
             checkpoint: None,
             prompt: false,
-            step: self.record(&work, &layers, false, false)?,
-            step_logits: self.record(&work, &layers, true, false)?,
+            step: self.record(&work, &layers, false, false, None)?,
+            step_logits: self.record(&work, &layers, true, false, None)?,
             prompt_passes,
             all_logits: all_logits.finish()?,
             replay,
@@ -382,7 +407,7 @@ impl<'m> VulkanModel<'m> {
         state.checkpoint = None;
         state.prompt = false;
         state.marks.clear();
-        for (layer, s) in self.layers.iter().zip(&mut state.layers) {
+        for (layer, s) in self.slot_layers().zip(&mut state.layers) {
             layer.clear(s)?;
         }
         Ok(())
@@ -401,13 +426,15 @@ impl<'m> VulkanModel<'m> {
 
     /// Records one pass: the batch and embeddings in, every layer, the
     /// head and its greedy tokens, and the results out, with `logits` the
-    /// logits of the first head row too.
+    /// logits of the first head row too. With `trace`, a network's stream
+    /// after each of its layers is copied there too.
     fn record(
         &self,
         w: &Work,
         states: &[LayerState],
         logits: bool,
         prompt: bool,
+        trace: Option<&HostBuffer<f32>>,
     ) -> kinetic_vulkan::Result<Graph> {
         let (k, d) = (&self.gpu.kernels, self.n_embd);
         let mut c = Commands::new(&self.gpu.device)?;
@@ -417,14 +444,17 @@ impl<'m> VulkanModel<'m> {
             w.batch.record_upload(c)?;
             c.upload(&w.embedded, 0, &w.x, 0, rows * d)
         })?;
-        let first = &self.layers[0].mixer_norm;
-        k.norm(&w.batch, &w.x, None, first, self.eps, &w.h, &mut c)?;
-        for (i, (layer, state)) in self.layers.iter().zip(states).enumerate() {
-            let next = self
-                .layers
-                .get(i + 1)
-                .map_or(&self.output_norm, |l| &l.mixer_norm);
-            layer.record(&self.gpu, w, state, next, self.eps, &mut c)?;
+        match &self.network {
+            Some(n) => n.record(
+                &self.gpu,
+                &self.layers,
+                w,
+                states,
+                &self.output_norm,
+                trace,
+                &mut c,
+            )?,
+            None => self.record_layers(w, states, &mut c)?,
         }
         let vocab = self.n_vocab();
         let out = Out {
@@ -449,12 +479,75 @@ impl<'m> VulkanModel<'m> {
         c.finish()
     }
 
+    /// Records the layers of a model on one residual stream, from the
+    /// embeddings in `w.x` to the input of the head in `w.h`.
+    fn record_layers(
+        &self,
+        w: &Work,
+        states: &[LayerState],
+        c: &mut Commands,
+    ) -> kinetic_vulkan::Result<()> {
+        fn norm(l: &VulkanLayer) -> &DeviceBuffer<f32> {
+            let norm = l.mixer_norm.as_ref();
+            norm.expect("layers of a stream have input norms")
+        }
+        let k = &self.gpu.kernels;
+        k.norm(
+            &w.batch,
+            &w.x,
+            None,
+            norm(&self.layers[0]),
+            self.eps,
+            &w.h,
+            c,
+        )?;
+        for (i, (layer, state)) in self.layers.iter().zip(states).enumerate() {
+            let next = self.layers.get(i + 1).map_or(&self.output_norm, norm);
+            layer.record(&self.gpu, w, state, next, self.eps, c)?;
+        }
+        Ok(())
+    }
+
+    /// The layer of each state slot.
+    fn slot_layers(&self) -> impl Iterator<Item = &VulkanLayer> {
+        self.slots.iter().map(|&i| &self.layers[i])
+    }
+
+    /// [Model::trace_layers] on the device: the stream after each layer a
+    /// network runs, for `tokens` from an empty state.
+    pub fn trace_layers(&self, tokens: &[u32]) -> kinetic_vulkan::Result<Vec<Vec<f32>>> {
+        let Some(network) = &self.network else {
+            return Ok(Vec::new());
+        };
+        let mut state = self.new_state()?;
+        self.check(&state, tokens)?;
+        let (n, d) = (tokens.len(), self.n_embd);
+        let w = &mut state.work;
+        let len = w.batch.rows() * d;
+        let layers = network.layer_steps();
+        let trace = HostBuffer::new(&self.gpu.device, layers * len)?;
+        w.batch.set(n, 0, n - 1..n, None)?;
+        self.ropes.fill(&mut w.batch, 0, n);
+        embed_into(
+            &self.embd,
+            self.embd_scale,
+            tokens,
+            &mut w.embedded.as_mut_slice()[..n * d],
+        );
+        let graph = self.record(w, &state.layers, false, false, Some(&trace))?;
+        graph.launch()?;
+        let all = trace.as_slice();
+        Ok((0..layers)
+            .map(|i| all[i * len..][..n * d].to_vec())
+            .collect())
+    }
+
     /// Records what a rollback runs: every layer's replay of the tokens it
     /// keeps.
     fn record_replay(&self, w: &Work, states: &[LayerState]) -> kinetic_vulkan::Result<Graph> {
         let mut c = Commands::new(&self.gpu.device)?;
         w.batch.record_upload(&mut c)?;
-        for (layer, state) in self.layers.iter().zip(states) {
+        for (layer, state) in self.slot_layers().zip(states) {
             layer.record_replay(&self.gpu, w, state, &mut c)?;
         }
         c.finish()

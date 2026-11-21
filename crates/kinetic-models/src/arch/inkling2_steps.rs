@@ -51,4 +51,15 @@ impl Network<'_> {
     pub(crate) fn starts_block(&self, layer: usize) -> bool {
         layer.is_multiple_of(self.block)
     }
+
+    /// Most blocks a mix reads besides the stream, and most a bank holds.
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn most_blocks(&self) -> (usize, usize) {
+        let blocks = self.wiring.len().div_ceil(self.block);
+        let bank = self
+            .core
+            .as_ref()
+            .map_or(0, |c| (c.end - c.start) / self.block);
+        (blocks, bank)
+    }
 }
