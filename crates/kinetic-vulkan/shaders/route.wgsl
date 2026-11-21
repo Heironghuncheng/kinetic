@@ -1,13 +1,15 @@
 // The experts each token of the pass runs: its router logits become
 // probabilities, by a softmax or a sigmoid each, and the `used` experts of
 // the largest probability plus bias are picked, largest first and the lowest
-// index among equals, each weighted by its share of their probabilities. One
-// invocation per token, so a token's picks never depend on the others.
+// index among equals, each weighted by its share of their probabilities
+// times `scale`. One invocation per token, so a token's picks never depend
+// on the others.
 
 struct Shape {
     experts: u32,
     used: u32,
     sigmoid: u32,
+    scale: f32,
 }
 
 var<immediate> shape: Shape;
@@ -73,6 +75,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     sum = max(sum, 6.1035156e-5);
     for (var s = 0u; s < shape.used; s++) {
         let at = 2u * (t * shape.used + s) + 1u;
-        picks[at] = bitcast<u32>(bitcast<f32>(picks[at]) / sum);
+        picks[at] = bitcast<u32>(bitcast<f32>(picks[at]) / sum * shape.scale);
     }
 }

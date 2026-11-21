@@ -232,7 +232,7 @@ impl VulkanModel<'_> {
             offset: 0,
         };
         k.gemv_rows(&head, &w.h, &w.logits, out, Rows::Head, &w.batch, &mut c)?;
-        k.argmax(&w.batch, &w.logits, vocab, &w.best, &mut c)?;
+        k.argmax(&w.batch, &w.logits, vocab, self.logit_cap, &w.best, &mut c)?;
         c.download(&w.best, 0, &w.greedy, 0, 1)?;
         c.finish()
     }

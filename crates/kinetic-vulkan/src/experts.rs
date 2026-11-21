@@ -31,7 +31,7 @@ impl Kernels {
     /// in `logits` become probabilities in place, and `picks` gets the
     /// `used` experts of the largest probability plus `bias`, largest first,
     /// each followed by the bits of its share of their probabilities; two
-    /// words per pick.
+    /// words per pick. The shares are multiplied by `scale`.
     #[allow(clippy::too_many_arguments)]
     pub fn route(
         &self,
@@ -41,6 +41,7 @@ impl Kernels {
         bias: &DeviceBuffer<f32>,
         experts: usize,
         used: usize,
+        scale: f32,
         picks: &DeviceBuffer<u32>,
         commands: &mut Commands,
     ) -> Result<()> {
@@ -56,8 +57,8 @@ impl Kernels {
             )));
         }
         // SAFETY: matches route.wgsl: the batch, logits, bias and picks at
-        // bindings 0..3, then the expert count, picks per token and the
-        // gating; every buffer holds the batch's rows, checked above.
+        // bindings 0..3, then the expert count, picks per token, the gating
+        // and the scale; every buffer holds the batch's rows, checked above.
         unsafe {
             commands.dispatch(
                 &self.route,
@@ -71,6 +72,7 @@ impl Kernels {
                     experts as u32,
                     used as u32,
                     (gating == Gating::Sigmoid) as u32,
+                    scale.to_bits(),
                 ],
                 [rows.div_ceil(ROUTE_THREADS) as u32, 1, 1],
             )

@@ -7,7 +7,7 @@ use std::rc::Rc;
 use half::f16;
 use kinetic_quant::{dequantize, Matrix, TensorType};
 use kinetic_vulkan::{
-    Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Error, Gating, GemvInput, Instance,
+    Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Error, Gating, GemvInput, Glu, Instance,
     Kernels, Out, Rows,
 };
 
@@ -388,6 +388,7 @@ fn routing_picks_what_the_host_picks() {
                     &device_bias,
                     experts,
                     used,
+                    1.0,
                     &picks,
                     &mut commands,
                 )
@@ -419,6 +420,81 @@ fn routing_picks_what_the_host_picks() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// The SiTU product against the same formula on the host.
+#[test]
+fn situ_matches_the_host() {
+    let (len, tokens, beta, linear) = (64, 3, 4.0f32, 25.0f32);
+    for gpu in gpus() {
+        let mut rng = Lcg(9);
+        let gu: Vec<f32> = (0..2 * tokens * len).map(|_| rng.f32() * 40.0).collect();
+        let device_gu = DeviceBuffer::from_slice(&gpu.device, &gu).unwrap();
+        let out = GemvInput::batch(&gpu.device, len, tokens).unwrap();
+        let mut batch = Batch::new(&gpu.device, tokens, 1, 64, 0).unwrap();
+        batch.set(tokens, 0, 0..0, None).unwrap();
+        let mut commands = Commands::new(&gpu.device).unwrap();
+        batch.record_upload(&mut commands).unwrap();
+        let glu = Glu::Situ { beta, linear };
+        gpu.kernels
+            .swiglu(&batch, 1, glu, &device_gu, &out, &mut commands)
+            .unwrap();
+        commands.submit().unwrap();
+        let got = out.values().to_vec().unwrap();
+        for (i, &v) in got.iter().enumerate() {
+            let (g, u) = (
+                gu[2 * (i / len) * len + i % len],
+                gu[(2 * (i / len) + 1) * len + i % len],
+            );
+            let u = linear * (u / linear).tanh();
+            let want = beta * (g / beta).tanh() / (1.0 + (-g).exp()) * u;
+            assert!(
+                (v - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "{i}: {v} against {want}"
+            );
+        }
+    }
+}
+
+/// A capped head: the greedy token of the capped logits, which are left
+/// capped for the host to read.
+#[test]
+fn argmax_caps_the_logits() {
+    let (vocab, cap) = (1000, 30.0f32);
+    for gpu in gpus() {
+        let mut rng = Lcg(13);
+        let logits: Vec<f32> = (0..2 * vocab).map(|_| rng.f32() * 80.0).collect();
+        let device_logits = DeviceBuffer::from_slice(&gpu.device, &logits).unwrap();
+        let best = DeviceBuffer::new(&gpu.device, 4).unwrap();
+        let mut batch = Batch::new(&gpu.device, 2, 2, 64, 0).unwrap();
+        batch.set(2, 0, 0..2, None).unwrap();
+        let mut commands = Commands::new(&gpu.device).unwrap();
+        batch.record_upload(&mut commands).unwrap();
+        gpu.kernels
+            .argmax(
+                &batch,
+                &device_logits,
+                vocab,
+                Some(cap),
+                &best,
+                &mut commands,
+            )
+            .unwrap();
+        commands.submit().unwrap();
+        let (capped, best) = (device_logits.to_vec().unwrap(), best.to_vec().unwrap());
+        for (i, (&l, &c)) in logits.iter().zip(&capped).enumerate() {
+            let want = cap * (l / cap).tanh();
+            assert!((c - want).abs() <= 1e-5 * cap, "{i}: {c} against {want}");
+        }
+        for (row, l) in capped.chunks_exact(vocab).enumerate() {
+            let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let at = l.iter().position(|&v| v == top).unwrap();
+            assert_eq!(
+                (best[2 * row], f32::from_bits(best[2 * row + 1])),
+                (at as u32, top)
+            );
         }
     }
 }

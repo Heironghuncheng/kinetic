@@ -105,6 +105,7 @@ pub use delta_net::{DeltaShape, DeltaState, DeltaWeights};
 pub use device::Device;
 pub use error::{Error, Result};
 pub use experts::{Gating, Shared};
+pub use ffn::Glu;
 pub use gemv::{DeviceMatrix, GemvInput, Out, Rows};
 pub use info::{DeviceInfo, DeviceKind, Features};
 pub use instance::Instance;

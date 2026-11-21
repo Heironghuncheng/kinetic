@@ -112,6 +112,8 @@ pub struct VulkanModel<'m> {
     eps: f32,
     embd: Matrix<'m>,
     embd_scale: Option<f32>,
+    /// Soft-caps the logits; see `Model::cap`.
+    logit_cap: Option<f32>,
     output: DeviceMatrix,
     /// The output head as the model file holds it, for drafts.
     output_rows: Matrix<'m>,
@@ -216,9 +218,9 @@ impl<'m> VulkanModel<'m> {
                 "weights stored folded are not supported on Vulkan yet".into(),
             ));
         }
-        if model.per_layer.is_some() || model.logit_cap.is_some() {
+        if model.per_layer.is_some() {
             return Err(LoadError(
-                "per-layer inputs and capped logits are not supported on Vulkan yet".into(),
+                "per-layer inputs are not supported on Vulkan yet".into(),
             ));
         }
         let e = &model.embd;
@@ -255,6 +257,7 @@ impl<'m> VulkanModel<'m> {
             eps: model.eps,
             embd: model.embd,
             embd_scale: model.embd_scale,
+            logit_cap: model.logit_cap,
             output: gpu.matrix(&model.output)?,
             output_rows: model.output,
             mtp,
@@ -437,7 +440,7 @@ impl<'m> VulkanModel<'m> {
             &w.batch,
             &mut c,
         )?;
-        k.argmax(&w.batch, &w.logits, vocab, &w.best, &mut c)?;
+        k.argmax(&w.batch, &w.logits, vocab, self.logit_cap, &w.best, &mut c)?;
         c.download(w.h.values(), 0, &w.hidden, 0, rows * d)?;
         c.download(&w.best, 0, &w.greedy, 0, w.greedy.len())?;
         if logits {
