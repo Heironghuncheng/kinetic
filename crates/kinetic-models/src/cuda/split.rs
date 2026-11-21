@@ -35,6 +35,9 @@ pub struct Placement {
     /// them and so changes outputs.
     pub cache_k: KvType,
     pub cache_v: KvType,
+    /// Most device bytes the cache of routed experts may take, besides the
+    /// slots that carry a batch's uncached experts over.
+    pub expert_cache: Option<usize>,
     /// The CUDA devices to spread the layers over, by ordinal, in the order
     /// the layers run; the first also holds the embeddings and the output
     /// head. Empty means device 0 alone. A device may be named twice, which

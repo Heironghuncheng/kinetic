@@ -9,7 +9,7 @@
 
 use half::f16;
 use kinetic_gguf::{Gguf, TensorInfo, TensorOut, TensorSource, TensorType, Value};
-use kinetic_models::cuda::{CudaModel, CudaState, Run};
+use kinetic_models::cuda::{CudaModel, CudaState, Placement, Run};
 use kinetic_models::speculative::{Decoder, Greedy, Lookup, Policy};
 
 struct Memory {
@@ -237,6 +237,28 @@ fn inkling_on_cuda_matches_the_cpu_and_changes_no_bit() {
         }
         exactness(&gpu, &model);
     }
+
+    // Three slots of one layer's experts for all 24: most picks run on the
+    // host or come over for a batch, and the result must not depend on
+    // where they ran.
+    let file = tiny_model(TensorType::Q8_0, 2);
+    let model = kinetic_models::load(&file).unwrap();
+    let slot = (2 * 96 * 64 + 64 * 96) / 32 * 18;
+    let placement = Placement {
+        expert_cache: Some(3 * slot),
+        ..Placement::default()
+    };
+    let gpu = CudaModel::load_with(&model, 128, placement).unwrap();
+    let plan = gpu.plan().unwrap();
+    assert_eq!(
+        plan.pools.iter().map(|p| p.slots).sum::<usize>(),
+        3,
+        "{plan}"
+    );
+    exactness(&gpu, &model);
+    let stats = gpu.stats().unwrap();
+    eprintln!("offloaded experts: {stats:?}");
+    assert!(stats.host_experts > 0 && stats.loaded > 0, "{stats:?}");
 }
 
 fn exactness(gpu: &CudaModel, model: &kinetic_models::Model) {

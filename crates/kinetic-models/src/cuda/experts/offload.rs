@@ -107,11 +107,12 @@ pub(in crate::cuda) struct Offload<'m> {
 
 impl<'m> Offload<'m> {
     /// Plans the cache for `moes` in at most `budget` device bytes, besides
-    /// `dense_bytes` already taken.
+    /// `dense_bytes` already taken, the cache itself at most `cache` bytes.
     pub fn new(
         gpu: &Gpu,
         moes: Vec<Moe<'m>>,
         budget: usize,
+        cache: Option<usize>,
         dense_bytes: usize,
     ) -> Result<Offload<'m>, LoadError> {
         let err = super::cuda_error;
@@ -131,7 +132,9 @@ impl<'m> Offload<'m> {
             region,
         };
         let transit = DeviceBuffer::<u8>::new(&gpu.ctx, TRANSIT_SLOTS * region).map_err(err)?;
-        let budget = budget.saturating_sub(transit.len());
+        let budget = budget
+            .saturating_sub(transit.len())
+            .min(cache.unwrap_or(usize::MAX));
         let (pools, pool_of) = plan::share_cache(&layouts, n_experts, budget);
         let arenas = pools
             .iter()
@@ -254,7 +257,7 @@ impl<'m> Offload<'m> {
                 })
                 .collect();
             let start = Instant::now();
-            moe.run_experts(&h[..tokens * d], &jobs);
+            super::run_host(moe, &h[..tokens * d], &jobs);
             start.elapsed().as_secs_f64() / (experts as f64 * bytes)
         };
         // The best of a few rounds, since other programs may be busy.

@@ -479,7 +479,9 @@ impl<'m> CudaModel<'m> {
             staging: RefCell::new(None),
         };
         if let Some(moes) = moes {
-            cuda.offload = Some(RefCell::new(cuda.plan_offload(moes)?));
+            cuda.offload = Some(RefCell::new(
+                cuda.plan_offload(moes, placement.expert_cache)?,
+            ));
             if cuda.routes_on_host() {
                 model.page_in_experts();
             }
@@ -499,7 +501,11 @@ impl<'m> CudaModel<'m> {
 
     /// Gives the routed experts the device memory left after the weights,
     /// one state and a reserve.
-    fn plan_offload(&self, moes: Vec<Moe<'m>>) -> Result<Offload<'m>, LoadError> {
+    fn plan_offload(
+        &self,
+        moes: Vec<Moe<'m>>,
+        cache: Option<usize>,
+    ) -> Result<Offload<'m>, LoadError> {
         let mut state = self.new_dense_state().map_err(cuda_error)?;
         state.work.experts = Some(self.expert_work(&moes).map_err(cuda_error)?);
         state.work.pass = Some(PassRows::new(&self.gpu, self.n_embd).map_err(cuda_error)?);
@@ -507,7 +513,13 @@ impl<'m> CudaModel<'m> {
         drop(state);
         let (free, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
         let budget = free.saturating_sub(state_bytes + experts::DEVICE_RESERVE);
-        Offload::new(&self.gpu, moes, budget, self.weight_bytes() + state_bytes)
+        Offload::new(
+            &self.gpu,
+            moes,
+            budget,
+            cache,
+            self.weight_bytes() + state_bytes,
+        )
     }
 
     fn expert_work(&self, moes: &[Moe]) -> kinetic_cuda::Result<ExpertWork> {
