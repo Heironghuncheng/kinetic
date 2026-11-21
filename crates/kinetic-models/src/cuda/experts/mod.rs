@@ -19,6 +19,7 @@
 //! device, so where an expert ran never changes a token's result.
 
 mod cache;
+mod host32;
 mod offload;
 mod place;
 mod plan;
@@ -34,7 +35,7 @@ use kinetic_cuda::{
 use kinetic_quant::{Matrix, TensorType};
 
 use super::{cuda_error, Gpu};
-use crate::blocks::{Gating, Moe, Pick};
+use crate::blocks::{Gating, Glu, Job, Moe, Pick};
 use crate::LoadError;
 
 pub(super) use offload::Offload;
@@ -66,10 +67,9 @@ impl CudaExperts {
         shared: bool,
     ) -> Result<CudaExperts, LoadError> {
         check_types(moe)?;
-        if !moe.plain() {
+        if moe.norms.is_some() || moe.glu == Glu::Gelu || moe.scales.iter().any(Option::is_some) {
             return Err(LoadError(
-                "expert scales, norms and activations other than SiLU do not run on CUDA yet"
-                    .into(),
+                "expert scales, norms and GELU experts do not run on CUDA yet".into(),
             ));
         }
         let routers = [Some(&moe.router), next];
@@ -312,6 +312,7 @@ impl CudaExperts {
             situ: match moe.glu {
                 Glu::Silu => None,
                 Glu::Situ { beta, linear } => Some((beta, linear)),
+                Glu::Gelu => unreachable!("GELU experts are refused at upload"),
             },
         };
         let hq = Q8kRows {
@@ -365,6 +366,14 @@ fn quantize(
     match expert_block(ty) {
         Q8K_BLOCK => k.quantize_q8k(x, rows, cols, qs, ds, stream),
         _ => k.quantize_q8(x, rows * cols, qs, ds, stream),
+    }
+}
+
+/// [`Moe::run_experts`] as the device computes it, bit for bit.
+fn run_host(moe: &Moe, h: &[f32], jobs: &[Job]) -> Vec<f32> {
+    match host32::handles(moe) {
+        true => host32::run_experts(moe, h, jobs),
+        false => moe.run_experts(h, jobs),
     }
 }
 

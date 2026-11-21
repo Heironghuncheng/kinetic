@@ -96,16 +96,16 @@ pub enum Glu {
 }
 
 impl Glu {
-    fn apply(self, gate: f32, up: f32) -> f32 {
+    pub(crate) fn apply(self, gate: f32, up: f32) -> f32 {
         match self {
             Glu::Silu => kernels::silu(gate) * up,
             Glu::Situ { beta, linear } => {
                 let up = if linear == 0.0 {
                     up
                 } else {
-                    linear * (up / linear).tanh()
+                    kernels::soft_clip(up, linear)
                 };
-                beta * (gate / beta).tanh() * sigmoid(gate) * up
+                kernels::soft_clip(gate, beta) * kernels::sigmoid(gate) * up
             }
             Glu::Gelu => super::gelu(gate) * up,
         }

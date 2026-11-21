@@ -215,7 +215,7 @@ impl Offload<'_> {
         let outputs = if jobs.is_empty() {
             Vec::new()
         } else {
-            moes[l].run_experts(h, jobs)
+            super::run_host(&moes[l], h, jobs)
         };
         self.costs
             .observe_host(self.expected_host, start.elapsed().as_secs_f64());

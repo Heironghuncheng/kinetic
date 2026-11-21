@@ -302,6 +302,18 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + exp(-x))
 }
 
+/// `1 / (1 + e^-x)` from the same `exp`, as the device computes it.
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + exp(-x))
+}
+
+/// `beta tanh(x / beta)`, with `tanh y = 1 - 2 / (e^2y + 1)` from the same
+/// `exp`, as the device computes it.
+pub fn soft_clip(x: f32, beta: f32) -> f32 {
+    let e = exp(2.0 * (x / beta));
+    beta * (1.0 - 2.0 / (e + 1.0))
+}
+
 /// `e^x` to about one unit in the last place: `x = n ln 2 + r` with `|r|`
 /// at most `ln 2 / 2`, a degree-6 polynomial for `e^r`, and `2^n` from the
 /// exponent bits.
