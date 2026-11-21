@@ -21,6 +21,7 @@ mod delta_net;
 mod ffn;
 mod host;
 mod layer;
+mod moe;
 mod mtp;
 mod rope;
 mod short_conv;

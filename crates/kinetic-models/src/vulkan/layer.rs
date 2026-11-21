@@ -5,6 +5,7 @@ use kinetic_vulkan::{Commands, ConvRing, DeltaState, Device, DeviceBuffer, KvCac
 use super::attention::VulkanAttention;
 use super::delta_net::VulkanDeltaNet;
 use super::ffn::VulkanFfn;
+use super::moe::VulkanMoe;
 use super::rope::RopeTables;
 use super::short_conv::VulkanShortConv;
 use super::work::{Needs, Work};
@@ -49,7 +50,9 @@ pub(super) struct VulkanLayer {
     mixer: VulkanMixer,
     mixer_out_norm: Option<DeviceBuffer<f32>>,
     ffn_norm: DeviceBuffer<f32>,
-    ffn: VulkanFfn,
+    /// The feed-forward, or the shared expert beside routed ones.
+    ffn: Option<VulkanFfn>,
+    experts: Option<VulkanMoe>,
     ffn_out_norm: Option<DeviceBuffer<f32>>,
     residual_scale: f32,
 }
@@ -67,22 +70,21 @@ impl VulkanLayer {
                 ))
             }
         };
-        if l.experts.is_some() {
-            return Err(unsupported("routed experts"));
-        }
         if l.output_scale.is_some() {
             return Err(unsupported("layer output scales"));
         }
-        let (Some(mixer_norm), Some(ffn_norm), Some(ffn)) = (&l.mixer_norm, &l.ffn_norm, &l.ffn)
-        else {
+        let (Some(mixer_norm), Some(ffn_norm)) = (&l.mixer_norm, &l.ffn_norm) else {
             return Err(unsupported("layers without input norms"));
         };
+        let ffn = l.ffn.as_ref().map(|f| VulkanFfn::upload(gpu, f));
+        let experts = l.experts.as_ref().map(|m| VulkanMoe::upload(gpu, m));
         Ok(VulkanLayer {
             mixer_norm: gpu.vector(mixer_norm)?,
             mixer,
             mixer_out_norm: optional(&l.mixer_out_norm)?,
             ffn_norm: gpu.vector(ffn_norm)?,
-            ffn: VulkanFfn::upload(gpu, ffn)?,
+            ffn: ffn.transpose()?,
+            experts: experts.transpose()?,
             ffn_out_norm: optional(&l.ffn_out_norm)?,
             residual_scale: l.residual_scale.unwrap_or(1.0),
         })
@@ -94,7 +96,8 @@ impl VulkanLayer {
             VulkanMixer::ShortConv(s) => s.size_bytes(),
             VulkanMixer::DeltaNet(d) => d.size_bytes(),
         };
-        mixer + self.ffn.size_bytes()
+        let ffn = self.ffn.as_ref().map_or(0, VulkanFfn::size_bytes);
+        mixer + ffn + self.experts.as_ref().map_or(0, VulkanMoe::size_bytes)
     }
 
     /// What the mixer needs of the work buffers.
@@ -106,8 +109,12 @@ impl VulkanLayer {
         }
     }
 
-    pub fn n_ff(&self) -> usize {
-        self.ffn.gate.rows()
+    pub fn n_ff(&self) -> Option<usize> {
+        self.ffn.as_ref().map(|f| f.gate.rows())
+    }
+
+    pub fn experts(&self) -> Option<&VulkanMoe> {
+        self.experts.as_ref()
     }
 
     /// Past positions an attention mixer sees, when not all.
@@ -178,7 +185,12 @@ impl VulkanLayer {
         };
         let mixed = add(self.mixer_out_norm.as_ref());
         k.norm(&w.batch, &w.x, Some(mixed), &self.ffn_norm, eps, &w.h, c)?;
-        self.ffn.record(gpu, w, c)?;
+        if let Some(ffn) = &self.ffn {
+            ffn.record(gpu, w, c)?;
+        }
+        if let Some(moe) = &self.experts {
+            moe.record(gpu, w, self.ffn.is_some(), c)?;
+        }
         let fed = add(self.ffn_out_norm.as_ref());
         k.norm(&w.batch, &w.x, Some(fed), next, eps, &w.h, c)
     }
