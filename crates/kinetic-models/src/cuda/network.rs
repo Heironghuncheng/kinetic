@@ -103,7 +103,6 @@ pub(super) fn upload(
         )));
     }
     let v = |x: &[f32]| gpu.vector(x).map_err(cuda_error);
-    let m = |x: &kinetic_quant::Matrix| gpu.matrix(x).map_err(cuda_error);
     let physical = &model.layers[..n_phys];
     let weights = physical
         .iter()
@@ -142,13 +141,8 @@ pub(super) fn upload(
             CudaExperts::upload(gpu, moe, next.map(|n| &n.router), false)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let control = |c: &Control| -> Result<CudaControl, LoadError> {
-        Ok(CudaControl {
-            down: m(&c.down)?,
-            gain: m(&c.gain)?,
-            forget: m(&c.forget)?,
-        })
-    };
+    let control = |c: &Control| CudaControl::upload(gpu, c);
+
     let wiring = net
         .wiring
         .iter()
@@ -244,13 +238,8 @@ impl CudaNetwork {
             inputs: [rows_of()?, rows_of()?, rows_of()?],
             messages: [rows_of()?, rows_of()?, rows_of()?, rows_of()?],
             normed: GemvInput::batch(&gpu.ctx, d, rows)?,
-            control: ControlBuffers {
-                joined: GemvInput::batch(&gpu.ctx, 2 * d, rows)?,
-                code: f32s(rank)?,
-                code_in: GemvInput::batch(&gpu.ctx, rank, rows)?,
-                gain: rows_of()?,
-                forget: rows_of()?,
-            },
+            control: ControlBuffers::new(gpu, d, rank, rows)?,
+
             rel: relative(&layers[0]).buffers(gpu, rows)?,
         })
     }
@@ -437,8 +426,6 @@ impl CudaNetwork {
         k.add(&mut b.cur, &b.attn, len, stream)
     }
 
-    /// `Control::apply` on the device: `x` takes in `message` through the
-    /// low-rank gate of `c`.
     fn control(
         &self,
         gpu: &Gpu,
@@ -448,10 +435,35 @@ impl CudaNetwork {
         b: &mut ControlBuffers,
         n: usize,
     ) -> kinetic_cuda::Result<()> {
+        c.apply(gpu, &self.ones, x, message, b, n)
+    }
+}
+
+impl CudaControl {
+    fn upload(gpu: &Gpu, c: &Control) -> Result<CudaControl, LoadError> {
+        let m = |x: &kinetic_quant::Matrix| gpu.matrix(x).map_err(cuda_error);
+        Ok(CudaControl {
+            down: m(&c.down)?,
+            gain: m(&c.gain)?,
+            forget: m(&c.forget)?,
+        })
+    }
+
+    /// `Control::apply` on the device: `x` takes in `message` through this
+    /// low-rank gate; `ones` holds a weight of one per value of a row.
+    fn apply(
+        &self,
+        gpu: &Gpu,
+        ones: &DeviceBuffer<f32>,
+        x: &mut DeviceBuffer<f32>,
+        message: &DeviceBuffer<f32>,
+        b: &mut ControlBuffers,
+        n: usize,
+    ) -> kinetic_cuda::Result<()> {
         let (k, stream) = (&gpu.kernels, &gpu.stream);
-        let d = self.d;
+        let (c, d) = (self, ones.len());
         let norm = RmsNorm {
-            weight: &self.ones,
+            weight: ones,
             eps: DEPTH_EPS,
         };
         k.rms_norm(x, norm, &mut b.joined, 0, n, stream)?;
@@ -507,4 +519,37 @@ fn relative(l: &CudaLayer) -> &RelLayer {
         CudaMixer::Relative(r) => &r.weights,
         _ => unreachable!("network layers attend by relative distance"),
     }
+}
+
+impl ControlBuffers {
+    fn new(gpu: &Gpu, d: usize, rank: usize, rows: usize) -> kinetic_cuda::Result<ControlBuffers> {
+        let f32s = |len: usize| DeviceBuffer::<f32>::new(&gpu.ctx, rows * len);
+        Ok(ControlBuffers {
+            joined: GemvInput::batch(&gpu.ctx, 2 * d, rows)?,
+            code: f32s(rank)?,
+            code_in: GemvInput::batch(&gpu.ctx, rank, rows)?,
+            gain: f32s(d)?,
+            forget: f32s(d)?,
+        })
+    }
+}
+
+/// `c` applied on the device to the `n` rows of `x` with those of
+/// `message`.
+#[cfg(test)]
+pub(super) fn control_on(
+    gpu: &Gpu,
+    c: &Control,
+    x: &[f32],
+    message: &[f32],
+    n: usize,
+) -> kinetic_cuda::Result<Vec<f32>> {
+    let d = c.gain.rows;
+    let control = CudaControl::upload(gpu, c).expect("f32 weights upload");
+    let mut b = ControlBuffers::new(gpu, d, c.down.rows, n)?;
+    let ones = gpu.vector(&vec![1.0; d])?;
+    let mut xs = gpu.vector(x)?;
+    let m = gpu.vector(message)?;
+    control.apply(gpu, &ones, &mut xs, &m, &mut b, n)?;
+    xs.to_vec()
 }

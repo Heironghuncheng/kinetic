@@ -31,6 +31,8 @@ mod mtp;
 mod network;
 mod pass;
 mod per_layer;
+#[cfg(test)]
+mod pieces;
 mod relative;
 mod scratch;
 mod short_conv;

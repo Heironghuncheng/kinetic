@@ -36,9 +36,9 @@ const WINDOW: u32 = 4;
 
 /// The tensors of the model and their types: every other layer windowed,
 /// blocks of two layers and a core of one block that runs three times.
-fn tensors() -> Vec<(String, Vec<u64>, TensorType)> {
+fn tensors(dense: TensorType) -> Vec<(String, Vec<u64>, TensorType)> {
     let (heads, hd, rel, taps, experts, ff, rank) = (2, 64, 2, 4, 4, 96, 32);
-    let (f32, q8, iq4) = (TensorType::F32, TensorType::Q8_0, TensorType::IQ4NL);
+    let (f32, q8, iq4) = (TensorType::F32, dense, TensorType::IQ4NL);
     let mut t: Vec<(String, Vec<u64>, TensorType)> = vec![
         ("token_embd.weight".into(), vec![D, VOCAB], q8),
         ("token_embd_norm.weight".into(), vec![D], f32),
@@ -101,7 +101,9 @@ fn tensors() -> Vec<(String, Vec<u64>, TensorType)> {
 }
 
 /// Small values that vary with the tensor `k` and position `i`; norms and
-/// clips around one.
+/// clips around one. The controls are kept gentle: with full-size ones the
+/// looped model is chaotic, and a weight changed by a part in a thousand
+/// moves the CPU's own logits as much as the device's rounding does.
 fn data(k: usize, name: &str, n: usize, ty: TensorType) -> Vec<u8> {
     let step = |i: usize| ((i * (2 * k + 3)) % 17) as i32 - 8;
     match ty {
@@ -125,14 +127,17 @@ fn data(k: usize, name: &str, n: usize, ty: TensorType) -> Vec<u8> {
             } else {
                 0.0
             };
+            let gain = if name.contains("ctrl") { 0.2 } else { 1.0 };
             (0..n)
-                .flat_map(|i| (step(i) as f32 * 0.07 + shift).to_le_bytes())
+                .flat_map(|i| (step(i) as f32 * 0.07 * gain + shift).to_le_bytes())
                 .collect()
         }
     }
 }
 
-fn tiny_model() -> Memory {
+/// The model with its dense weights of type `dense` and `used` of its four
+/// experts per token.
+fn tiny_model(dense: TensorType, used: u32) -> Memory {
     let arch = "inkling2_loop";
     let per_layer = |v: Value| Value::Array(vec![v; N_PHYS]);
     let mut metadata = vec![(
@@ -148,9 +153,7 @@ fn tiny_model() -> Memory {
         ("attention.head_count_kv", per_layer(Value::U32(1))),
         ("attention.layer_norm_rms_epsilon", Value::F32(1e-6)),
         ("expert_count", Value::U32(4)),
-        // every expert, so that rounding never changes which ones run and the
-        // comparison with the CPU stays smooth
-        ("expert_used_count", Value::U32(4)),
+        ("expert_used_count", Value::U32(used)),
         ("attention.key_length", Value::U32(64)),
         ("attention.value_length", Value::U32(64)),
         ("vocab_size", Value::U32(VOCAB as u32)),
@@ -181,7 +184,7 @@ fn tiny_model() -> Memory {
         ("loop.varying", Value::Bool(false)),
     ];
     metadata.extend(keys.into_iter().map(|(k, v)| (format!("{arch}.{k}"), v)));
-    let tensors = tensors();
+    let tensors = tensors(dense);
     let out: Vec<TensorOut> = tensors
         .iter()
         .map(|(name, dims, ty)| TensorOut {
@@ -209,26 +212,40 @@ fn bits(x: &[f32]) -> Vec<u32> {
     x.iter().map(|v| v.to_bits()).collect()
 }
 
-/// One test, so one model on the device: capturing the decode graph on one
-/// thread forbids other threads' synchronous copies in the same context.
+/// One test, so one model on the device at a time: capturing the decode
+/// graph on one thread forbids other threads' synchronous copies in the
+/// same context.
+///
+/// With f32 dense weights and every expert used, the device follows the
+/// CPU within its rounding. With the file's types and two experts of four,
+/// rounding may change which experts run, so that model checks exactness
+/// alone.
 #[test]
 #[ignore = "needs a CUDA device"]
 fn inkling_on_cuda_matches_the_cpu_and_changes_no_bit() {
-    let file = tiny_model();
-    let model = kinetic_models::load(&file).unwrap();
-    let gpu = CudaModel::load(&model, 128).unwrap();
-    assert!(
-        gpu.plan()
-            .is_some_and(|p| p.pools.iter().all(|p| p.slots == p.layers * 4)),
-        "every expert on the device"
-    );
-    logits_match_the_cpu(&gpu, &model);
-    a_batch_matches_token_by_token(&gpu);
-    rollback_leaves_the_state_as_if_never_run(&gpu);
-    a_host_copy_restores_the_state(&gpu, &model);
-    a_reset_state_is_a_fresh_one(&gpu);
-    shared_passes_match_running_alone(&gpu);
-    speculative_greedy_is_plain_greedy(&gpu);
+    for (dense, used) in [(TensorType::F32, 4), (TensorType::Q8_0, 2)] {
+        let file = tiny_model(dense, used);
+        let model = kinetic_models::load(&file).unwrap();
+        let gpu = CudaModel::load(&model, 128).unwrap();
+        assert!(
+            gpu.plan()
+                .is_some_and(|p| p.pools.iter().all(|p| p.slots == p.layers * 4)),
+            "every expert on the device"
+        );
+        if dense == TensorType::F32 {
+            logits_match_the_cpu(&gpu, &model);
+        }
+        exactness(&gpu, &model);
+    }
+}
+
+fn exactness(gpu: &CudaModel, model: &kinetic_models::Model) {
+    a_batch_matches_token_by_token(gpu);
+    rollback_leaves_the_state_as_if_never_run(gpu);
+    a_host_copy_restores_the_state(gpu, model);
+    a_reset_state_is_a_fresh_one(gpu);
+    shared_passes_match_running_alone(gpu);
+    speculative_greedy_is_plain_greedy(gpu);
 }
 
 /// The GPU's logits after every token of a prompt and of single steps are
