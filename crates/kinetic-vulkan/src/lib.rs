@@ -46,6 +46,7 @@ mod argmax;
 mod attention;
 mod batch;
 mod delta_net;
+mod depth;
 mod error;
 mod experts;
 mod ffn;
@@ -56,6 +57,7 @@ mod layout;
 #[cfg(not(metal_driver))]
 mod matrix_tile;
 mod norm;
+mod relative;
 mod short_conv;
 
 // The driver: what opens the device, holds its memory, builds its kernels
@@ -102,6 +104,7 @@ pub use attention::{AttentionGate, AttentionShape, KvCache, QkvConsts};
 pub use batch::{Batch, BATCH_HEADER};
 pub use commands::{Commands, Graph, Timestamp, Timings};
 pub use delta_net::{DeltaShape, DeltaState, DeltaWeights};
+pub use depth::{States, MAX_STATES};
 pub use device::Device;
 pub use error::{Error, Result};
 pub use experts::{Gating, Shared};
@@ -113,4 +116,5 @@ pub use kernels::Kernels;
 pub use memory::{DeviceBuffer, DeviceCopy, HostBuffer};
 pub use norm::Residual;
 pub use physical::PhysicalDevice;
-pub use short_conv::ConvRing;
+pub use relative::RelativeShape;
+pub use short_conv::{ConvRing, Strided};

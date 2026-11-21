@@ -74,6 +74,11 @@ pub struct Kernels {
     pub(crate) swiglu: Rc<Kernel>,
     pub(crate) argmax: Rc<Kernel>,
     pub(crate) rope: Rc<Kernel>,
+    pub(crate) relative: Rc<Kernel>,
+    pub(crate) residual_conv: Rc<Kernel>,
+    pub(crate) depth: Rc<Kernel>,
+    pub(crate) join_norm: Rc<Kernel>,
+    pub(crate) control: Rc<Kernel>,
     pub(crate) short_conv: Rc<Kernel>,
     pub(crate) delta_conv: Rc<Kernel>,
     pub(crate) delta_rule: Rc<Kernel>,
@@ -112,7 +117,7 @@ impl Kernels {
     /// `matrix` and the device has them; see [`Kernels::matrix`].
     pub fn load_with(device: &Rc<Device>, matrix: bool) -> Result<Kernels> {
         let gemv = |name, spirv| Kernel::new(device, name, spirv, 6, 5);
-        let attend = |name, spirv| Kernel::new(device, name, spirv, 7, 9);
+        let attend = |name, spirv| Kernel::new(device, name, spirv, 8, 13);
         let experts = |name, spirv| Kernel::new(device, name, spirv, 7, 7);
         #[cfg(not(metal_driver))]
         let matrix = matrix && device.info().features.matrix_f16;
@@ -163,6 +168,11 @@ impl Kernels {
             swiglu: Kernel::new(device, "swiglu", spirv!("swiglu"), 5, 4)?,
             argmax: Kernel::new(device, "argmax", spirv!("argmax"), 3, 2)?,
             rope: Kernel::new(device, "rope", spirv!("rope"), 5, 13)?,
+            relative: Kernel::new(device, "relative", spirv!("relative"), 5, 16)?,
+            residual_conv: Kernel::new(device, "residual_conv", spirv!("residual_conv"), 5, 11)?,
+            depth: Kernel::new(device, "depth", spirv!("depth"), 5, 4)?,
+            join_norm: Kernel::new(device, "join_norm", spirv!("join_norm"), 6, 2)?,
+            control: Kernel::new(device, "control", spirv!("control"), 5, 1)?,
             short_conv: Kernel::new(device, "short_conv", spirv!("short_conv"), 7, 3)?,
             delta_conv: Kernel::new(device, "delta_conv", spirv!("delta_conv"), 6, 7)?,
             delta_rule: Kernel::new(device, "delta_rule", spirv!("delta_rule"), 4, 7)?,

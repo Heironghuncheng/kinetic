@@ -97,7 +97,90 @@ impl ConvRing {
     }
 }
 
+/// Rows of `stride` values from element `at` on: a part of each token's
+/// row of a buffer.
+#[derive(Clone, Copy)]
+pub struct Strided<'a> {
+    pub data: &'a DeviceBuffer<f32>,
+    pub stride: usize,
+    pub at: usize,
+}
+
+impl Strided<'_> {
+    fn holds(&self, rows: usize, len: usize) -> bool {
+        (rows <= 1 || self.at + len <= self.stride)
+            && (rows.max(1) - 1) * self.stride + self.at + len <= self.data.len()
+    }
+}
+
 impl Kernels {
+    /// Records the residual short convolution of every token of the batch,
+    /// `(x + c) / sqrt(k + 1)`, where `c` is the causal convolution of each
+    /// channel of `x` with its `taps` weights, oldest input first, and `k`
+    /// the number of taps. With `dynamic`, the rows of `x.data` also hold
+    /// `taps` more weights per head of `head_len` channels at element `at`,
+    /// newest input first, that add to `c` and count in `k`. With
+    /// `accumulate` the result is added to `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn residual_conv(
+        &self,
+        batch: &Batch,
+        x: Strided,
+        dynamic: Option<(usize, usize)>,
+        weight: &DeviceBuffer<f32>,
+        ring: &ConvRing,
+        out: Strided,
+        accumulate: bool,
+        commands: &mut Commands,
+    ) -> Result<()> {
+        let (len, taps, rows) = (ring.channels, ring.taps, batch.rows());
+        let (taps_at, head_len) = dynamic.unwrap_or((0, len));
+        let lags = Strided { at: taps_at, ..x };
+        let fits = head_len > 0
+            && len.is_multiple_of(head_len)
+            && weight.len() == len * taps
+            && x.holds(rows, len)
+            && (dynamic.is_none() || lags.holds(rows, len / head_len * taps))
+            && out.holds(rows, len);
+        ring.check(batch, len, taps)?;
+        if !fits {
+            return Err(Error::Shape(format!(
+                "residual convolution of {rows} rows of {len}"
+            )));
+        }
+        // SAFETY: matches residual_conv.wgsl: the batch, the input rows,
+        // weights, ring and output at bindings 0..4, then its shape. Every
+        // row the batch can name holds its parts, checked above, the ring
+        // its slots; invocations past them return.
+        unsafe {
+            commands.dispatch(
+                &self.residual_conv,
+                &[
+                    batch.device().allocation(),
+                    x.data.allocation(),
+                    weight.allocation(),
+                    ring.data.allocation(),
+                    out.data.allocation(),
+                ],
+                &[
+                    len as u32,
+                    taps as u32,
+                    ring.slots() as u32,
+                    x.stride as u32,
+                    x.at as u32,
+                    taps_at as u32,
+                    dynamic.is_some() as u32,
+                    head_len as u32,
+                    out.stride as u32,
+                    out.at as u32,
+                    accumulate as u32,
+                ],
+                [len.div_ceil(256) as u32, rows as u32, 1],
+            )
+        };
+        Ok(())
+    }
+
     /// Records the gated short convolution of every token of the batch:
     /// a row of `bcx` holds the input gates, output gates and values,
     /// `out.width()` each; `weight` holds `taps` weights per channel, the
