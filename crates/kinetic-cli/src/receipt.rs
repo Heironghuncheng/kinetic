@@ -14,11 +14,13 @@ use crate::{
 };
 
 /// What receipts made with this engine record: the model at `path`, run on
-/// `kind` (described as `name`) with `runtime` and `context`.
+/// `kind` (described as `name`) with `runtime` and `context`, its prompts
+/// on the device's matrix units if `matrix`.
 pub fn receipts(
     path: &Path,
     kind: Device,
     name: &str,
+    matrix: bool,
     runtime: &RuntimeArgs,
     context: usize,
 ) -> Result<Receipts> {
@@ -28,6 +30,9 @@ pub fn receipts(
         _ => ReceiptDevice::cpu(),
     };
     device.settings = settings(kind, runtime, context);
+    if matrix {
+        device.settings.insert(COOPMAT.into(), true.into());
+    }
     let receipts = Receipts::new(path, device);
     Ok(match &runtime.sign_key {
         Some(key) => receipts.signed_with(receipt::read_key(key)?),
@@ -49,6 +54,10 @@ fn cuda_class() -> String {
 fn cuda_class() -> String {
     "cuda".into()
 }
+
+/// The setting that says prompts ran on the device's matrix units, which
+/// give them their own bits; see [`Tech::Coopmat`].
+const COOPMAT: &str = "coopmat";
 
 /// Load settings that change the bits, named as their flags.
 fn settings(kind: Device, runtime: &RuntimeArgs, context: usize) -> Map<String, Value> {
@@ -128,9 +137,8 @@ fn rerun_runtime(
         Device::Cpu
     });
     let mut off = vec![Tech::Rad1, Tech::WarmStart, Tech::ZeroWait, Tech::Convoy];
-    // prompts on a device's matrix units give their own bits; the class,
-    // made from the device's name, says whether they ran there
-    if !class.ends_with(", cooperative matrices)") {
+    // prompts on a device's matrix units give their own bits
+    if s.get(COOPMAT).and_then(Value::as_bool) != Some(true) {
         off.push(Tech::Coopmat);
     }
     Ok(RuntimeArgs {

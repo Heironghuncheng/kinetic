@@ -52,6 +52,8 @@ mod gemv;
 mod info;
 mod kernels;
 mod layout;
+#[cfg(not(metal_driver))]
+mod matrix_tile;
 mod norm;
 mod short_conv;
 

@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use naga::back::spv;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
+include!("src/matrix_tile.rs");
+
 /// (kernel, constants, source parts in order).
 const KERNELS: &[(&str, &str, &[&str])] = &[
     ("gemv_f32", "", &["gemv", "gemv_f32"]),
@@ -44,7 +46,8 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
 /// Kernels on the matrix units, for devices with cooperative f16 matrices
 /// (`Features::matrix_f16`): f16 arithmetic and cooperative matrices
 /// validate, and their modules take the Vulkan memory model. Not built for
-/// Metal, whose simdgroup matrices are 8x8.
+/// Metal, whose simdgroup matrices are 8x8. `MATRIX_TYPES` in
+/// src/kernels.rs says which weight type each is for.
 const MATRIX_KERNELS: &[(&str, &str, &[&str])] = &[
     ("mm_q8_0", "", &["mm", "mm_q8_0"]),
     ("mm_q4_k", "", &["mm", "k4", "mm_q4_k"]),
@@ -90,7 +93,11 @@ fn main() {
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     for &(name, constants, parts) in MATRIX_KERNELS {
-        let source = source(constants, parts, &["shaders"]);
+        // after the parts, whose `enable` directives come first
+        let source = format!(
+            "{}\nconst TILE: u32 = {MATRIX_TILE}u;\n",
+            source(constants, parts, &["shaders"])
+        );
         let (module, info) = parse_with(name, &source, MATRIX_CAPABILITIES);
         fs::write(out.join(format!("{name}.spv")), spirv(name, &module, &info))
             .expect("write SPIR-V");

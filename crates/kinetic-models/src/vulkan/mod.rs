@@ -268,10 +268,18 @@ impl<'m> VulkanModel<'m> {
         self.matrix
     }
 
+    /// Turns [`VulkanModel::matrix`] off, along with the prompt passes it
+    /// takes, for states made from now on: they need far less memory.
+    pub fn without_matrix(&mut self) {
+        if self.matrix {
+            self.matrix = false;
+            self.prompt_batch = MAX_BATCH;
+        }
+    }
+
     /// Marks the tokens `state` runs from now on as a prompt's (`true`) or
     /// as decoded ones. With [`VulkanModel::matrix`], prompt tokens all run
-    /// in prompt passes, however few, as long as no checkpoint is set and
-    /// only the last row is wanted.
+    /// in prompt passes, however few, as long as no checkpoint is set.
     pub fn set_prompt(&self, state: &mut VulkanState, prompt: bool) {
         state.prompt = prompt;
     }
@@ -558,17 +566,19 @@ impl<'m> VulkanModel<'m> {
             // be rolled back over, are prompt processing, which takes them
             // in passes as large as it can. Prompt passes on the matrix
             // units give their own bits, so there every token of a prompt
-            // takes one, and only those.
+            // takes one, and only those; a prompt whose every row is wanted
+            // takes one pass per token, since a prompt pass keeps the head
+            // rows of its last token only.
             let prompt = self.prompt_batch > MAX_BATCH
-                && !all_rows
                 && state.checkpoint.is_none()
                 && match self.matrix {
                     true => state.prompt,
-                    false => rest.len() >= PROMPT_MIN,
+                    false => !all_rows && rest.len() >= PROMPT_MIN,
                 };
-            let n = rest.len().min(match prompt {
-                true => self.prompt_batch,
-                false => MAX_BATCH,
+            let n = rest.len().min(match (prompt, all_rows) {
+                (true, true) => 1,
+                (true, false) => self.prompt_batch,
+                (false, _) => MAX_BATCH,
             });
             let chunk;
             (chunk, rest) = rest.split_at(n);

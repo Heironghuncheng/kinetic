@@ -120,8 +120,13 @@ about three times as fast as the decode kernels on long prompts. The status
 line says so, `(Vulkan, cooperative matrices)`. As on CUDA, a prompt's state
 then differs slightly from the same tokens decoded one at a time; where the
 prompt is cut changes no bit, and decoding and drafts give exactly what they
-give without it. Warm Start and receipts keep states made this way apart
-from the others, and `--off coopmat` runs prompts with the decode kernels.
+give without it. So that a chat's next turn gives what it gives run cold,
+it runs the last reply again as prompt, from the prompt cache when that is
+on. Warm Start and receipts keep states made this way apart from the
+others, and `--off coopmat` runs prompts with the decode kernels. Prompt
+passes keep buffers for 512 tokens in every state; when those don't fit in
+the GPU's memory, Kinetic says so and runs prompts with the decode kernels
+instead.
 
 ## Dense models larger than the GPU
 

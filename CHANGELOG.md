@@ -83,7 +83,8 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   a prompt's state differs slightly from the same tokens decoded one at a
   time; where a prompt is cut changes no bit, and decoding and drafts stay
   exact. Warm Start and receipts keep such states apart, and
-  `--off coopmat` runs prompts as before.
+  `--off coopmat` runs prompts as before, as does a GPU whose memory has no
+  room for the larger buffers.
 
 ### Server
 

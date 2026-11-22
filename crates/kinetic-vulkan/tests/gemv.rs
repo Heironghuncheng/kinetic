@@ -342,8 +342,16 @@ fn mismatched_shapes_are_rejected() {
 /// the f64 products of the dequantized weights and the f32 inputs: each
 /// term rounds to f16 twice, so every output is within a few parts in ten
 /// thousand of its terms' magnitude; and the slots between rows stay as
-/// they were. Returns the largest error relative to that magnitude.
-fn check_matrix_pass(ty: TensorType, rows: usize, cols: usize, held: usize, tokens: usize) {
+/// they were. With `big`, every third token's inputs go past what f16
+/// holds.
+fn check_matrix_pass(
+    ty: TensorType,
+    rows: usize,
+    cols: usize,
+    held: usize,
+    tokens: usize,
+    big: bool,
+) {
     for gpu in gpus() {
         let name = &gpu.device.info().name;
         if !gpu.device.info().features.matrix_f16 {
@@ -353,7 +361,12 @@ fn check_matrix_pass(ty: TensorType, rows: usize, cols: usize, held: usize, toke
         let mut rng = Lcg(ty as u64 + 23 + rows as u64);
         let data = random_matrix(ty, rows, cols, &mut rng);
         let m = Matrix::new(ty, &data, rows, cols);
-        let x: Vec<f32> = (0..held * cols).map(|_| rng.f32() * 3.0).collect();
+        let x: Vec<f32> = (0..held * cols)
+            .map(|i| match big && (i / cols) % 3 == 1 {
+                true => rng.f32() * 3.0e5,
+                false => rng.f32() * 3.0,
+            })
+            .collect();
         let out = Out {
             stride: rows + 8,
             offset: 3,
@@ -412,14 +425,22 @@ fn check_matrix_pass(ty: TensorType, rows: usize, cols: usize, held: usize, toke
 // three tiles of tokens.
 #[test]
 fn q8_0_matrix_pass_matches_reference() {
-    check_matrix_pass(TensorType::Q8_0, 37, 2 * 256, 32, 21);
-    check_matrix_pass(TensorType::Q8_0, 128, 3 * 256, 160, 130);
+    check_matrix_pass(TensorType::Q8_0, 37, 2 * 256, 32, 21, false);
+    check_matrix_pass(TensorType::Q8_0, 128, 3 * 256, 160, 130, false);
+}
+
+/// Inputs past f16's range are scaled into it, not turned to infinity.
+#[test]
+fn matrix_passes_take_inputs_past_f16() {
+    for ty in [TensorType::Q8_0, TensorType::Q4K, TensorType::Q6K] {
+        check_matrix_pass(ty, 64, 2 * 256, 64, 40, true);
+    }
 }
 
 #[test]
 fn k_quant_matrix_passes_match_reference() {
     for ty in [TensorType::Q4K, TensorType::Q5K, TensorType::Q6K] {
-        check_matrix_pass(ty, 37, 5 * 256, 32, 21);
-        check_matrix_pass(ty, 128, 3 * 256, 160, 130);
+        check_matrix_pass(ty, 37, 5 * 256, 32, 21, false);
+        check_matrix_pass(ty, 128, 3 * 256, 160, 130, false);
     }
 }

@@ -17,6 +17,9 @@ use crate::sequence::{self, Run, Sequence, PREFILL_CHUNK};
 /// of [`CpuBackend`]: speculative decoding that changes no token, greedy or
 /// seeded, reuse of the last sequence when a prompt extends it and, with a
 /// [`Warm`] cache, warm starts that give exactly the output of a cold run.
+/// With prompt passes on the matrix units, a reply is not reused: a prompt
+/// that goes on from it starts from the warm cache or from scratch, so the
+/// reply runs as prompt, as in a cold run.
 /// Prompts with images run on the CPU, since the device takes only token
 /// ids.
 pub struct VulkanBackend<'a> {
@@ -24,9 +27,13 @@ pub struct VulkanBackend<'a> {
     model: &'a Model<'a>,
     decoder: Decoder<Ensemble<Source<VulkanModel<'a>>>>,
     cached: Option<Sequence<VulkanState>>,
+    /// Whether `cached` ends with tokens a reply ran as decode steps.
+    replied: bool,
     warm: Option<Warm<'a>>,
     cpu: CpuBackend<'a>,
     device: String,
+    /// Whether the matrix path was asked for but left off for memory.
+    matrix_dropped: bool,
 }
 
 /// A prompt's state to keep in the warm cache once the reply is out.
@@ -51,20 +58,34 @@ impl<'a> VulkanBackend<'a> {
     /// Uploads `model` to the first Vulkan device that can run it, for
     /// sequences of up to `context` tokens, with prompt passes on its matrix
     /// units if `matrix` and it has them; see [`VulkanModel::matrix`].
-    /// Fails when no device is usable or the model needs something the
-    /// Vulkan kernels lack.
+    /// Their states take more memory: where it runs short, the model runs
+    /// without them; see [`VulkanBackend::matrix_dropped`]. Fails when no
+    /// device is usable or the model needs something the Vulkan kernels
+    /// lack.
     pub fn new(model: &'a Model<'a>, context: usize, matrix: bool) -> Result<Self, LoadError> {
-        let gpu = VulkanModel::load(model, context, matrix)?;
-        let state = gpu.new_state().map_err(vulkan_error)?;
+        let mut gpu = VulkanModel::load(model, context, matrix)?;
         // the drafter's cache shares the memory, so a full device fails here
         // and not on the first request
-        drop(gpu.new_mtp_state().map_err(vulkan_error)?);
+        let states = |gpu: &VulkanModel| -> kinetic_vulkan::Result<VulkanState> {
+            let state = gpu.new_state()?;
+            drop(gpu.new_mtp_state()?);
+            Ok(state)
+        };
+        let (state, matrix_dropped) = match states(&gpu) {
+            Ok(state) => (state, false),
+            Err(_) if gpu.matrix() => {
+                gpu.without_matrix();
+                (states(&gpu).map_err(vulkan_error)?, true)
+            }
+            Err(e) => return Err(vulkan_error(e)),
+        };
         Ok(VulkanBackend {
             decoder: drafter::decoder(&gpu),
             cached: Some(Sequence {
                 state,
                 tokens: Vec::new(),
             }),
+            replied: false,
             warm: None,
             cpu: CpuBackend::new(model),
             // receipts class devices by this name, so it says which path
@@ -77,6 +98,7 @@ impl<'a> VulkanBackend<'a> {
                 ),
                 false => format!("{} ({})", gpu.device_name(), kinetic_vulkan::API),
             },
+            matrix_dropped,
             model,
             gpu,
         })
@@ -88,13 +110,27 @@ impl<'a> VulkanBackend<'a> {
         VulkanBackend::new(model, context, matrix).map(Self::without_drafts)
     }
 
-    /// The kernel path that decides the bits, for keying warm states and
-    /// receipts: `vulkan`, or `vulkan-coopmat` where prompt passes run on
-    /// the matrix units.
-    pub fn class(&self) -> &'static str {
+    /// Whether prompt passes run on the device's matrix units; see
+    /// [`VulkanModel::matrix`].
+    pub fn matrix(&self) -> bool {
+        self.gpu.matrix()
+    }
+
+    /// Whether prompt passes on the matrix units were asked for and the
+    /// device has them, but their states did not fit in its memory, so the
+    /// model runs without them.
+    pub fn matrix_dropped(&self) -> bool {
+        self.matrix_dropped
+    }
+
+    /// The kernel path that decides the bits, for keying warm states:
+    /// `vulkan`, or `vulkan-coopmat` and the device's name where prompt
+    /// passes run on the matrix units, whose sums may differ between
+    /// GPUs.
+    pub fn class(&self) -> String {
         match self.gpu.matrix() {
-            true => "vulkan-coopmat",
-            false => "vulkan",
+            true => format!("vulkan-coopmat {}", self.gpu.device_name()),
+            false => "vulkan".into(),
         }
     }
 
@@ -132,8 +168,12 @@ impl<'a> VulkanBackend<'a> {
         let chunk = PREFILL_CHUNK;
         // the empty sequence made at load time leaves warm starts their go
         let fresh = |s: &Sequence<VulkanState>| s.tokens.is_empty() && self.warm.is_some();
+        // prompt passes on the matrix units sum unlike decode steps, so a
+        // reply's tokens would get other bits than a cold run gives them
+        // as prompt
+        let exact = !(self.replied && self.gpu.matrix());
         let old = match self.cached.take() {
-            Some(mut seq) if seq.continues(prompt) && !fresh(&seq) => {
+            Some(mut seq) if seq.continues(prompt) && exact && !fresh(&seq) => {
                 let reused = seq.tokens.len();
                 sequence::extend(
                     &self.gpu,
@@ -220,6 +260,8 @@ impl<'a> Run<VulkanModel<'a>> for VulkanBackend<'a> {
             // next run starts colder
             let _ = warm.insert(&k.tokens, &k.state, &k.logits);
         }
+        // the token chosen last is never run
+        self.replied = seq.tokens.len() > prompt.len();
         self.cached = Some(seq);
         Timings {
             prompt_tokens: prompt.len(),
@@ -247,6 +289,8 @@ impl Backend for VulkanBackend<'_> {
 
     fn logits(&mut self, tokens: &[u32], all_rows: bool) -> Result<Vec<f32>, String> {
         let mut state = self.gpu.new_state().map_err(|e| format!("Vulkan: {e}"))?;
+        // a request runs its prompt as one
+        self.gpu.set_prompt(&mut state, true);
         self.gpu
             .run(&mut state, tokens, all_rows)
             .map(|f| f.logits)

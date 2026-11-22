@@ -420,6 +420,48 @@ fn f{i}(a: i32) -> i32 {{"
     }
 }
 
+#[cfg(feature = "vulkan")]
+mod vulkan {
+    use super::*;
+    use kinetic_server::VulkanBackend;
+
+    /// Every turn of a chat continued from the cache gives what the whole
+    /// conversation gives on a fresh backend, which runs it all as prompt:
+    /// on the matrix units the reply's decode steps sum unlike a prompt.
+    #[test]
+    #[ignore = "needs KINETIC_TEST_GGUF and a Vulkan device"]
+    fn vulkan_chat_continues_like_a_cold_run() {
+        let (_, file, tokenizer) = model_file();
+        let model = kinetic_models::load(&file).unwrap();
+        let turns: Vec<Vec<u32>> = [
+            CODE.repeat(3),
+            "\nfn neg(a: i32) -> i32 {".into(),
+            CODE.into(),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, text)| tokenizer.encode(&format!("{text}\nfn f{i}(a: i32) -> i32 {{"), i == 0))
+        .collect();
+        let settings = settings();
+        let mut chat = VulkanBackend::new(&model, 4096, true).unwrap();
+        eprintln!("{}", chat.device());
+        for sampling in [&settings[0], &settings[2]] {
+            let mut prompt = Vec::new();
+            for (turn, text) in turns.iter().enumerate() {
+                prompt.extend_from_slice(text);
+                let answer = generate(&mut chat, &prompt, sampling);
+                let mut cold = VulkanBackend::new(&model, 4096, true).unwrap();
+                assert_eq!(
+                    generate(&mut cold, &prompt, sampling),
+                    answer,
+                    "turn {turn}, {sampling:?}"
+                );
+                prompt.extend_from_slice(&answer[..answer.len() - 1]);
+            }
+        }
+    }
+}
+
 /// Two turns of a chat about a long prompt, every request after drafts of
 /// it when `ahead`: growing as if typed, and one edited inside what already
 /// ran ahead. Returns every answer.

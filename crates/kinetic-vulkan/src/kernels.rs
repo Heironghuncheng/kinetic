@@ -1,5 +1,8 @@
 use std::rc::Rc;
 
+#[cfg(not(metal_driver))]
+use kinetic_quant::TensorType;
+
 use crate::commands::Commands;
 use crate::device::Device;
 use crate::error::{Error, Result};
@@ -46,7 +49,7 @@ pub struct Kernels {
     /// Products of prompt passes on the matrix units, on devices with
     /// cooperative f16 matrices (`Features::matrix_f16`).
     #[cfg(not(metal_driver))]
-    pub(crate) mm: Option<MatrixKernels>,
+    pub(crate) mm: Vec<(TensorType, Rc<Kernel>)>,
     pub(crate) quantize_q8: Rc<Kernel>,
     pub(crate) norm: Rc<Kernel>,
     pub(crate) swiglu: Rc<Kernel>,
@@ -64,14 +67,20 @@ pub struct Kernels {
     pub(crate) single: DeviceBuffer<u32>,
 }
 
-/// The kernels on the matrix units, by weight type.
+/// The weight types with kernels on the matrix units, and those kernels,
+/// as build.rs compiles them.
 #[cfg(not(metal_driver))]
-pub(crate) struct MatrixKernels {
-    pub(crate) q8_0: Rc<Kernel>,
-    pub(crate) q4_k: Rc<Kernel>,
-    pub(crate) q5_k: Rc<Kernel>,
-    pub(crate) q6_k: Rc<Kernel>,
-}
+const MATRIX_TYPES: [(TensorType, &str, &[u8]); 4] = [
+    (TensorType::Q8_0, "mm_q8_0", spirv!("mm_q8_0")),
+    (TensorType::Q4K, "mm_q4_k", spirv!("mm_q4_k")),
+    (TensorType::Q5K, "mm_q5_k", spirv!("mm_q5_k")),
+    (TensorType::Q6K, "mm_q6_k", spirv!("mm_q6_k")),
+];
+
+/// Most tokens of a prompt pass on the matrix units; every state holds
+/// buffers for as many.
+#[cfg(not(metal_driver))]
+const MATRIX_PROMPT_BATCH: usize = 512;
 
 impl Kernels {
     /// Builds the pipelines for the kernels embedded in this crate.
@@ -111,16 +120,13 @@ impl Kernels {
             gemv_q5_k: gemv("gemv_q5_k", spirv!("gemv_q5_k"))?,
             gemv_q6_k: gemv("gemv_q6_k", spirv!("gemv_q6_k"))?,
             #[cfg(not(metal_driver))]
-            mm: matrix
-                .then(|| -> Result<MatrixKernels> {
-                    Ok(MatrixKernels {
-                        q8_0: gemv("mm_q8_0", spirv!("mm_q8_0"))?,
-                        q4_k: gemv("mm_q4_k", spirv!("mm_q4_k"))?,
-                        q5_k: gemv("mm_q5_k", spirv!("mm_q5_k"))?,
-                        q6_k: gemv("mm_q6_k", spirv!("mm_q6_k"))?,
-                    })
-                })
-                .transpose()?,
+            mm: match matrix {
+                true => MATRIX_TYPES
+                    .iter()
+                    .map(|&(ty, name, spirv)| Ok((ty, gemv(name, spirv)?)))
+                    .collect::<Result<_>>()?,
+                false => Vec::new(),
+            },
             quantize_q8: Kernel::new(device, "quantize_q8", spirv!("quantize_q8"), 3, 1)?,
             norm: Kernel::new(device, "norm", spirv!("norm"), 8, 4)?,
             swiglu: Kernel::new(device, "swiglu", spirv!("swiglu"), 5, 1)?,
@@ -145,7 +151,7 @@ impl Kernels {
         #[cfg(metal_driver)]
         return false;
         #[cfg(not(metal_driver))]
-        self.mm.is_some()
+        !self.mm.is_empty()
     }
 
     /// Most tokens worth running as one prompt pass, or 0 where the device
@@ -155,9 +161,9 @@ impl Kernels {
         #[cfg(metal_driver)]
         return 64;
         #[cfg(not(metal_driver))]
-        match self.mm {
-            Some(_) => 512,
-            None => 0,
+        match self.mm.is_empty() {
+            false => MATRIX_PROMPT_BATCH,
+            true => 0,
         }
     }
 

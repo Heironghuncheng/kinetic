@@ -8,6 +8,8 @@ use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::kernels::{Kernels, MAX_GROUPS};
 use crate::layout::device_layout;
+#[cfg(not(metal_driver))]
+use crate::matrix_tile::MATRIX_TILE;
 use crate::memory::{Allocation, DeviceBuffer};
 use crate::pipeline::Kernel;
 
@@ -381,14 +383,10 @@ impl Kernels {
     /// device has one.
     #[cfg(not(metal_driver))]
     fn matrix_kernel(&self, ty: TensorType) -> Option<&Rc<Kernel>> {
-        let mm = self.mm.as_ref()?;
-        match ty {
-            TensorType::Q8_0 => Some(&mm.q8_0),
-            TensorType::Q4K => Some(&mm.q4_k),
-            TensorType::Q5K => Some(&mm.q5_k),
-            TensorType::Q6K => Some(&mm.q6_k),
-            _ => None,
-        }
+        self.mm
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .map(|(_, kernel)| kernel)
     }
 
     /// Records a product on the matrix units: tiles of 64 rows by 64 of
@@ -410,7 +408,6 @@ impl Kernels {
         batch: &Batch,
         commands: &mut Commands,
     ) {
-        const TILE: usize = 64;
         let block = block_len(w.ty).expect("matrix kernels take types with GEMV kernels");
         // SAFETY: matches mm_*.wgsl, which takes gemv.wgsl's bindings and
         // push constants; it reads the rows and writes the outputs of the
@@ -435,8 +432,8 @@ impl Kernels {
                     0,
                 ],
                 [
-                    w.rows.div_ceil(TILE) as u32,
-                    capacity.max(1).div_ceil(TILE) as u32,
+                    w.rows.div_ceil(MATRIX_TILE) as u32,
+                    capacity.max(1).div_ceil(MATRIX_TILE) as u32,
                     1,
                 ],
             )
