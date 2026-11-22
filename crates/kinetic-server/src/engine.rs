@@ -13,6 +13,7 @@ use kinetic_vision::VisionEncoder;
 use serde_json::{Map, Value};
 
 use crate::backend::{Backend, Job, PromptImage, Timings};
+use crate::logprobs::TextLogprobs;
 use crate::metrics::{Load, Slot, Stats};
 use crate::model_info::ModelInfo;
 use crate::receipt::Receipts;
@@ -542,14 +543,38 @@ impl<'a> Engine<'a> {
         self.complete_tokens(ids, prompt, request, logprobs, on_delta)
     }
 
+    /// Chat uses the same visible token prefix for logprobs in both modes.
+    pub(crate) fn complete_chat_with_logprobs(
+        &self,
+        prompt: &Prompt,
+        request: &Request,
+        logprobs: Option<&Logprobs>,
+        on_delta: &mut dyn FnMut(&Split, usize) -> bool,
+    ) -> Result<Completion, RequestError> {
+        let ids = self.encode(&prompt.text);
+        self.complete_tokens_inner(ids, prompt, request, logprobs, true, on_delta)
+    }
+
     /// [`Engine::complete_with_logprobs`] after prompt tokens already
     /// encoded; `prompt` only gives the images, reasoning and tools.
     pub fn complete_tokens(
+        &self,
+        ids: Vec<u32>,
+        prompt: &Prompt,
+        request: &Request,
+        logprobs: Option<&Logprobs>,
+        on_delta: &mut dyn FnMut(&Split, usize) -> bool,
+    ) -> Result<Completion, RequestError> {
+        self.complete_tokens_inner(ids, prompt, request, logprobs, false, on_delta)
+    }
+
+    fn complete_tokens_inner(
         &self,
         mut ids: Vec<u32>,
         prompt: &Prompt,
         request: &Request,
         logprobs: Option<&Logprobs>,
+        visible_logprobs: bool,
         on_delta: &mut dyn FnMut(&Split, usize) -> bool,
     ) -> Result<Completion, RequestError> {
         if ids.is_empty() {
@@ -594,10 +619,12 @@ impl<'a> Engine<'a> {
         let mut cut = false;
         let mut generated = 0;
         let mut output_ids = Vec::new();
-        let mut deliver = |part: Split, generated: usize, out: &mut Split| {
+        let mut text_logprobs =
+            (visible_logprobs && logprobs.is_some()).then(TextLogprobs::default);
+        let mut deliver = |part: Split, count: usize, out: &mut Split| {
             out.reasoning.push_str(&part.reasoning);
             out.content.push_str(&part.content);
-            part.is_empty() || on_delta(&part, generated)
+            part.is_empty() || on_delta(&part, count)
         };
 
         let vocab = request.grammar.as_ref().map(|_| {
@@ -614,6 +641,7 @@ impl<'a> Engine<'a> {
             images: &images,
             logprobs,
         };
+        let mut count = 0;
         let timings = self.on_backend(&ids, |slot, backend| {
             self.stats
                 .start(slot, request, prompt.text.clone(), max_tokens);
@@ -628,7 +656,11 @@ impl<'a> Engine<'a> {
                         return false;
                     }
                     let (text, hit) = stops.push(&decoder.push(t));
-                    let open = deliver(split(&text), generated, &mut out);
+                    count = text_logprobs.as_mut().map_or(generated, |log| {
+                        log.push(self.tokenizer.piece(t));
+                        log.emit(&text)
+                    });
+                    let open = deliver(split(&text), count, &mut out);
                     if hit {
                         (finish, cut) = (Finish::Stop, true);
                         return false;
@@ -648,11 +680,15 @@ impl<'a> Engine<'a> {
 
         if !cut {
             // the decoder holds back only an unfinished character, e.g. one cut by the token limit; drop it
-            deliver(split(&stops.finish()), generated, &mut out);
+            let text = stops.finish();
+            count = text_logprobs
+                .as_mut()
+                .map_or(generated, |log| log.emit(&text));
+            deliver(split(&text), count, &mut out);
         }
         if let Some(t) = think.as_mut() {
             let part = calls(t.finish(), &mut tools);
-            deliver(part, generated, &mut out);
+            deliver(part, count, &mut out);
         }
         let tool_calls = match tools {
             Some(t) => {
@@ -661,11 +697,14 @@ impl<'a> Engine<'a> {
                     content,
                     ..Split::default()
                 };
-                deliver(part, generated, &mut out);
+                deliver(part, count, &mut out);
                 found
             }
             None => Vec::new(),
         };
+        if let (Some(_), Some(log)) = (text_logprobs, logprobs) {
+            log.truncate(count);
+        }
         out.reasoning.truncate(out.reasoning.trim_end().len());
         if !tool_calls.is_empty() {
             out.content.truncate(out.content.trim_end().len());
