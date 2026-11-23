@@ -268,6 +268,11 @@ impl<'a> Run<VulkanModel<'a>> for VulkanBackend<'a> {
         // the token chosen last is never run
         self.replied = seq.tokens.len() > prompt.len();
         self.cached = Some(seq);
+        // where an offloaded model's time went, beside the run's summary
+        if let Some(report) = self.gpu.expert_report() {
+            eprintln!("[{report}]");
+            self.gpu.reset_expert_report();
+        }
         Timings {
             prompt_tokens: prompt.len(),
             cached_tokens,

@@ -64,7 +64,14 @@ pub(super) struct VulkanLayer {
 }
 
 impl VulkanLayer {
-    pub fn upload(gpu: &Gpu, l: &Layer, ropes: &mut RopeTables) -> Result<VulkanLayer, LoadError> {
+    /// Uploads `l`, with its routed experts unless they are left to an
+    /// offload.
+    pub fn upload(
+        gpu: &Gpu,
+        l: &Layer,
+        ropes: &mut RopeTables,
+        experts: bool,
+    ) -> Result<VulkanLayer, LoadError> {
         let optional = |v: &Option<Vec<f32>>| v.as_deref().map(|v| gpu.vector(v)).transpose();
         let mixer = match &l.mixer {
             Mixer::Attention(a) => VulkanMixer::Attention(VulkanAttention::upload(gpu, a, ropes)?),
@@ -83,7 +90,10 @@ impl VulkanLayer {
             return Err(unsupported("layers without input norms"));
         };
         let ffn = l.ffn.as_ref().map(|f| VulkanFfn::upload(gpu, f));
-        let experts = l.experts.as_ref().map(|m| VulkanMoe::upload(gpu, m));
+        let experts = l
+            .experts
+            .as_ref()
+            .map(|m| VulkanMoe::upload(gpu, m, experts));
         Ok(VulkanLayer {
             mixer_norm: optional(&l.mixer_norm)?,
             mixer,
@@ -130,6 +140,10 @@ impl VulkanLayer {
 
     pub fn ffn_norm(&self) -> &DeviceBuffer<f32> {
         &self.ffn_norm
+    }
+
+    pub fn experts_mut(&mut self) -> Option<&mut VulkanMoe> {
+        self.experts.as_mut()
     }
 
     pub fn experts(&self) -> Option<&VulkanMoe> {

@@ -7,8 +7,9 @@ use super::Gpu;
 use crate::blocks::{Experts, Gating, Moe};
 use crate::LoadError;
 
-/// The routed experts of a layer on the device, every expert resident; see
-/// [`Moe`].
+/// The routed experts of a layer on the device; see [`Moe`]. Their
+/// matrices are resident, or for a model larger than the device held in
+/// slots that its offload fills.
 pub(super) struct VulkanMoe {
     router: DeviceMatrix,
     gating: kinetic_vulkan::Gating,
@@ -17,7 +18,7 @@ pub(super) struct VulkanMoe {
     weight_scale: f32,
     glu: kinetic_vulkan::Glu,
     n_ff: usize,
-    weights: ExpertWeights,
+    weights: Option<ExpertWeights>,
     /// The shared expert's gate as a one-row matrix.
     shared_gate: Option<DeviceMatrix>,
     pub used: usize,
@@ -33,47 +34,57 @@ pub(super) struct ExpertWeights {
     pub count: usize,
 }
 
-/// Every expert of `e` as one matrix, if they follow each other in memory.
-fn stacked<'a>(e: &Experts<'a>, count: usize) -> Option<Matrix<'a>> {
-    let bytes = e.expert_bytes();
-    (e.stride == bytes).then(|| Matrix::new(e.ty, &e.data[..count * bytes], count * e.rows, e.cols))
+/// [`ExpertWeights`] wherever they are held.
+pub(super) struct ExpertView<'a> {
+    pub gate_up: Vec<(&'a DeviceMatrix, usize)>,
+    pub down: &'a DeviceMatrix,
+    pub count: usize,
 }
 
-/// The gate and up halves of one tensor as that tensor, if they are.
-fn fused<'a>(gate: &Experts<'a>, up: &Experts<'a>, count: usize) -> Option<Matrix<'a>> {
+impl ExpertWeights {
+    fn view(&self) -> ExpertView<'_> {
+        ExpertView {
+            gate_up: self.gate_up.iter().map(|(m, at)| (m, *at)).collect(),
+            down: &self.down,
+            count: self.count,
+        }
+    }
+}
+
+/// The experts of `m` the products run: the gate and up experts, each with
+/// where it writes in a row of both (one product when they are the halves
+/// of one tensor), then the down experts.
+pub(super) fn sources<'a>(m: &Moe<'a>) -> (Vec<(Experts<'a>, usize)>, Experts<'a>) {
+    let (gate, up) = (m.gate, m.up);
     let half = gate.expert_bytes();
     let joined = gate.stride == 2 * half
         && (up.stride, up.rows, up.cols, up.ty) == (gate.stride, gate.rows, gate.cols, gate.ty)
         && gate.data.get(half..).map(<[u8]>::as_ptr) == Some(up.data.as_ptr());
-    joined.then(|| {
-        Matrix::new(
-            gate.ty,
-            &gate.data[..count * gate.stride],
-            count * 2 * gate.rows,
-            gate.cols,
-        )
-    })
+    let gate_up = match joined {
+        true => vec![(
+            Experts {
+                rows: 2 * gate.rows,
+                ..gate
+            },
+            0,
+        )],
+        false => vec![(gate, 0), (up, gate.rows)],
+    };
+    (gate_up, m.down)
+}
+
+/// Every expert of `e` as one matrix, if they follow each other in memory.
+fn stacked<'a>(e: &Experts<'a>, count: usize) -> Result<Matrix<'a>, LoadError> {
+    let bytes = e.expert_bytes();
+    (e.stride == bytes)
+        .then(|| Matrix::new(e.ty, &e.data[..count * bytes], count * e.rows, e.cols))
+        .ok_or_else(|| LoadError("expert matrices are interleaved".into()))
 }
 
 impl VulkanMoe {
-    pub fn upload(gpu: &Gpu, m: &Moe) -> Result<Self, LoadError> {
+    /// Uploads the routing of `m`, and its experts if `resident`.
+    pub fn upload(gpu: &Gpu, m: &Moe, resident: bool) -> Result<Self, LoadError> {
         let n = m.n_experts();
-        let n_ff = m.gate.rows;
-        let gate_up = match (
-            fused(&m.gate, &m.up, n),
-            stacked(&m.gate, n),
-            stacked(&m.up, n),
-        ) {
-            (Some(f), _, _) => vec![(gpu.matrix(&f)?, 0)],
-            (None, Some(g), Some(u)) => vec![(gpu.matrix(&g)?, 0), (gpu.matrix(&u)?, n_ff)],
-            _ => {
-                return Err(LoadError(
-                    "expert gate and up matrices are interleaved".into(),
-                ))
-            }
-        };
-        let down = stacked(&m.down, n)
-            .ok_or_else(|| LoadError("expert down matrices are interleaved".into()))?;
         if m.scales.iter().any(Option::is_some) {
             return Err(LoadError(
                 "per-expert weight scales do not run on Vulkan yet".into(),
@@ -91,7 +102,7 @@ impl VulkanMoe {
                 gpu.matrix(&Matrix::new(TensorType::F32, &bytes, 1, g.len()))
             })
             .transpose()?;
-        Ok(VulkanMoe {
+        let mut moe = VulkanMoe {
             router: gpu.matrix(&m.router)?,
             gating,
             bias: gpu.vector(&bias)?,
@@ -100,15 +111,31 @@ impl VulkanMoe {
                 Glu::Silu => kinetic_vulkan::Glu::Silu,
                 Glu::Situ { beta, linear } => kinetic_vulkan::Glu::Situ { beta, linear },
             },
-            n_ff,
-            weights: ExpertWeights {
-                gate_up,
-                down: gpu.matrix(&down)?,
-                count: n,
-            },
+            n_ff: m.gate.rows,
+            weights: None,
             shared_gate,
             used: m.n_used,
-        })
+        };
+        if resident {
+            moe.upload_experts(gpu, m)?;
+        }
+        Ok(moe)
+    }
+
+    /// Uploads every expert of `m`, the routed experts of this layer.
+    pub fn upload_experts(&mut self, gpu: &Gpu, m: &Moe) -> Result<(), LoadError> {
+        let n = m.n_experts();
+        let (gate_up, down) = sources(m);
+        let gate_up = gate_up
+            .iter()
+            .map(|(e, at)| Ok((gpu.matrix(&stacked(e, n)?)?, *at)))
+            .collect::<Result<_, LoadError>>()?;
+        self.weights = Some(ExpertWeights {
+            gate_up,
+            down: gpu.matrix(&stacked(&down, n)?)?,
+            count: n,
+        });
+        Ok(())
     }
 
     pub fn n_experts(&self) -> usize {
@@ -121,20 +148,20 @@ impl VulkanMoe {
     }
 
     pub fn size_bytes(&self) -> usize {
-        let w = &self.weights;
-        w.gate_up
-            .iter()
-            .map(|(m, _)| m)
-            .chain([&self.router, &w.down])
-            .map(DeviceMatrix::size_bytes)
-            .sum()
+        let experts = self.weights.as_ref().map_or(0, |w| {
+            let gate_up: usize = w.gate_up.iter().map(|(m, _)| m.size_bytes()).sum();
+            gate_up + w.down.size_bytes()
+        });
+        self.router.size_bytes() + experts
     }
 
     /// Reads `w.h` and leaves the layer's output in `w.y`, which holds the
-    /// shared expert's output if `shared`.
+    /// shared expert's output if `shared`. The experts must be resident.
     pub fn record(&self, gpu: &Gpu, w: &Work, shared: bool, c: &mut Commands) -> R {
+        let weights = self.weights.as_ref().expect("experts are on the device");
         self.record_route(gpu, w, c)?;
-        self.record_products(gpu, w, &self.weights, shared, c)
+        self.record_products(gpu, w, &weights.view(), c)?;
+        self.record_mix(gpu, w, shared, c)
     }
 
     /// Records the routing of `w.h` into the picks of `w`.
@@ -178,24 +205,24 @@ impl VulkanMoe {
         )
     }
 
-    /// Records the products of the picked experts of `weights`, which the
-    /// picks name, and their mix into `w.y`.
+    /// Records the products of the picks of `w`, which name experts of
+    /// `weights`, into the rows of each pick's output; picks of experts
+    /// past `weights` are left alone.
     pub fn record_products(
         &self,
         gpu: &Gpu,
         w: &Work,
-        weights: &ExpertWeights,
-        shared: bool,
+        weights: &ExpertView,
         c: &mut Commands,
     ) -> R {
         let k = &gpu.kernels;
         let (n_ff, used, d, count) = (self.n_ff, self.used, w.d, weights.count);
         let e = w.experts.as_ref().expect("work has expert buffers");
         c.independent(|c| {
-            for (m, offset) in &weights.gate_up {
+            for &(m, offset) in &weights.gate_up {
                 let out = Out {
                     stride: 2 * n_ff,
-                    offset: *offset,
+                    offset,
                 };
                 k.gemv_experts(
                     m, count, used, &e.picks, &w.h, used, &e.gu, out, &w.batch, c,
@@ -210,7 +237,7 @@ impl VulkanMoe {
             offset: 0,
         };
         k.gemv_experts(
-            &weights.down,
+            weights.down,
             count,
             used,
             &e.picks,
@@ -220,12 +247,20 @@ impl VulkanMoe {
             out,
             &w.batch,
             c,
-        )?;
+        )
+    }
+
+    /// Records the mix of the picks' outputs into `w.y`, which holds the
+    /// shared expert's output if `shared`.
+    pub fn record_mix(&self, gpu: &Gpu, w: &Work, shared: bool, c: &mut Commands) -> R {
+        let e = w.experts.as_ref().expect("work has expert buffers");
         let shared = match (shared, &self.shared_gate) {
             (false, _) => Shared::None,
             (true, None) => Shared::Plain,
             (true, Some(_)) => Shared::Gated(&e.gate),
         };
-        k.mix_experts(&w.batch, used, &e.picks, &e.routed, shared, d, &w.y, c)
+        let (used, d) = (self.used, w.d);
+        gpu.kernels
+            .mix_experts(&w.batch, used, &e.picks, &e.routed, shared, d, &w.y, c)
     }
 }

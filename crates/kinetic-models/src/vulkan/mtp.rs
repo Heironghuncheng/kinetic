@@ -32,7 +32,7 @@ impl VulkanMtp {
             eh_proj: gpu.matrix(&m.eh_proj)?,
             embd_norm: m.embd_norm.clone(),
             hidden_norm: m.hidden_norm.clone(),
-            layer: VulkanLayer::upload(gpu, &m.layer, ropes)?,
+            layer: VulkanLayer::upload(gpu, &m.layer, ropes, true)?,
             head_norm: gpu.vector(&m.head_norm)?,
             draft_head: RefCell::new(None),
         })

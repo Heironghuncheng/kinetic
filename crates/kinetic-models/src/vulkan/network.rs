@@ -8,6 +8,7 @@ use kinetic_vulkan::{
 };
 
 use super::layer::{LayerState, VulkanLayer, R};
+use super::offload::Segments;
 use super::relative::RelativeState;
 use super::work::Work;
 use super::Gpu;
@@ -229,6 +230,7 @@ impl VulkanNetwork {
         states: &[LayerState],
         output_norm: &DeviceBuffer<f32>,
         trace: Option<&HostBuffer<f32>>,
+        mut cuts: Option<&mut Segments>,
         c: &mut Commands,
     ) -> R {
         let k = &gpu.kernels;
@@ -274,12 +276,14 @@ impl VulkanNetwork {
                         gpu,
                         w,
                         net,
+                        index: layer,
                         layer: &layers[layer],
                         wiring: &self.wiring[layer],
                         state,
                         bank: looped.then_some(&bank),
                     };
-                    blocks = ctx.record(blocks, self.starts_block[layer], self.eps, c)?;
+                    let starts = self.starts_block[layer];
+                    blocks = ctx.record(blocks, starts, self.eps, cuts.as_deref_mut(), c)?;
                     if let Some(trace) = trace {
                         c.download(cur, 0, trace, traced * len, len)?;
                         traced += 1;
@@ -303,6 +307,8 @@ struct Ctx<'a> {
     gpu: &'a Gpu,
     w: &'a Work,
     net: &'a NetWork,
+    /// The physical layer.
+    index: usize,
     layer: &'a VulkanLayer,
     wiring: &'a VulkanWiring,
     state: &'a RelativeState,
@@ -318,6 +324,7 @@ impl Ctx<'_> {
         mut blocks: usize,
         starts_block: bool,
         eps: f32,
+        cuts: Option<&mut Segments>,
         c: &mut Commands,
     ) -> kinetic_vulkan::Result<usize> {
         let (gpu, w, net) = (self.gpu, self.w, self.net);
@@ -395,7 +402,14 @@ impl Ctx<'_> {
         }
         k.norm(&w.batch, h, None, self.layer.ffn_norm(), eps, &w.h, c)?;
         let moe = self.layer.experts().expect("network layers have experts");
-        moe.record(gpu, w, false, c)?;
+        match cuts {
+            None => moe.record(gpu, w, false, c)?,
+            Some(cuts) => {
+                moe.record_route(gpu, w, c)?;
+                cuts.cut(gpu, w, self.index, c)?;
+                moe.record_mix(gpu, w, false, c)?;
+            }
+        }
         attn.record_conv(gpu, w, 3, self.state, cur, true, c)?;
         Ok(blocks)
     }
