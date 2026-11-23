@@ -1,36 +1,28 @@
-//! The form an expert takes in a device slot: each matrix in its file's
-//! type where an expert kernel reads that type ([`EXPERT_TYPES`]), or else
-//! expanded on the host into [`EXPANDED`], which one does; then, in files
-//! that have them, its scales of the gate, up and down products.
+//! The form an expert takes in a device slot: each matrix as `expand.rs`
+//! says the device reads its type, then, in files that have them, its
+//! scales of the gate, up and down products.
 
 use std::borrow::Cow;
 
 use kinetic_cuda::EXPERT_TYPES;
-use kinetic_quant::{dequantize, quantize, TensorType};
+use kinetic_quant::TensorType;
 
+use super::super::expand::{self, Use};
 use super::cache::SlotLayout;
 use crate::blocks::{Experts, Moe};
 
-/// The type expert matrices without a kernel of their own are expanded to.
-pub(super) const EXPANDED: TensorType = TensorType::Q8_0;
-
 /// How the device stores and reads expert matrices of type `ty`.
 pub(super) fn device_type(ty: TensorType) -> TensorType {
-    if EXPERT_TYPES.contains(&ty) {
-        ty
-    } else {
-        EXPANDED
-    }
+    expand::device_type(ty, Use::Expert)
 }
 
 /// Whether experts of type `ty` can run on the device, read as they are or
 /// expanded.
 pub(super) fn supported(ty: TensorType) -> bool {
-    let mut row = vec![0.0; ty.block_len()];
-    EXPERT_TYPES.contains(&ty) || dequantize(ty, &vec![0; ty.block_bytes()], &mut row).is_ok()
+    EXPERT_TYPES.contains(&ty) || expand::expandable(ty)
 }
 
-fn matrix_bytes(m: &Experts) -> usize {
+pub(super) fn matrix_bytes(m: &Experts) -> usize {
     let ty = device_type(m.ty);
     m.rows * m.cols / ty.block_len() * ty.block_bytes()
 }
@@ -55,14 +47,7 @@ pub(super) fn row<'a>(m: &Experts<'a>, e: usize, r: usize) -> Cow<'a, [u8]> {
     if device_type(m.ty) == m.ty {
         return Cow::Borrowed(row);
     }
-    let mut x = vec![0.0; m.cols];
-    dequantize(m.ty, row, &mut x).expect("supported types dequantize");
-    let mut out = vec![0; m.cols / EXPANDED.block_len() * EXPANDED.block_bytes()];
-    assert!(
-        quantize(EXPANDED, &x, &mut out),
-        "the expanded type quantizes"
-    );
-    Cow::Owned(out)
+    Cow::Owned(expand::row(m.ty, row, m.cols))
 }
 
 /// Writes expert `e` of `moe` in its slot form at the start of `dst` and
@@ -108,7 +93,7 @@ mod tests {
         }
         for ty in expanded {
             assert!(supported(ty), "{ty}");
-            assert_eq!(device_type(ty), EXPANDED, "{ty}");
+            assert_eq!(device_type(ty), expand::EXPANDED, "{ty}");
         }
     }
 }

@@ -256,6 +256,7 @@ fn routed_experts_match_the_host() {
         },
         weight_scale: 2.0,
         scales: Default::default(),
+        norms: None,
     };
     let h = pattern(n * D, 7, 19, 0.3);
     let mut want = vec![0.0; n * D];

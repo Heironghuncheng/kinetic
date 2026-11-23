@@ -169,6 +169,7 @@ fn device_experts_equal_host_experts_bit_for_bit() {
             situ: match glu {
                 Glu::Silu => None,
                 Glu::Situ { beta, linear } => Some((beta, linear)),
+                Glu::Gelu => unreachable!("not among these cases"),
             },
             scales: scales.map(|at| (at, if second.is_some() { 0 } else { 2 })),
         };

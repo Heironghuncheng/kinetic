@@ -19,6 +19,7 @@
 
 mod attention;
 mod delta_net;
+mod expand;
 mod experts;
 mod ffn;
 mod fold;
@@ -54,6 +55,7 @@ use crate::blocks::{Folding, Moe};
 use crate::convoy::Convoy;
 use crate::model::Mark;
 use crate::{Forward, LoadError, Model};
+use expand::{Expanded, Use};
 use experts::{CudaExperts, ExpertWork, Offload};
 use fold::CudaFolding;
 use kinetic_cuda::Flow;
@@ -111,6 +113,8 @@ struct Gpu {
     copied: Event,
     /// How attention caches store keys and values.
     cache: [KvType; 2],
+    /// The weights uploaded expanded, for the line said after loading.
+    expanded: Expanded,
 }
 
 /// Layers that run on a further device, after those of the device before.
@@ -138,6 +142,7 @@ impl Gpu {
             handoff: Event::new(&ctx)?,
             copied: Event::new(&ctx)?,
             cache: [KvType::F16; 2],
+            expanded: Expanded::default(),
             ctx,
         })
     }
@@ -155,8 +160,16 @@ impl Gpu {
         self.stream.wait(&self.join)
     }
 
+    /// Uploads `m`, expanded on the host when no GEMV kernel reads its type.
     fn matrix(&self, m: &kinetic_quant::Matrix) -> kinetic_cuda::Result<DeviceMatrix> {
-        DeviceMatrix::upload(&self.ctx, m)
+        if expand::device_type(m.ty, Use::Matrix) == m.ty || !expand::expandable(m.ty) {
+            return DeviceMatrix::upload(&self.ctx, m);
+        }
+        let bytes = expand::matrix(m);
+        self.expanded
+            .add(m.ty, bytes.len() as isize - m.data.len() as isize);
+        let wide = kinetic_quant::Matrix::new(expand::EXPANDED, &bytes, m.rows, m.cols);
+        DeviceMatrix::upload(&self.ctx, &wide)
     }
 
     fn vector(&self, v: &[f32]) -> kinetic_cuda::Result<DeviceBuffer<f32>> {
@@ -495,6 +508,9 @@ impl<'m> CudaModel<'m> {
                 let mtp = cuda.mtp.as_mut().expect("a prediction block");
                 mtp.spare = Some(RefCell::new(Spare::new(spare)));
             }
+        }
+        if let Some(line) = cuda.gpu.expanded.report() {
+            eprintln!("{line}");
         }
         Ok(cuda)
     }

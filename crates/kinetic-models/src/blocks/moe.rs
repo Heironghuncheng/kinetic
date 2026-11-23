@@ -190,17 +190,6 @@ impl Moe<'_> {
             .collect()
     }
 
-    /// Whether the block uses only what the GPU backends run: SiLU experts
-    /// on the shared feed-forward input, with no scales or norms of their
-    /// own.
-    #[cfg(feature = "cuda")]
-    pub fn plain(&self) -> bool {
-        self.glu == Glu::Silu
-            && self.weight_scale == 1.0
-            && self.scales.iter().all(Option::is_none)
-            && self.norms.is_none()
-    }
-
     /// [`Moe::forward`] in a layer whose input is `x` and whose normalized
     /// feed-forward input is `h`; with [`Moe::norms`] the experts and the
     /// router read `x` through their own norms, and each branch's output is

@@ -127,6 +127,11 @@ pub struct DeviceMatrix {
 }
 
 impl DeviceMatrix {
+    /// Whether a GEMV kernel reads weights of type `ty`.
+    pub fn reads(ty: TensorType) -> bool {
+        gemv_layout(ty).is_some()
+    }
+
     /// Copies `m` to the device. Fails for types without a GEMV kernel and
     /// for row lengths that are not a multiple of 32.
     pub fn upload(ctx: &Rc<Context>, m: &Matrix) -> Result<DeviceMatrix> {

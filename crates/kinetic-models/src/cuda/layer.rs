@@ -321,6 +321,7 @@ impl CudaLayer {
             experts: None,
             ffn_out_norm: None,
             residual_scale: 1.0,
+            output_scale: 1.0,
             eps,
             kv_source: None,
             input: None,

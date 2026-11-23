@@ -66,6 +66,12 @@ impl CudaExperts {
         shared: bool,
     ) -> Result<CudaExperts, LoadError> {
         check_types(moe)?;
+        for m in [&moe.gate, &moe.up, &moe.down] {
+            if form::device_type(m.ty) != m.ty {
+                let grown = form::matrix_bytes(m) as isize - m.expert_bytes() as isize;
+                gpu.expanded.add(m.ty, grown * moe.n_experts() as isize);
+            }
+        }
         if moe.norms.is_some() || moe.glu == Glu::Gelu {
             return Err(LoadError(
                 "expert norms and GELU experts do not run on CUDA yet".into(),
