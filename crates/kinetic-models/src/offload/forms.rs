@@ -24,6 +24,11 @@ pub(crate) const VULKAN: &[TensorType] = &[
     TensorType::Q6K,
     TensorType::IQ4NL,
     TensorType::NVFP4,
+    TensorType::IQ3XXS,
+    TensorType::IQ2S,
+    TensorType::IQ3S,
+    TensorType::Q3K,
+    TensorType::IQ2XS,
 ];
 
 pub(crate) fn on_vulkan(ty: TensorType) -> Form {

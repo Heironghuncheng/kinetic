@@ -74,7 +74,13 @@ fn random_matrix(ty: TensorType, rows: usize, cols: usize, rng: &mut Lcg) -> Vec
             let scale_offsets: &[usize] = match ty {
                 TensorType::Q4K | TensorType::Q5K => &[0, 2],
                 TensorType::Q6K => &[208],
-                TensorType::Q8_0 | TensorType::IQ4NL => &[0],
+                TensorType::Q8_0
+                | TensorType::IQ4NL
+                | TensorType::IQ2XS
+                | TensorType::IQ2S
+                | TensorType::IQ3XXS
+                | TensorType::IQ3S => &[0],
+                TensorType::Q3K => &[108],
                 TensorType::NVFP4 => &[],
                 _ => unreachable!(),
             };
@@ -271,6 +277,31 @@ fn nvfp4_matches_reference() {
 }
 
 #[test]
+fn iq2_s_matches_reference() {
+    check(TensorType::IQ2S, 37, 5 * 256);
+}
+
+#[test]
+fn iq3_s_matches_reference() {
+    check(TensorType::IQ3S, 37, 5 * 256);
+}
+
+#[test]
+fn q3_k_matches_reference() {
+    check(TensorType::Q3K, 37, 5 * 256);
+}
+
+#[test]
+fn iq2_xs_matches_reference() {
+    check(TensorType::IQ2XS, 37, 5 * 256);
+}
+
+#[test]
+fn iq3_xxs_matches_reference() {
+    check(TensorType::IQ3XXS, 37, 5 * 256);
+}
+
+#[test]
 fn iq4_nl_matches_reference() {
     check(TensorType::IQ4NL, 37, 41 * 32);
 }
@@ -371,6 +402,11 @@ fn experts_match_reference() {
     check_experts(TensorType::Q8_0, 37, 41 * 32);
     check_experts(TensorType::IQ4NL, 37, 41 * 32);
     check_experts(TensorType::NVFP4, 37, 21 * 64);
+    check_experts(TensorType::IQ3XXS, 37, 5 * 256);
+    check_experts(TensorType::IQ2XS, 37, 5 * 256);
+    check_experts(TensorType::Q3K, 37, 5 * 256);
+    check_experts(TensorType::IQ3S, 37, 5 * 256);
+    check_experts(TensorType::IQ2S, 37, 5 * 256);
     check_experts(TensorType::F16, 37, 41 * 32);
     check_experts(TensorType::F32, 37, 41 * 32);
 }

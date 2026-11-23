@@ -6,7 +6,7 @@ use crate::commands::Commands;
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::gemv::{block_len, DeviceMatrix};
-use crate::layout::{device_layout, planes};
+use crate::layout::{blocks, codebook, planes};
 use crate::memory::{DeviceBuffer, HostBuffer};
 
 /// Slots for experts of one shape: a matrix of `slots` experts one after
@@ -39,14 +39,19 @@ impl ExpertSlots {
             )));
         }
         let bytes = slots * rows * cols / ty.block_len() * ty.block_bytes();
+        // Kernels read whole 16-byte words, also of the last plane, and a
+        // codebook from the next word on.
+        let book = codebook(ty).unwrap_or_default();
+        let start = bytes.next_multiple_of(16);
+        let mut data = DeviceBuffer::new(device, start + book.len())?;
+        data.copy_range_from(start, &book)?;
         Ok(ExpertSlots {
             matrix: DeviceMatrix {
                 ty,
                 rows: slots * rows,
                 cols,
                 bytes,
-                // Kernels read whole 16-byte words, also of the last plane.
-                data: DeviceBuffer::new(device, bytes.next_multiple_of(16))?,
+                data,
             },
             slots,
         })
@@ -83,7 +88,7 @@ impl ExpertSlots {
                 self.matrix.cols
             )));
         }
-        staging.copy_from_slice(&device_layout(m));
+        staging.copy_from_slice(&blocks(m));
         Ok(())
     }
 

@@ -38,7 +38,14 @@ pub(crate) fn block_len(ty: TensorType) -> Option<usize> {
         TensorType::F16 => 8,
         TensorType::Q8_0 | TensorType::IQ4NL => 32,
         TensorType::NVFP4 => 64,
-        TensorType::Q4K | TensorType::Q5K | TensorType::Q6K => 256,
+        TensorType::Q3K
+        | TensorType::Q4K
+        | TensorType::Q5K
+        | TensorType::Q6K
+        | TensorType::IQ2XS
+        | TensorType::IQ2S
+        | TensorType::IQ3XXS
+        | TensorType::IQ3S => 256,
         _ => return None,
     })
 }
@@ -508,6 +515,11 @@ impl Kernels {
             TensorType::Q6K => &self.experts_q6_k,
             TensorType::IQ4NL => &self.experts_iq4_nl,
             TensorType::NVFP4 => &self.experts_nvfp4,
+            TensorType::IQ3XXS => &self.experts_iq3_xxs,
+            TensorType::IQ2XS => &self.experts_iq2_xs,
+            TensorType::Q3K => &self.experts_q3_k,
+            TensorType::IQ3S => &self.experts_iq3_s,
+            TensorType::IQ2S => &self.experts_iq2_s,
             _ => unreachable!("block_len admits only types with kernels"),
         };
         // SAFETY: matches experts.wgsl: weights, x, qs, ds, y, the batch and
@@ -570,6 +582,11 @@ impl Kernels {
             TensorType::Q6K => &self.gemv_q6_k,
             TensorType::IQ4NL => &self.gemv_iq4_nl,
             TensorType::NVFP4 => &self.gemv_nvfp4,
+            TensorType::IQ3XXS => &self.gemv_iq3_xxs,
+            TensorType::IQ2XS => &self.gemv_iq2_xs,
+            TensorType::Q3K => &self.gemv_q3_k,
+            TensorType::IQ3S => &self.gemv_iq3_s,
+            TensorType::IQ2S => &self.gemv_iq2_s,
             _ => unreachable!("block_len admits only types with kernels"),
         };
         (kernel, ROWS_PER_GROUP)
