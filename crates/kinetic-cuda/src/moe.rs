@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use kinetic_quant::grids::MXFP4_VALUES;
+use kinetic_quant::grids::{IQ1S_GRID, IQ2S_GRID, MXFP4_VALUES};
 use kinetic_quant::iq::{IQ2XS_GRID, IQ2XXS_GRID, IQ3XXS_GRID, IQ4NL_VALUES};
 use kinetic_quant::TensorType;
 
@@ -12,7 +12,7 @@ use crate::module::LaunchConfig;
 use crate::stream::Stream;
 
 /// Weight types the expert kernels read, in the order of their kernels.
-pub const EXPERT_TYPES: [TensorType; 12] = [
+pub const EXPERT_TYPES: [TensorType; 15] = [
     TensorType::IQ2XXS,
     TensorType::IQ2XS,
     TensorType::IQ3XXS,
@@ -25,12 +25,15 @@ pub const EXPERT_TYPES: [TensorType; 12] = [
     TensorType::IQ4NL,
     TensorType::NVFP4,
     TensorType::Q8_0,
+    TensorType::IQ2S,
+    TensorType::IQ1S,
+    TensorType::Q2_0,
 ];
 
 /// Kernel names, by index into [`EXPERT_TYPES`].
 pub(crate) const MOE_NAMES: [&str; EXPERT_TYPES.len()] = [
     "iq2_xxs", "iq2_xs", "iq3_xxs", "iq4_xs", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq4_nl",
-    "nvfp4", "q8_0",
+    "nvfp4", "q8_0", "iq2_s", "iq1_s", "q2_0",
 ];
 
 /// Values per quantization block of the inputs of experts of type `ty`:
@@ -38,7 +41,12 @@ pub(crate) const MOE_NAMES: [&str; EXPERT_TYPES.len()] = [
 /// are quantized as GEMV inputs are (see [`Kernels::quantize_q8`]).
 pub fn expert_block(ty: TensorType) -> usize {
     match ty {
-        TensorType::IQ4NL | TensorType::NVFP4 | TensorType::Q8_0 => 32,
+        TensorType::IQ4NL
+        | TensorType::NVFP4
+        | TensorType::Q8_0
+        | TensorType::IQ2S
+        | TensorType::IQ1S
+        | TensorType::Q2_0 => 32,
         _ => Q8K_BLOCK,
     }
 }
@@ -68,6 +76,8 @@ impl ExpertTables {
         bytes.extend(IQ3XXS_GRID.as_flattened());
         bytes.extend(IQ4NL_VALUES.map(|v| v as u8));
         bytes.extend(MXFP4_VALUES.map(|v| v as u8));
+        bytes.extend(IQ2S_GRID.as_flattened());
+        bytes.extend(IQ1S_GRID.as_flattened().iter().map(|&v| v as u8));
         Ok(ExpertTables(DeviceBuffer::from_slice(ctx, &bytes)?))
     }
 }

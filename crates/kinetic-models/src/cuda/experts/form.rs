@@ -86,8 +86,10 @@ mod tests {
     #[test]
     fn every_published_expert_type_has_a_device_form() {
         use TensorType::*;
-        let kernel = [IQ4NL, NVFP4, Q8_0, Q5K, Q3K, IQ3XXS, IQ2XXS, IQ2XS];
-        let expanded = [IQ2S, IQ3S, IQ1S, MXFP4, Q2_0];
+        let kernel = [
+            IQ4NL, NVFP4, Q8_0, Q5K, Q3K, IQ3XXS, IQ2XXS, IQ2XS, IQ2S, IQ1S, Q2_0,
+        ];
+        let expanded = [IQ3S, MXFP4, Q5_0, BF16];
         for ty in kernel {
             assert_eq!(device_type(ty), ty, "{ty}");
         }

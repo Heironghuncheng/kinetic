@@ -27,6 +27,8 @@ constexpr unsigned IQ2XS_OFFSET = 2048;
 constexpr unsigned IQ3XXS_OFFSET = 6144;
 constexpr unsigned IQ4NL_OFFSET = 7168;
 constexpr unsigned MXFP4_OFFSET = 7184;
+constexpr unsigned IQ2S_OFFSET = 7200;
+constexpr unsigned IQ1S_OFFSET = IQ2S_OFFSET + 1024 * 8;
 
 // x quantized per 256 values: d = max|x| / 127, q = round(x / d) half away
 // from zero. One warp per block, eight values per lane.
@@ -493,6 +495,67 @@ struct Q8Zero {
     }
 };
 
+// IQ2_S: per 256 values an f16 d, 32 low index bytes, 32 sign bytes, 8
+// bytes of high index bits and 8 of 4-bit scales; each 8 values are a grid
+// row with signs, each 16 share the scale d (0.5 + s) / 4.
+struct Iq2S {
+    static constexpr unsigned GROUP = 16, BLOCK = 256, BYTES = 82;
+    static __device__ __forceinline__ float lane(const uint8_t* row, unsigned v, const uint8_t* tables, int w[2]) {
+        const uint8_t* b = row + v / BLOCK * BYTES;
+        const unsigned k = v % BLOCK / 8;
+        const unsigned index = b[2 + k] | (b[66 + k / 4] >> (2 * (k % 4)) & 3) << 8;
+        const uint2 g = reinterpret_cast<const uint2*>(tables + IQ2S_OFFSET)[index];
+        const unsigned signs = b[34 + k];
+        w[0] = signed4(g.x, signs);
+        w[1] = signed4(g.y, signs >> 4);
+        const unsigned s = b[74 + k / 4] >> (4 * (k % 4 / 2)) & 0xf;
+        return __fmul_rn(__fmul_rn(half_at(b), 0.5f + static_cast<float>(s)), 0.25f);
+    }
+};
+
+// IQ1_S: per 256 values an f16 d, 32 low index bytes and per 32 values a
+// u16 of high index bits, a 3-bit scale and the sign of a delta of 1/8.
+// Each value is (d (2 s + 1) / 8) (8 g +- 1) for its grid entry g in -1..1.
+struct Iq1S {
+    static constexpr unsigned GROUP = 32, BLOCK = 256, BYTES = 50;
+    static __device__ __forceinline__ float lane(const uint8_t* row, unsigned v, const uint8_t* tables, int w[2]) {
+        const uint8_t* b = row + v / BLOCK * BYTES;
+        const unsigned sub = v % BLOCK / 32, l = v % 32 / 8;
+        const unsigned qh = b[34 + 2 * sub] | b[35 + 2 * sub] << 8;
+        const unsigned index = b[2 + 4 * sub + l] | (qh >> (3 * l) & 7) << 8;
+        const int8_t* g = reinterpret_cast<const int8_t*>(tables + IQ1S_OFFSET) + 8 * index;
+        const int delta = qh & 0x8000 ? -1 : 1;
+#pragma unroll
+        for (unsigned h = 0; h < 2; ++h) {
+            unsigned packed = 0;
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j)
+                packed |= static_cast<unsigned>(static_cast<uint8_t>(8 * g[4 * h + j] + delta)) << (8 * j);
+            w[h] = static_cast<int>(packed);
+        }
+        const float scale = static_cast<float>(2 * (qh >> 12 & 7) + 1);
+        return __fmul_rn(__fmul_rn(half_at(b), scale), 0.125f);
+    }
+};
+
+// Q2_0: per 64 values an f16 d and 2-bit codes c, each value (c - 1) d.
+struct Q2Zero {
+    static constexpr unsigned GROUP = 32, BLOCK = 64, BYTES = 18;
+    static __device__ __forceinline__ float lane(const uint8_t* row, unsigned v, const uint8_t*, int w[2]) {
+        const uint8_t* b = row + v / BLOCK * BYTES;
+        const uint8_t* q = b + 2 + v % BLOCK / 4;
+#pragma unroll
+        for (unsigned h = 0; h < 2; ++h) {
+            unsigned packed = 0;
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j)
+                packed |= static_cast<unsigned>(static_cast<uint8_t>(static_cast<int>(q[h] >> (2 * j) & 3) - 1)) << (8 * j);
+            w[h] = static_cast<int>(packed);
+        }
+        return half_at(b);
+    }
+};
+
 // `moe_rows` for those types: the lanes of a group give its exact integer
 // sum, and the groups of a row are added in order, each times its scale
 // and its input block's.
@@ -574,6 +637,9 @@ MOE_KERNELS(q6_k, Q6K, moe_rows)
 MOE_KERNELS(iq4_nl, Iq4Nl, moe_rows_grouped)
 MOE_KERNELS(nvfp4, Nvfp4, moe_rows_grouped)
 MOE_KERNELS(q8_0, Q8Zero, moe_rows_grouped)
+MOE_KERNELS(iq2_s, Iq2S, moe_rows_grouped)
+MOE_KERNELS(iq1_s, Iq1S, moe_rows_grouped)
+MOE_KERNELS(q2_0, Q2Zero, moe_rows_grouped)
 
 // Routing on the device, for layers whose experts all have a slot.
 

@@ -8,7 +8,7 @@
 use half::f16;
 use kinetic_cpu::{pool, Q8K};
 use kinetic_cuda::{expert_block, Q8K_BLOCK};
-use kinetic_quant::grids::{ue4m3_half, MXFP4_VALUES};
+use kinetic_quant::grids::{ue4m3_half, IQ1S_GRID, IQ2S_GRID, MXFP4_VALUES};
 use kinetic_quant::iq::IQ4NL_VALUES;
 use kinetic_quant::TensorType;
 
@@ -72,6 +72,59 @@ fn grouped_dot(ty: TensorType, row: &[u8], qs: &[i8], ds: &[f32]) -> f32 {
             for (b, (w, x)) in row.chunks_exact(34).zip(qs.chunks_exact(32)).enumerate() {
                 let sum = (0..32).map(|j| w[2 + j] as i8 as i32 * x[j] as i32).sum();
                 add(half(w), b, sum);
+            }
+        }
+        TensorType::IQ2S => {
+            for (b, (w, x)) in row.chunks_exact(82).zip(qs.chunks_exact(256)).enumerate() {
+                for g in 0..16 {
+                    let sum = (2 * g..2 * g + 2)
+                        .map(|k| {
+                            let index = w[2 + k] as usize
+                                | (w[66 + k / 4] as usize >> (2 * (k % 4)) & 3) << 8;
+                            let grid = &IQ2S_GRID[index];
+                            (0..8)
+                                .map(|j| {
+                                    let v = grid[j] as i32;
+                                    let v = if w[34 + k] >> j & 1 == 1 { -v } else { v };
+                                    v * x[8 * k + j] as i32
+                                })
+                                .sum::<i32>()
+                        })
+                        .sum();
+                    let s = w[74 + g / 2] >> (4 * (g % 2)) & 0xf;
+                    add(half(w) * (0.5 + s as f32) * 0.25, 8 * b + g / 2, sum);
+                }
+            }
+        }
+        TensorType::IQ1S => {
+            for (b, (w, x)) in row.chunks_exact(50).zip(qs.chunks_exact(256)).enumerate() {
+                for sub in 0..8 {
+                    let qh = u16::from_le_bytes([w[34 + 2 * sub], w[35 + 2 * sub]]) as usize;
+                    let delta = if qh & 0x8000 != 0 { -1 } else { 1 };
+                    let sum = (0..4)
+                        .map(|l| {
+                            let index = w[2 + 4 * sub + l] as usize | (qh >> (3 * l) & 7) << 8;
+                            (0..8)
+                                .map(|j| {
+                                    (8 * IQ1S_GRID[index][j] as i32 + delta)
+                                        * x[32 * sub + 8 * l + j] as i32
+                                })
+                                .sum::<i32>()
+                        })
+                        .sum();
+                    let scale = (2 * (qh >> 12 & 7) + 1) as f32;
+                    add(half(w) * scale * 0.125, 8 * b + sub, sum);
+                }
+            }
+        }
+        TensorType::Q2_0 => {
+            for (b, (w, x)) in row.chunks_exact(18).zip(qs.chunks_exact(64)).enumerate() {
+                for h in 0..2 {
+                    let sum = (32 * h..32 * h + 32)
+                        .map(|j| ((w[2 + j / 4] >> (2 * (j % 4)) & 3) as i32 - 1) * x[j] as i32)
+                        .sum();
+                    add(half(w), 2 * b + h, sum);
+                }
             }
         }
         _ => unreachable!("{ty} is not a grouped expert type"),
