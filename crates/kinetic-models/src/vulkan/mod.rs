@@ -31,16 +31,18 @@ mod short_conv;
 mod target;
 mod work;
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 
-use kinetic_quant::{dequantize_row, Matrix};
+use kinetic_quant::{dequantize_row, Matrix, TensorType};
 use kinetic_vulkan::{
     Batch, Commands, Device, DeviceBuffer, DeviceMatrix, Graph, HostBuffer, Instance, Kernels, Out,
     PhysicalDevice, Rows,
 };
 
 use crate::model::{embed_into, Mark};
+use crate::offload::forms::{expanded, on_vulkan, Form, HostWeights};
 use crate::{Forward, LoadError, Model};
 use layer::{LayerState, VulkanLayer};
 use mtp::VulkanMtp;
@@ -70,11 +72,21 @@ const PROMPT_SHORT: usize = 64;
 struct Gpu {
     device: Rc<Device>,
     kernels: Kernels,
+    /// Matrices of types without kernels, uploaded expanded.
+    expanded: RefCell<HostWeights>,
 }
 
 impl Gpu {
     fn matrix(&self, m: &Matrix) -> Result<DeviceMatrix, LoadError> {
-        DeviceMatrix::upload(&self.device, m).map_err(vulkan_error)
+        if on_vulkan(m.ty) == Form::Kernel {
+            return DeviceMatrix::upload(&self.device, m).map_err(vulkan_error);
+        }
+        let f32s = expanded(m);
+        self.expanded
+            .borrow_mut()
+            .add(m.ty, m.data.len(), f32s.len());
+        let wide = Matrix::new(TensorType::F32, &f32s, m.rows, m.cols);
+        DeviceMatrix::upload(&self.device, &wide).map_err(vulkan_error)
     }
 
     fn vector(&self, v: &[f32]) -> Result<DeviceBuffer<f32>, LoadError> {
@@ -255,6 +267,7 @@ impl<'m> VulkanModel<'m> {
         let gpu = Gpu {
             kernels: Kernels::load_with(&device, matrix).map_err(vulkan_error)?,
             device,
+            expanded: RefCell::default(),
         };
         let prompt_batch = gpu.kernels.prompt_batch().max(MAX_BATCH);
         let mut ropes = RopeTables::new(prompt_batch);

@@ -64,6 +64,9 @@ impl<'a> VulkanBackend<'a> {
     /// lack.
     pub fn new(model: &'a Model<'a>, context: usize, matrix: bool) -> Result<Self, LoadError> {
         let mut gpu = VulkanModel::load(model, context, matrix)?;
+        if let Some(line) = gpu.host_weights() {
+            eprintln!("kinetic: {line}");
+        }
         // the drafter's cache shares the memory, so a full device fails here
         // and not on the first request
         let states = |gpu: &VulkanModel| -> kinetic_vulkan::Result<VulkanState> {

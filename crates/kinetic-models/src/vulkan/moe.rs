@@ -26,6 +26,9 @@ pub(super) struct VulkanMoe {
 
 /// Expert matrices of equal shape one after another, `count` of each.
 pub(super) struct ExpertWeights {
+    /// Per expert, multipliers of the gate and up products and of the
+    /// down product, if the file has them.
+    pub scales: [Option<DeviceBuffer<f32>>; 2],
     /// The gate and up products and where each writes in a row of both: two
     /// matrices, or one whose experts hold their gate rows and then their up
     /// rows.
@@ -36,6 +39,7 @@ pub(super) struct ExpertWeights {
 
 /// [`ExpertWeights`] wherever they are held.
 pub(super) struct ExpertView<'a> {
+    pub scales: [Option<&'a DeviceBuffer<f32>>; 2],
     pub gate_up: Vec<(&'a DeviceMatrix, usize)>,
     pub down: &'a DeviceMatrix,
     pub count: usize,
@@ -44,6 +48,7 @@ pub(super) struct ExpertView<'a> {
 impl ExpertWeights {
     fn view(&self) -> ExpertView<'_> {
         ExpertView {
+            scales: [self.scales[0].as_ref(), self.scales[1].as_ref()],
             gate_up: self.gate_up.iter().map(|(m, at)| (m, *at)).collect(),
             down: &self.down,
             count: self.count,
@@ -85,9 +90,10 @@ impl VulkanMoe {
     /// Uploads the routing of `m`, and its experts if `resident`.
     pub fn upload(gpu: &Gpu, m: &Moe, resident: bool) -> Result<Self, LoadError> {
         let n = m.n_experts();
-        if m.scales.iter().any(Option::is_some) {
+        if m.scales[0] != m.scales[1] {
             return Err(LoadError(
-                "per-expert weight scales do not run on Vulkan yet".into(),
+                "experts whose gate and up products have different scales do not run on Vulkan yet"
+                    .into(),
             ));
         }
         let (gating, bias) = match &m.gating {
@@ -130,7 +136,9 @@ impl VulkanMoe {
             .iter()
             .map(|(e, at)| Ok((gpu.matrix(&stacked(e, n)?)?, *at)))
             .collect::<Result<_, LoadError>>()?;
+        let scale = |s: &Option<Vec<f32>>| s.as_deref().map(|s| gpu.vector(s)).transpose();
         self.weights = Some(ExpertWeights {
+            scales: [scale(&m.scales[0])?, scale(&m.scales[2])?],
             gate_up,
             down: gpu.matrix(&stacked(&down, n)?)?,
             count: n,
@@ -224,8 +232,9 @@ impl VulkanMoe {
                     stride: 2 * n_ff,
                     offset,
                 };
+                let s = weights.scales[0];
                 k.gemv_experts(
-                    m, count, used, &e.picks, &w.h, used, &e.gu, out, &w.batch, c,
+                    m, count, used, &e.picks, &w.h, used, s, &e.gu, out, &w.batch, c,
                 )?;
             }
             Ok(())
@@ -243,6 +252,7 @@ impl VulkanMoe {
             &e.picks,
             act,
             1,
+            weights.scales[1],
             &e.routed,
             out,
             &w.batch,
