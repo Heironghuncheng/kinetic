@@ -75,9 +75,17 @@ fn random_matrix(ty: TensorType, rows: usize, cols: usize, rng: &mut Lcg) -> Vec
                 TensorType::Q4K | TensorType::Q5K => &[0, 2],
                 TensorType::Q6K => &[208],
                 TensorType::Q8_0 | TensorType::IQ4NL => &[0],
+                TensorType::NVFP4 => &[],
                 _ => unreachable!(),
             };
             let mut data: Vec<u8> = (0..blocks * size).map(|_| rng.next() as u8).collect();
+            if ty == TensorType::NVFP4 {
+                // E4M3 scales between 2^-4 and 2^-2
+                for blk in data.chunks_exact_mut(size) {
+                    blk[..4].iter_mut().for_each(|s| *s = 0x18 + (rng.next() % 16) as u8);
+                }
+                return data;
+            }
             for blk in data.chunks_exact_mut(size) {
                 for &o in scale_offsets {
                     let v = f16::from_f32(0.001 + rng.f32().abs() * 0.01);
@@ -256,6 +264,11 @@ fn q8_0_matches_reference() {
 }
 
 #[test]
+fn nvfp4_matches_reference() {
+    check(TensorType::NVFP4, 37, 21 * 64);
+}
+
+#[test]
 fn iq4_nl_matches_reference() {
     check(TensorType::IQ4NL, 37, 41 * 32);
 }
@@ -354,6 +367,7 @@ fn experts_match_reference() {
     check_experts(TensorType::Q6K, 37, 5 * 256);
     check_experts(TensorType::Q8_0, 37, 41 * 32);
     check_experts(TensorType::IQ4NL, 37, 41 * 32);
+    check_experts(TensorType::NVFP4, 37, 21 * 64);
     check_experts(TensorType::F16, 37, 41 * 32);
     check_experts(TensorType::F32, 37, 41 * 32);
 }

@@ -1,6 +1,7 @@
 //! Device layout of weight matrices.
 //!
-//! Q6_K (210-byte), Q8_0 (34-byte) and IQ4_NL (18-byte) blocks are not 16-byte aligned, so
+//! Q6_K (210-byte), Q8_0 (34-byte), IQ4_NL (18-byte) and NVFP4 (36-byte)
+//! blocks are not 16-byte aligned, so
 //! kernels could not read them as 16-byte words. On the device their
 //! fields are stored planar instead: each field of every block in turn, so
 //! every plane starts aligned. The byte count does not change.
@@ -13,6 +14,7 @@ use kinetic_quant::{Matrix, TensorType};
 const Q6_K_FIELDS: &[(usize, usize)] = &[(0, 128), (128, 64), (192, 16), (208, 2)];
 const Q8_0_FIELDS: &[(usize, usize)] = &[(2, 32), (0, 2)];
 const IQ4_NL_FIELDS: &[(usize, usize)] = &[(2, 16), (0, 2)];
+const NVFP4_FIELDS: &[(usize, usize)] = &[(4, 32), (0, 4)];
 
 /// (offset, length) of each field of a block of `ty` in plane order, for
 /// the types stored planar.
@@ -21,6 +23,7 @@ pub(crate) fn planes(ty: TensorType) -> Option<&'static [(usize, usize)]> {
         TensorType::Q6K => Some(Q6_K_FIELDS),
         TensorType::Q8_0 => Some(Q8_0_FIELDS),
         TensorType::IQ4NL => Some(IQ4_NL_FIELDS),
+        TensorType::NVFP4 => Some(NVFP4_FIELDS),
         _ => None,
     }
 }
