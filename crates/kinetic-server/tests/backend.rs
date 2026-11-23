@@ -10,7 +10,7 @@
 
 use kinetic_gguf::GgufFile;
 use kinetic_models::warm::{self, Warm};
-use kinetic_server::{Backend, CpuBackend, Job, Logprobs, Sampling};
+use kinetic_server::{Backend, CpuBackend, Job, Logprobs, Sampling, Timings, PREFILL_GRID};
 use kinetic_tokenizer::Tokenizer;
 
 fn generate(backend: &mut dyn Backend, prompt: &[u32], sampling: &Sampling) -> Vec<u32> {
@@ -194,6 +194,70 @@ fn warm_starts_change_no_token() {
     let expected = generate(&mut cold, &prompts[1], sampling);
     assert_eq!(generate(&mut restarted, &prompts[1], sampling), expected);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Runs `prompt` greedily for a few tokens, with what the backend reports.
+fn generate_timed(backend: &mut dyn Backend, prompt: &[u32]) -> (Vec<u32>, Timings) {
+    let sampling = Sampling {
+        temperature: 0.0,
+        ..Sampling::default()
+    };
+    let job = Job {
+        sampling: &sampling,
+        max_tokens: 8,
+        stop_tokens: &[],
+        grammar: None,
+        images: &[],
+        logprobs: None,
+    };
+    let mut out = Vec::new();
+    let timings = backend.generate(prompt, &job, &mut |t| {
+        out.extend_from_slice(t);
+        true
+    });
+    (out, timings)
+}
+
+/// An agent loop on the CPU: a system prompt, then five requests that each
+/// add a short tool result to the one before, without its reply as it was
+/// generated, as when a template writes it back differently. Each runs only
+/// the tokens after where the one before started its last batch, from the
+/// cached sequence alone or, with another conversation in between, from
+/// the prompt cache, and answers exactly as a cold run does.
+#[test]
+#[ignore = "needs KINETIC_TEST_GGUF"]
+fn agent_loops_resume_where_the_last_request_ended() {
+    let (path, file, _) = model_file();
+    let model = kinetic_models::load(&file).unwrap();
+    let vocab = model.n_vocab() as u32;
+    let ids = |n: u32, seed: u32| -> Vec<u32> {
+        (0..n)
+            .map(|i| 100 + (i * 7919 + seed * 104_729) % (vocab / 2))
+            .collect()
+    };
+    let id = warm::model_id(&path).unwrap();
+    let mut alone = CpuBackend::new(&model);
+    let mut shared = CpuBackend::new(&model).with_warm(Warm::new(&model, id, 1 << 30));
+    let other = ids(100, 9);
+
+    // under 256 tokens throughout, where nothing used to be reused
+    let mut prompt = ids(144, 1);
+    let mut previous: Option<usize> = None;
+    for (i, n) in [21, 25, 20, 23, 22].into_iter().enumerate() {
+        prompt.extend(ids(n, i as u32 + 2));
+        let want = previous.map_or(0, |len| (len - 1) / PREFILL_GRID * PREFILL_GRID);
+        let cold = generate_timed(&mut CpuBackend::new(&model), &prompt).0;
+
+        let (tokens, timings) = generate_timed(&mut alone, &prompt);
+        assert_eq!(timings.cached_tokens, want, "cached sequence, request {i}");
+        assert_eq!(tokens, cold, "cached sequence, request {i}");
+
+        let (tokens, timings) = generate_timed(&mut shared, &prompt);
+        assert_eq!(timings.cached_tokens, want, "prompt cache, request {i}");
+        assert_eq!(tokens, cold, "prompt cache, request {i}");
+        generate_timed(&mut shared, &other);
+        previous = Some(prompt.len());
+    }
 }
 
 #[cfg(feature = "cuda")]

@@ -104,9 +104,12 @@ caching, as in vLLM and SGLang, and llama.cpp's prompt cache.
 Attention layers can be cut back to any length. Recurrent layers, such as
 the Gated DeltaNet layers of Qwen3.5, the short convolutions of LFM2 and
 LFM3 and the Mamba-2 layers of Granite 4.0 H and Falcon-H1, cannot be rewound;
-for those Kinetic records a snapshot every 256 tokens (or a larger multiple
-when a snapshot is large next to what it saves), and resumes from the last
-snapshot before the prompts part.
+for those Kinetic records a snapshot every 256 tokens (`--cache-spacing`, or
+a larger multiple when a snapshot is large next to what it saves) and near
+where each prompt ends, and resumes from the last snapshot before the
+prompts part. On the CPU a prompt resumes at any multiple of 32 tokens, so
+each request of an agent loop runs at most 31 tokens of the one before
+again.
 
 - States are kept in memory (up to 1 GiB) and in your cache directory (up
   to 2 GiB, least recently used out first), so they survive a restart.

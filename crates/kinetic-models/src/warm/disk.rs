@@ -65,11 +65,17 @@ impl Disk {
     }
 
     /// Writes `saved`, which `meta` describes and which takes `bytes` in
-    /// memory, in the background, then drops
-    /// the files it covers and trims the directory to its budget. The index
+    /// memory, in the background, then drops the files it covers on mark
+    /// grid `grid` and trims the directory to its budget. The index
     /// takes the file at once; one whose write failed is dropped when a
     /// read of it fails.
-    pub fn save(&mut self, meta: &Meta, saved: &Arc<Saved>, bytes: usize) -> io::Result<()> {
+    pub fn save(
+        &mut self,
+        meta: &Meta,
+        saved: &Arc<Saved>,
+        bytes: usize,
+        grid: Option<usize>,
+    ) -> io::Result<()> {
         self.wait();
         let mut key = Hasher::default();
         key.word(self.model_id);
@@ -81,7 +87,7 @@ impl Disk {
             .files
             .drain(..)
             .filter(|f| f.path != path)
-            .partition(|f| meta.covers(&f.meta));
+            .partition(|f| meta.covers(&f.meta, grid));
         self.files = kept;
         self.files.push(Indexed {
             path: path.clone(),
