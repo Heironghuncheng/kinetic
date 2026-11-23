@@ -136,6 +136,7 @@ fn rerun_runtime(
         gpus: Vec::new(),
         cache_dir: None,
         no_prompt_cache: true,
+        cache_spacing: 256,
         cache_type_k: cache("cache-type-k")?,
         cache_type_v: cache("cache-type-v")?,
         sign_key: None,

@@ -34,9 +34,11 @@ use disk::Disk;
 use hash::Hasher;
 
 /// Marks are taken at multiples of this many tokens, or of a larger
-/// multiple of it when a mark is expensive next to the cache it saves.
+/// multiple of it when a mark is expensive next to the cache it saves;
+/// see [`Warm::marks_every`].
 const GRID: usize = 256;
-const MAX_GRID: usize = 8192;
+/// The widest spacing of marks.
+pub const MAX_GRID: usize = 8192;
 
 /// What runs prompts for a [`Warm`] cache: the [`Model`] itself, or a copy
 /// of it on a device whose states have an exact host form.
@@ -262,6 +264,16 @@ impl<'m> Warm<'m> {
     /// `None` when its caches cut back anywhere.
     pub fn grid(&self) -> Option<usize> {
         self.grid
+    }
+
+    /// Takes marks every `tokens` tokens rather than every 256, or every
+    /// larger multiple of it when a mark is expensive next to the cache it
+    /// saves, rounded up to the alignment. Closer marks resume more prompts
+    /// and take more memory.
+    pub fn marks_every(mut self, tokens: usize) -> Self {
+        let base = tokens.clamp(1, MAX_GRID);
+        self.grid = grid(self.model, base).map(|g| g.next_multiple_of(self.align));
+        self
     }
 
     /// Runs `prompt` from the longest cached prefix it can resume exactly,
