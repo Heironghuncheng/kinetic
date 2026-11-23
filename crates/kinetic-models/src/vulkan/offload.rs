@@ -38,6 +38,11 @@ struct LayerSlots<'m> {
 }
 
 impl LayerSlots<'_> {
+    /// Bytes of one of this layer's experts.
+    fn bytes(&self) -> usize {
+        self.parts().map(|(s, _)| s.expert_bytes()).sum()
+    }
+
     fn view(&self) -> ExpertView<'_> {
         ExpertView {
             gate_up: self
@@ -74,9 +79,8 @@ pub struct Times {
 pub(super) struct VulkanOffload<'m> {
     /// Per physical layer, if it has routed experts.
     layers: Vec<Option<LayerSlots<'m>>>,
-    /// Experts of a layer, and bytes of one.
+    /// Experts of a layer.
     experts: usize,
-    slot_bytes: usize,
     cache: RefCell<ExpertCache>,
     stats: RefCell<Stats>,
     times: RefCell<Times>,
@@ -119,7 +123,9 @@ pub(super) fn place<'m>(
         }
         return Ok(None);
     }
-    let with = moes.iter().flatten().count();
+    // a slot in every layer, each the size of that layer's experts
+    let per_slot: usize = moes.iter().flatten().map(|m| expert_bytes(m)).sum();
+    // staging holds the largest experts
     let slot_bytes = moes
         .iter()
         .flatten()
@@ -132,7 +138,7 @@ pub(super) fn place<'m>(
         .map(|m| m.n_experts())
         .max()
         .unwrap_or(0);
-    let slots = (budget / (with * slot_bytes).max(1)).min(most);
+    let slots = (budget / per_slot.max(1)).min(most);
     let fewest = moes.iter().flatten().map(|m| m.n_used).max().unwrap_or(0);
     if slots < fewest {
         return Err(LoadError(format!(
@@ -167,7 +173,6 @@ pub(super) fn place<'m>(
         cache: RefCell::new(ExpertCache::new(&counts, (0..counts.len()).collect(), most)),
         layers: planned,
         experts: most,
-        slot_bytes,
         stats: RefCell::default(),
         times: RefCell::default(),
         staging: RefCell::new(HostBuffer::new(device, STAGED * slot_bytes).map_err(vulkan_error)?),
@@ -260,7 +265,7 @@ impl VulkanOffload<'_> {
                 &mut self.cache.borrow_mut(),
                 layer,
                 &experts,
-                self.slot_bytes as u64,
+                slots.bytes() as u64,
                 &mut self.stats.borrow_mut(),
             );
             for round in rounds {
