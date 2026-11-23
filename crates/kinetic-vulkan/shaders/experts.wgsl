@@ -4,8 +4,9 @@
 // The weights are `count` experts of `rows` rows each, one after another as
 // one matrix. A pass runs `batch[0] * used` jobs: job j multiplies expert
 // `picks[2j]` with input row `j / per_input` and writes output row j from
-// `j * stride + offset`. One subgroup of 32 takes a row of one job, as in
-// gemv.wgsl, and a job's sums run in the same order whatever else runs.
+// `j * stride + offset`; a job whose expert is not below `count` is skipped.
+// One subgroup of 32 takes a row of one job, as in gemv.wgsl, and a job's
+// sums run in the same order whatever else runs.
 
 struct Shape {
     rows: u32,
@@ -42,7 +43,11 @@ fn main(
     if row >= shape.rows || job >= batch[0] * shape.used {
         return;
     }
-    let expert = min(picks[2u * job], shape.count - 1u);
+    let expert = picks[2u * job];
+    // A workgroup takes one job, so all of it leaves together.
+    if expert >= shape.count {
+        return;
+    }
     let n = shape.blocks_per_row;
     let total = shape.count * shape.rows * n;
     let first = (expert * shape.rows + row) * n;

@@ -32,7 +32,7 @@ const Q8_BLOCK: usize = 32;
 const QUANTIZE_THREADS: usize = 64;
 
 /// Elements per kernel block for each type with a GEMV kernel.
-fn block_len(ty: TensorType) -> Option<usize> {
+pub(crate) fn block_len(ty: TensorType) -> Option<usize> {
     Some(match ty {
         TensorType::F32 => 4,
         TensorType::F16 => 8,
@@ -44,11 +44,11 @@ fn block_len(ty: TensorType) -> Option<usize> {
 
 /// A weight matrix in device memory, laid out for the GEMV kernels.
 pub struct DeviceMatrix {
-    ty: TensorType,
-    rows: usize,
-    cols: usize,
-    bytes: usize,
-    data: DeviceBuffer<u8>,
+    pub(crate) ty: TensorType,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) bytes: usize,
+    pub(crate) data: DeviceBuffer<u8>,
 }
 
 impl DeviceMatrix {
@@ -504,7 +504,8 @@ impl Kernels {
         // the picks at bindings 0..6, then the rows of an expert, blocks per
         // row, experts, picks per token, jobs per input row, output stride
         // and offset. Checked above: the picks, input rows and output rows of
-        // every job the batch can hold; experts past the last are clamped.
+        // every job the batch can hold; jobs of experts past the last are
+        // skipped.
         unsafe {
             commands.dispatch(
                 kernel,

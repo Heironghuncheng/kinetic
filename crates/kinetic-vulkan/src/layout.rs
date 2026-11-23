@@ -14,13 +14,21 @@ const Q6_K_FIELDS: &[(usize, usize)] = &[(0, 128), (128, 64), (192, 16), (208, 2
 const Q8_0_FIELDS: &[(usize, usize)] = &[(2, 32), (0, 2)];
 const IQ4_NL_FIELDS: &[(usize, usize)] = &[(2, 16), (0, 2)];
 
+/// (offset, length) of each field of a block of `ty` in plane order, for
+/// the types stored planar.
+pub(crate) fn planes(ty: TensorType) -> Option<&'static [(usize, usize)]> {
+    match ty {
+        TensorType::Q6K => Some(Q6_K_FIELDS),
+        TensorType::Q8_0 => Some(Q8_0_FIELDS),
+        TensorType::IQ4NL => Some(IQ4_NL_FIELDS),
+        _ => None,
+    }
+}
+
 /// The bytes of `m` as the GEMV kernels expect them.
 pub(crate) fn device_layout<'a>(m: &Matrix<'a>) -> Cow<'a, [u8]> {
-    let fields = match m.ty {
-        TensorType::Q6K => Q6_K_FIELDS,
-        TensorType::Q8_0 => Q8_0_FIELDS,
-        TensorType::IQ4NL => IQ4_NL_FIELDS,
-        _ => return Cow::Borrowed(m.data),
+    let Some(fields) = planes(m.ty) else {
+        return Cow::Borrowed(m.data);
     };
     Cow::Owned(planar(m.data, m.ty.block_bytes(), fields))
 }
