@@ -21,12 +21,12 @@ use kinetic_vulkan::{Commands, DeviceBuffer, ExpertSlots, Graph, HostBuffer};
 use super::layer::{VulkanLayer, R};
 use super::moe::{sources, ExpertView};
 use super::work::Work;
-use super::{vulkan_error, Gpu, VulkanModel};
+use super::{vulkan_error, Gpu, VulkanModel, VulkanState};
 use crate::blocks::{Experts, Job, Moe};
 use crate::offload::assign::assign;
 use crate::offload::cache::ExpertCache;
 use crate::offload::forms::{on_vulkan, Form};
-use crate::offload::plan::DEVICE_RESERVE;
+use crate::offload::plan;
 use crate::offload::stats::Stats;
 use crate::{LoadError, Model};
 
@@ -138,9 +138,15 @@ pub(super) fn place<'m>(
         .flatten()
         .map(|m| m.n_experts() * expert_bytes(m))
         .sum();
-    let used: usize = layers.iter().map(VulkanLayer::size_bytes).sum::<usize>() + elsewhere;
-    let free =
-        (gpu.device.info().device_local_bytes as usize).saturating_sub(used + DEVICE_RESERVE);
+    // what the driver says is free now, less what is still to come and
+    // what the plan leaves free
+    let card = gpu.device.info().device_local_bytes as usize;
+    let reserve = plan::reserve(card, None);
+    let held: usize = layers.iter().map(VulkanLayer::size_bytes).sum();
+    let measured = gpu.device.free_bytes().map(|f| f as usize);
+    let free = measured
+        .unwrap_or(card.saturating_sub(held))
+        .saturating_sub(elsewhere + reserve);
     let budget = cap.map_or(free, |c| c.min(free));
     if total <= budget && host.iter().all(Option::is_none) {
         for (layer, m) in layers.iter_mut().zip(&moes) {
@@ -165,38 +171,34 @@ pub(super) fn place<'m>(
         .map(|m| m.n_experts())
         .max()
         .unwrap_or(0);
-    let slots = (budget / per_slot.max(1)).min(most);
+    let mut slots = (budget / per_slot.max(1)).min(most);
     let fewest = moes.iter().flatten().map(|m| m.n_used).max().unwrap_or(0);
-    if slots < fewest {
-        return Err(LoadError(format!(
-            "the device has room for {slots} experts per layer and a token needs {fewest}"
-        )));
-    }
     let device = &gpu.device;
-    let mut planned = Vec::with_capacity(moes.len());
-    for m in &moes {
-        planned.push(match m {
-            Some(m) => {
-                let (gate_up, down) = sources(m);
-                let pool = |e: &Experts| ExpertSlots::new(device, e.ty, slots, e.rows, e.cols);
-                let table = |s: &Option<Vec<f32>>| -> Result<_, LoadError> {
-                    let Some(s) = s else { return Ok(None) };
-                    Ok(Some((gpu.vector(&vec![0.0; slots])?, s.clone())))
-                };
-                Some(LayerSlots {
-                    scales: [table(&m.scales[0])?, table(&m.scales[2])?],
-                    gate_up: gate_up
-                        .iter()
-                        .map(|(e, at)| Ok((pool(e)?, *at)))
-                        .collect::<kinetic_vulkan::Result<_>>()
-                        .map_err(vulkan_error)?,
-                    down: pool(&down).map_err(vulkan_error)?,
-                    sources: (gate_up, down),
-                })
-            }
-            None => None,
-        });
-    }
+    let allocate = |slots: usize| -> Result<Vec<Option<LayerSlots<'m>>>, LoadError> {
+        moes.iter()
+            .map(|m| layer_slots(gpu, m.as_ref(), slots))
+            .collect()
+    };
+    let planned = loop {
+        if slots < fewest {
+            return Err(LoadError(format!(
+                "the device has room for {slots} experts per layer and a token needs {fewest}"
+            )));
+        }
+        let planned = allocate(slots)?;
+        // others may have taken memory meanwhile: keep the reserve free
+        let left = gpu.device.free_bytes().map_or(usize::MAX, |f| f as usize);
+        let need = elsewhere + reserve;
+        if left >= need {
+            break planned;
+        }
+        drop(planned);
+        let short = (need - left).div_ceil(per_slot.max(1));
+        slots = match slots > fewest {
+            true => slots.saturating_sub(short).max(fewest),
+            false => 0,
+        };
+    };
     let counts: Vec<usize> = planned
         .iter()
         .map(|p| if p.is_some() { slots } else { 0 })
@@ -211,6 +213,37 @@ pub(super) fn place<'m>(
         staging: RefCell::new(HostBuffer::new(device, STAGED * slot_bytes).map_err(vulkan_error)?),
         scales: RefCell::new(HostBuffer::new(device, 2 * STAGED).map_err(vulkan_error)?),
     }))
+}
+
+/// The slots for the experts `m` of one layer, if it has experts the
+/// device runs.
+fn layer_slots<'m>(
+    gpu: &Gpu,
+    m: Option<&&Moe<'m>>,
+    slots: usize,
+) -> Result<Option<LayerSlots<'m>>, LoadError> {
+    let device = &gpu.device;
+    Ok(match m {
+        Some(m) => {
+            let (gate_up, down) = sources(m);
+            let pool = |e: &Experts| ExpertSlots::new(device, e.ty, slots, e.rows, e.cols);
+            let table = |s: &Option<Vec<f32>>| -> Result<_, LoadError> {
+                let Some(s) = s else { return Ok(None) };
+                Ok(Some((gpu.vector(&vec![0.0; slots])?, s.clone())))
+            };
+            Some(LayerSlots {
+                scales: [table(&m.scales[0])?, table(&m.scales[2])?],
+                gate_up: gate_up
+                    .iter()
+                    .map(|(e, at)| Ok((pool(e)?, *at)))
+                    .collect::<kinetic_vulkan::Result<_>>()
+                    .map_err(vulkan_error)?,
+                down: pool(&down).map_err(vulkan_error)?,
+                sources: (gate_up, down),
+            })
+        }
+        None => None,
+    })
 }
 
 /// A pass cut after each layer's routing: the command lists up to each
@@ -437,7 +470,8 @@ impl fmt::Display for ExpertReport {
         write!(
             f,
             "experts: {} of {} per layer on the device ({:.0} MiB), hit rate {:.1}%, {:.1} MiB \
-             copied per token, {} layers on the host; ms per token: {:.1} layers, {:.1} staging, \n             {:.1} copies, {:.1} experts, {:.1} host",
+             copied per token, {} layers on the host; ms per token: {:.1} layers, {:.1} staging, \
+             {:.1} copies, {:.1} experts, {:.1} host",
             self.slots,
             self.experts,
             self.bytes as f64 / (1 << 20) as f64,
@@ -510,6 +544,22 @@ impl VulkanModel<'_> {
         }
         (!parts.is_empty())
             .then(|| format!("no Vulkan kernels for some weights: {}", parts.join("; ")))
+    }
+
+    /// One line on the device memory this model takes with `state`, and
+    /// what the driver says is left free.
+    pub fn memory_line(&self, state: &VulkanState) -> String {
+        const MIB: usize = 1 << 20;
+        let slots = self.expert_report().map_or(0, |r| r.bytes);
+        let used = self.weight_bytes() + slots + self.state_bytes(state);
+        match self.gpu.device.free_bytes() {
+            Some(free) => format!(
+                "the model takes {} MiB of the GPU, {} MiB left free",
+                used / MIB,
+                free as usize / MIB
+            ),
+            None => format!("the model takes {} MiB of the GPU", used / MIB),
+        }
     }
 
     /// Starts the counts of [`VulkanModel::expert_report`] over.

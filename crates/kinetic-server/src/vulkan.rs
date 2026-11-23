@@ -82,6 +82,7 @@ impl<'a> VulkanBackend<'a> {
             }
             Err(e) => return Err(vulkan_error(e)),
         };
+        eprintln!("kinetic: {}", gpu.memory_line(&state));
         Ok(VulkanBackend {
             decoder: drafter::decoder(&gpu),
             cached: Some(Sequence {

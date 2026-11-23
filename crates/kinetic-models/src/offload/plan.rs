@@ -9,6 +9,19 @@ use super::cache::SlotLayout;
 /// Device memory kept free for the driver and for buffers made later.
 pub const DEVICE_RESERVE: usize = 384 << 20;
 
+/// The least device memory a plan leaves free at load. A desktop and the
+/// driver take a share that moves while a model runs, and a driver out of
+/// dedicated memory spills to system memory, where the model runs at a
+/// fraction of its speed with the GPU mostly idle, or fails.
+pub const FREE_FLOOR: usize = 600 << 20;
+
+/// The memory a plan leaves free on a device of `total` bytes: `asked`, or
+/// the larger of [`FREE_FLOOR`] and a tenth of the device.
+#[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+pub fn reserve(total: usize, asked: Option<usize>) -> usize {
+    asked.unwrap_or(FREE_FLOOR.max(total / 10))
+}
+
 /// The placement chosen at load time.
 #[derive(Clone, Debug)]
 pub struct Plan {
