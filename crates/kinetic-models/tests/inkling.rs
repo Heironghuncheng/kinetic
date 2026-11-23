@@ -12,11 +12,9 @@ use std::path::PathBuf;
 
 mod inkling_tiny;
 
-use kinetic_gguf::{GgufFile, Value};
+use kinetic_gguf::{GgufFile, TensorType, Value};
 
-use inkling_tiny::{keys, model, weights, write, Memory, LOOP, N_PHYS, REFERENCE};
-
-const D: u64 = REFERENCE.d;
+use inkling_tiny::{model, unrolled_of, Memory, LOOP, N_PHYS, REFERENCE};
 
 fn files() -> Vec<PathBuf> {
     let path =
@@ -82,39 +80,8 @@ fn runs_tokens_through_every_pass_of_every_file() {
     }
 }
 
-/// The tiny model as Unsloth lays it out: `inkling2` with every pass of the
-/// core in `block_count` and the per-layer arrays, its own loop keys, the
-/// controls named `attn`, `k`, `v` and `mlp`, and the message queries of
-/// all core layers in two tables. The renaming is what the bytes of
-/// Unsloth's files and of their copies in Mainline_Support show.
 fn unrolled_model() -> Memory {
-    let mut keys = keys(&REFERENCE, N_PHYS + LOOP.len());
-    keys.extend([
-        ("num_loops", Value::U32(2)),
-        ("loop.core_start", Value::U32(LOOP.start as u32)),
-        ("loop.core_end", Value::U32(LOOP.end as u32)),
-    ]);
-    let mut tensors = Vec::new();
-    let (mut res, mut kv) = (Vec::new(), Vec::new());
-    for (name, dims, values) in weights(&REFERENCE) {
-        if name.ends_with("loop_msg_query.weight") {
-            let q = |j: usize| &values[j * D as usize..][..D as usize];
-            res.extend([q(0), q(3)].concat());
-            kv.extend([q(1), q(2)].concat());
-            continue;
-        }
-        let renamed = ["q", "k", "v", "ffn"]
-            .into_iter()
-            .zip(["attn", "k", "v", "mlp"])
-            .fold(name, |n, (from, to)| {
-                n.replace(&format!("loop_{from}_ctrl_"), &format!("loop_{to}_"))
-            });
-        tensors.push((renamed, dims, values));
-    }
-    let rows = 2 * LOOP.len() as u64;
-    tensors.push(("loop_res_query.weight".into(), vec![D, rows], res));
-    tensors.push(("loop_kv_res_query.weight".into(), vec![D, rows], kv));
-    write("inkling2", keys, &tensors)
+    unrolled_of(&REFERENCE, TensorType::F32)
 }
 
 fn logits(model: &kinetic_models::Model, batches: &[usize]) -> Vec<f32> {

@@ -44,6 +44,15 @@ pub const REFERENCE: Size = Size {
     step: 0.07,
 };
 
+/// The smallest width whose rows are whole blocks of every weight type.
+pub const TYPED: Size = Size {
+    d: 256,
+    head_dim: 64,
+    n_ff: 256,
+    rank: 32,
+    step: 0.01,
+};
+
 /// The smallest size every device runs: widths of whole blocks of 32 and
 /// heads of 64.
 pub const DEVICE: Size = Size {
@@ -183,11 +192,10 @@ pub fn weights(s: &Size) -> Vec<(String, Vec<u64>, Vec<f32>)> {
         .collect()
 }
 
-pub fn write(
-    arch: &str,
-    keys: Vec<(&str, Value)>,
-    tensors: &[(String, Vec<u64>, Vec<f32>)],
-) -> Memory {
+/// One tensor of a file: its name, dimensions, type and bytes.
+pub type Tensor = (String, Vec<u64>, TensorType, Vec<u8>);
+
+pub fn write(arch: &str, keys: Vec<(&str, Value)>, tensors: &[Tensor]) -> Memory {
     let mut metadata = vec![(
         "general.architecture".to_string(),
         Value::String(arch.into()),
@@ -195,25 +203,141 @@ pub fn write(
     metadata.extend(keys.into_iter().map(|(k, v)| (format!("{arch}.{k}"), v)));
     let out: Vec<TensorOut> = tensors
         .iter()
-        .map(|(name, dims, _)| TensorOut {
+        .map(|(name, dims, ty, _)| TensorOut {
             name: name.clone(),
             dims: dims.clone(),
-            ty: TensorType::F32,
+            ty: *ty,
         })
         .collect();
     let mut bytes = Vec::new();
-    kinetic_gguf::write(&mut bytes, &metadata, &out, |k| {
-        Ok(tensors[k].2.iter().flat_map(|v| v.to_le_bytes()).collect())
-    })
-    .unwrap();
+    kinetic_gguf::write(&mut bytes, &metadata, &out, |k| Ok(tensors[k].3.clone())).unwrap();
     Memory {
         header: Gguf::parse(&bytes).unwrap(),
         bytes,
     }
 }
 
+/// The tensors that take the weight type under test: the experts, and the
+/// query, key and value projections.
+fn typed(name: &str) -> bool {
+    [
+        "_exps.weight",
+        "attn_q.weight",
+        "attn_k.weight",
+        "attn_v.weight",
+    ]
+    .iter()
+    .any(|s| name.ends_with(s))
+}
+
+/// Blocks of `ty` holding `n` values, random but for their scales, which
+/// give the values a root mean square near 0.01 whatever the type's grid;
+/// floats are drawn directly.
+pub fn random_blocks(ty: TensorType, n: usize, seed: u64) -> Vec<u8> {
+    let first = blocks(ty, n, seed, 1e-3);
+    if matches!(ty, TensorType::MXFP4 | TensorType::NVFP4) || ty.block_len() == 1 {
+        return first;
+    }
+    let mut values = vec![0.0; n];
+    kinetic_quant::dequantize(ty, &first, &mut values).unwrap();
+    let rms = (values.iter().map(|v| v * v).sum::<f32>() / n as f32).sqrt();
+    blocks(ty, n, seed, 1e-3 * 0.01 / rms)
+}
+
+/// [`random_blocks`] with f16 block scales near `d`.
+fn blocks(ty: TensorType, n: usize, seed: u64, d: f32) -> Vec<u8> {
+    let mut state = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    let mut small = || (next() as f32 / u32::MAX as f32 - 0.5) * 0.04;
+    match ty {
+        TensorType::F32 => return (0..n).flat_map(|_| small().to_le_bytes()).collect(),
+        TensorType::F16 => {
+            return (0..n)
+                .flat_map(|_| half::f16::from_f32(small()).to_le_bytes())
+                .collect()
+        }
+        TensorType::BF16 => {
+            return (0..n)
+                .flat_map(|_| half::bf16::from_f32(small()).to_le_bytes())
+                .collect()
+        }
+        _ => {}
+    }
+    let size = ty.block_bytes();
+    let mut data: Vec<u8> = (0..n / ty.block_len() * size)
+        .map(|_| next() as u8)
+        .collect();
+    for blk in data.chunks_exact_mut(size) {
+        let scale = half::f16::from_f32(d * (1.0 + (next() % 1000) as f32 * 1e-3));
+        match ty {
+            // the f16 scale in the top nibbles of the four scale words
+            TensorType::IQ1M => {
+                let bits = scale.to_bits();
+                for i in 0..4 {
+                    let at = 48 + 2 * i;
+                    let w = u16::from_le_bytes([blk[at], blk[at + 1]]) & 0x0FFF;
+                    let w = w | ((bits >> (4 * i)) & 0xF) << 12;
+                    blk[at..at + 2].copy_from_slice(&w.to_le_bytes());
+                }
+            }
+            // an E8M0 scale of 2^-9, halved
+            TensorType::MXFP4 => blk[0] = 119,
+            // E4M3 scales between 2^-8 and 2^-7
+            TensorType::NVFP4 => blk[..4]
+                .iter_mut()
+                .for_each(|b| *b = 0x08 + (next() % 8) as u8),
+            _ => {
+                let at: &[usize] = match ty {
+                    TensorType::Q4K | TensorType::Q5K => &[0, 2],
+                    TensorType::Q6K => &[208],
+                    TensorType::Q3K => &[108],
+                    _ => &[0],
+                };
+                for &o in at {
+                    blk[o..o + 2].copy_from_slice(&scale.to_le_bytes());
+                }
+            }
+        }
+    }
+    data
+}
+
+/// The tensors of a tiny model of size `s` with the typed ones in `ty`,
+/// the others in f32.
+pub fn tensors_of(s: &Size, ty: TensorType) -> Vec<Tensor> {
+    weights(s)
+        .into_iter()
+        .enumerate()
+        .map(
+            |(k, (name, dims, values))| match typed(&name) && ty != TensorType::F32 {
+                true => {
+                    let bytes = random_blocks(ty, values.len(), k as u64);
+                    (name, dims, ty, bytes)
+                }
+                false => {
+                    let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    (name, dims, TensorType::F32, bytes)
+                }
+            },
+        )
+        .collect()
+}
+
 /// A tiny looped model of size `s` in ggml-org's layout.
 pub fn model(s: &Size) -> Memory {
+    model_of(s, TensorType::F32)
+}
+
+/// [`model`] with the experts and the query, key and value projections in
+/// `ty`.
+pub fn model_of(s: &Size, ty: TensorType) -> Memory {
     let mut keys = keys(s, N_PHYS);
     keys.extend([
         ("loop.start", Value::U32(LOOP.start as u32)),
@@ -221,5 +345,42 @@ pub fn model(s: &Size) -> Memory {
         ("loop.count", Value::U32(2)),
         ("loop.varying", Value::Bool(false)),
     ]);
-    write("inkling2_loop", keys, &weights(s))
+    write("inkling2_loop", keys, &tensors_of(s, ty))
+}
+
+/// [`model_of`] as Unsloth lays it out: `inkling2` with every pass of the
+/// core in `block_count` and the per-layer arrays, its own loop keys, the
+/// controls named `attn`, `k`, `v` and `mlp`, and the message queries of
+/// all core layers in two tables. The renaming is what the bytes of
+/// Unsloth's files and of their copies in Mainline_Support show.
+pub fn unrolled_of(s: &Size, ty: TensorType) -> Memory {
+    let d = s.d as usize;
+    let mut keys = keys(s, N_PHYS + LOOP.len());
+    keys.extend([
+        ("num_loops", Value::U32(2)),
+        ("loop.core_start", Value::U32(LOOP.start as u32)),
+        ("loop.core_end", Value::U32(LOOP.end as u32)),
+    ]);
+    let mut tensors = Vec::new();
+    let (mut res, mut kv) = (Vec::new(), Vec::new());
+    for (name, dims, t, bytes) in tensors_of(s, ty) {
+        if name.ends_with("loop_msg_query.weight") {
+            let q = |j: usize| &bytes[4 * j * d..][..4 * d];
+            res.extend([q(0), q(3)].concat());
+            kv.extend([q(1), q(2)].concat());
+            continue;
+        }
+        let renamed = ["q", "k", "v", "ffn"]
+            .into_iter()
+            .zip(["attn", "k", "v", "mlp"])
+            .fold(name, |n, (from, to)| {
+                n.replace(&format!("loop_{from}_ctrl_"), &format!("loop_{to}_"))
+            });
+        tensors.push((renamed, dims, t, bytes));
+    }
+    let rows = 2 * LOOP.len() as u64;
+    let f32 = TensorType::F32;
+    tensors.push(("loop_res_query.weight".into(), vec![s.d, rows], f32, res));
+    tensors.push(("loop_kv_res_query.weight".into(), vec![s.d, rows], f32, kv));
+    write("inkling2", keys, &tensors)
 }
