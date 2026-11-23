@@ -1,9 +1,10 @@
 //! CPU kernels.
 //!
-//! [`matvec`] picks an integer SIMD kernel when the weight type has one, a
-//! SIMD kernel on f32 activations for f16 and bf16 weights, and otherwise
-//! falls back to dequantizing each row to f32, which is also the reference
-//! the fast kernels are tested against.
+//! Vector products of weight rows with activations go through [`matvec`].
+//! Each weight type with an integer SIMD kernel uses it; f16 and bf16 weights
+//! leave their activations in f32 for a SIMD kernel of their own; and
+//! other types fall back to dequantizing each row to f32, which is also the
+//! reference the fast kernels are tested against.
 
 mod fdot;
 mod kdot;
