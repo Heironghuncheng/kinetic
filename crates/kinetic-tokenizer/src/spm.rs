@@ -137,9 +137,14 @@ impl Spm {
             None => true,
         };
 
+        let mut specials = Specials::new(specials);
+        if gguf.architecture() == Some("phi3") {
+            // Phi-3 strips trailing ASCII whitespace after most specials.
+            specials.trim_after(|text| !matches!(text, "<unk>" | "<s>" | "<|endoftext|>"));
+        }
         Ok(Spm {
             pieces,
-            specials: Specials::new(specials),
+            specials,
             ids,
             scores,
             byte_ids,
