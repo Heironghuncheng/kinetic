@@ -147,6 +147,7 @@ impl PhysicalDevice {
             ),
             driver_name,
             driver_info,
+            driver_version: props.driver_version,
             device_local_bytes,
             max_buffer_bytes: props.limits.max_storage_buffer_range.into(),
             timestamp_period: f64::from(props.limits.timestamp_period) * 1e-9,

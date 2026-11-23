@@ -114,19 +114,22 @@ of many Ryzen APUs, only run subgroups of 64, which no driver changes, so
 models run on the CPU there and `kinetic doctor` says so.
 
 On GPUs with cooperative f16 matrices (`VK_KHR_cooperative_matrix`, such as
-AMD's RDNA3 cards), prompts run on the matrix units: Q8_0 and K-quant
-products of passes of up to 512 tokens take 16x16x16 f16 products into f32,
-about three times as fast as the decode kernels on long prompts. The status
-line says so, `(Vulkan, cooperative matrices)`. As on CUDA, a prompt's state
-then differs slightly from the same tokens decoded one at a time; where the
-prompt is cut changes no bit, and decoding and drafts give exactly what they
-give without it. So that a chat's next turn gives what it gives run cold,
-it runs the last reply again as prompt, from the prompt cache when that is
-on. Warm Start and receipts keep states made this way apart from the
-others, and `--off coopmat` runs prompts with the decode kernels. Prompt
-passes keep buffers for 512 tokens in every state; when those don't fit in
-the GPU's memory, Kinetic says so and runs prompts with the decode kernels
-instead.
+AMD's RDNA3 cards and NVIDIA's RTX cards), prompts run on the matrix units:
+Q8_0 and K-quant products of passes of up to 512 tokens take 16x16x16 f16
+products into f32, three to four times as fast as the decode kernels on
+long prompts. The status line says so, `(Vulkan, cooperative matrices)`. As
+on CUDA, a prompt's state then differs slightly from the same tokens decoded
+one at a time; where the prompt is cut changes no bit, and decoding and
+drafts give exactly what they give without it. So that a chat's next turn
+gives what it gives run cold, it runs the last reply again as prompt, from
+the prompt cache when that is on. With `--no-prompt-cache` there is nothing
+to resume from, so each turn runs the whole chat again and a long chat's
+turns grow slow; keep Warm Start on for chats, or turn the matrix units off.
+Warm Start keeps states made this way apart from the others and from other
+driver versions, receipts record them, and `--off coopmat` runs prompts with
+the decode kernels. Prompt passes keep buffers for 512 tokens in every
+state; when those don't fit in the GPU's memory, Kinetic says so and runs
+prompts with the decode kernels instead.
 
 ## Dense models larger than the GPU
 

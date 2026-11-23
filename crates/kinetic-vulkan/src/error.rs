@@ -46,6 +46,20 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Whether the device or the host ran out of memory.
+    pub fn out_of_memory(&self) -> bool {
+        match self {
+            #[cfg(not(metal_driver))]
+            Error::Vulkan { result, .. } => matches!(
+                *result,
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY
+            ),
+            _ => false,
+        }
+    }
+}
+
 /// Maps a failed call's result into an [`Error`] naming the call.
 #[cfg(not(metal_driver))]
 pub(crate) trait Check<T> {

@@ -432,7 +432,12 @@ fn q8_0_matrix_pass_matches_reference() {
 /// Inputs past f16's range are scaled into it, not turned to infinity.
 #[test]
 fn matrix_passes_take_inputs_past_f16() {
-    for ty in [TensorType::Q8_0, TensorType::Q4K, TensorType::Q6K] {
+    for ty in [
+        TensorType::Q8_0,
+        TensorType::Q4K,
+        TensorType::Q5K,
+        TensorType::Q6K,
+    ] {
         check_matrix_pass(ty, 64, 2 * 256, 64, 40, true);
     }
 }

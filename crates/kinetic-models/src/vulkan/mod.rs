@@ -103,6 +103,8 @@ pub fn devices() -> kinetic_vulkan::Result<Vec<PhysicalDevice>> {
 pub struct VulkanModel<'m> {
     gpu: Gpu,
     name: String,
+    /// The driver's name, version string and version number.
+    driver: String,
     /// Most tokens a state holds.
     context: usize,
     n_embd: usize,
@@ -240,6 +242,13 @@ impl<'m> VulkanModel<'m> {
             .transpose()?;
         Ok(VulkanModel {
             name: physical.info().name.clone(),
+            driver: {
+                let info = physical.info();
+                format!(
+                    "{} {} ({:#x})",
+                    info.driver_name, info.driver_info, info.driver_version
+                )
+            },
             context,
             n_embd: model.n_embd,
             eps: model.eps,
@@ -287,6 +296,11 @@ impl<'m> VulkanModel<'m> {
     /// The name of the device the model runs on.
     pub fn device_name(&self) -> &str {
         &self.name
+    }
+
+    /// The device's driver: its name, version string and version number.
+    pub fn driver(&self) -> &str {
+        &self.driver
     }
 
     pub fn n_vocab(&self) -> usize {

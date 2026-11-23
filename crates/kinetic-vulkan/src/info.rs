@@ -74,6 +74,8 @@ pub struct DeviceInfo {
     pub driver_name: String,
     /// The driver's own version string.
     pub driver_info: String,
+    /// The driver's version number, encoded as its vendor chooses.
+    pub driver_version: u32,
     /// Size of the largest device-local memory heap.
     pub device_local_bytes: u64,
     /// The largest storage buffer a kernel can bind.
@@ -133,6 +135,7 @@ mod tests {
             api_version,
             driver_name: String::new(),
             driver_info: String::new(),
+            driver_version: 0,
             device_local_bytes: 0,
             max_buffer_bytes: 0,
             timestamp_period: 1.0,

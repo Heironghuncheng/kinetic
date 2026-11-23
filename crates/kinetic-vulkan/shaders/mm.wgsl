@@ -54,8 +54,10 @@ var<workgroup> wa: array<f16, TILE * LD>;
 var<workgroup> xb: array<f16, TILE * LD>;
 // the finished tile, [token][row]
 var<workgroup> out: array<f32, TILE * TILE>;
-// the batch's first token and token count
-var<workgroup> span: vec2<u32>;
+// the batch's first token and token count. Every variable here is a
+// multiple of 16 bytes: NVIDIA packs them without padding, and the matrix
+// loads and stores need addresses aligned to 16
+var<workgroup> span: vec4<u32>;
 // each staging invocation's largest input, then each token's power of two
 var<workgroup> peak: array<f32, 2u * TILE>;
 var<workgroup> scale: array<f32, TILE>;
@@ -82,7 +84,7 @@ fn main(
             first = batch[2];
             tokens = batch[3];
         }
-        span = vec2<u32>(first, tokens);
+        span = vec4<u32>(first, tokens, 0u, 0u);
     }
     // the same for the whole workgroup, as the matrix products want to know
     let picked = workgroupUniformLoad(&span);

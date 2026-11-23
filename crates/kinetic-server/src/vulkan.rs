@@ -73,7 +73,7 @@ impl<'a> VulkanBackend<'a> {
         };
         let (state, matrix_dropped) = match states(&gpu) {
             Ok(state) => (state, false),
-            Err(_) if gpu.matrix() => {
+            Err(e) if e.out_of_memory() && gpu.matrix() => {
                 gpu.without_matrix();
                 (states(&gpu).map_err(vulkan_error)?, true)
             }
@@ -129,7 +129,12 @@ impl<'a> VulkanBackend<'a> {
     /// GPUs.
     pub fn class(&self) -> String {
         match self.gpu.matrix() {
-            true => format!("vulkan-coopmat {}", self.gpu.device_name()),
+            // a driver update can change how the matrix products sum
+            true => format!(
+                "vulkan-coopmat {} {}",
+                self.gpu.device_name(),
+                self.gpu.driver()
+            ),
             false => "vulkan".into(),
         }
     }
