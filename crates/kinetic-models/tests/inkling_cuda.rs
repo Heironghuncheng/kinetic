@@ -29,7 +29,6 @@ impl TensorSource for Memory {
     }
 }
 
-const D: u64 = 64;
 const N_PHYS: usize = 6;
 const LOOP: std::ops::Range<usize> = 2..4;
 const VOCAB: u64 = 64;
@@ -48,73 +47,87 @@ struct Tiny {
     experts: TensorType,
     used: u32,
     unrolled: bool,
+    /// Widths that weight types in blocks of 256 fit: a width of 256 and
+    /// four heads, rather than 64 and two.
+    wide: bool,
+}
+
+impl Tiny {
+    /// The width, query heads and expert width.
+    fn dims(&self) -> (u64, u64, u64) {
+        match self.wide {
+            true => (256, 4, 256),
+            false => (64, 2, 128),
+        }
+    }
 }
 
 /// The tensors of the model in the looped layout, with their types: every
 /// other layer windowed, blocks of two layers and a core of one block that
 /// runs three times. NVFP4 experts come with per-expert scales.
 fn tensors(c: &Tiny) -> Vec<(String, Vec<u64>, TensorType)> {
-    let (heads, hd, rel, taps, experts, ff, rank) = (2, 64, 2, 4, 4, 128, 32);
+    let (d, heads, ff) = c.dims();
+    let (hd, rel, taps, experts, rank) = (64, 2, 4, 4, 32);
     let (f32, q8, exps) = (TensorType::F32, c.dense, c.experts);
     let mut t: Vec<(String, Vec<u64>, TensorType)> = vec![
-        ("token_embd.weight".into(), vec![D, VOCAB], q8),
-        ("token_embd_norm.weight".into(), vec![D], f32),
-        ("output.weight".into(), vec![D, VOCAB], q8),
-        ("output_norm.weight".into(), vec![D], f32),
-        ("output_res_query.weight".into(), vec![D], f32),
+        ("token_embd.weight".into(), vec![d, VOCAB], q8),
+        ("token_embd_norm.weight".into(), vec![d], f32),
+        ("output.weight".into(), vec![d, VOCAB], q8),
+        ("output_norm.weight".into(), vec![d], f32),
+        ("output_res_query.weight".into(), vec![d], f32),
     ];
     for i in 0..N_PHYS {
         let windowed = i % 2 == 0;
         let mut add =
             |name: &str, dims: Vec<u64>, ty| t.push((format!("blk.{i}.{name}"), dims, ty));
-        add("attn_q.weight", vec![D, heads * hd], q8);
-        add("attn_k.weight", vec![D, hd], q8);
-        add("attn_v.weight", vec![D, hd], q8);
-        add("attn_output.weight", vec![heads * hd, D], q8);
-        add("attn_gate.weight", vec![D, heads * hd], q8);
-        add("attn_sink_proj.weight", vec![D, heads], q8);
+        add("attn_q.weight", vec![d, heads * hd], q8);
+        add("attn_k.weight", vec![d, hd], q8);
+        add("attn_v.weight", vec![d, hd], q8);
+        add("attn_output.weight", vec![heads * hd, d], q8);
+        add("attn_gate.weight", vec![d, heads * hd], q8);
+        add("attn_sink_proj.weight", vec![d, heads], q8);
         add("attn_q_clip.weight", vec![hd, heads], f32);
-        add("attn_rel.weight", vec![D, rel * heads], q8);
+        add("attn_rel.weight", vec![d, rel * heads], q8);
         let extent = if windowed { WINDOW as u64 } else { 6 };
         add("attn_rel_bias.weight", vec![rel, extent], f32);
         add("attn_rel_clip.weight", vec![rel, heads], f32);
         add("attn_k_conv.weight", vec![taps, hd], f32);
         add("attn_v_conv.weight", vec![taps, hd], f32);
-        add("attn_post_conv.weight", vec![taps, D], f32);
-        add("ffn_post_conv.weight", vec![taps, D], f32);
+        add("attn_post_conv.weight", vec![taps, d], f32);
+        add("ffn_post_conv.weight", vec![taps, d], f32);
         if windowed {
-            add("attn_norm.weight", vec![D], f32);
+            add("attn_norm.weight", vec![d], f32);
         } else {
-            add("attn_q_inp_norm.weight", vec![D], f32);
-            add("attn_k_inp_norm.weight", vec![D], f32);
-            add("attn_v_inp_norm.weight", vec![D], f32);
-            add("attn_k_conv_proj.weight", vec![D, taps], q8);
-            add("attn_v_conv_proj.weight", vec![D, taps], q8);
+            add("attn_q_inp_norm.weight", vec![d], f32);
+            add("attn_k_inp_norm.weight", vec![d], f32);
+            add("attn_v_inp_norm.weight", vec![d], f32);
+            add("attn_k_conv_proj.weight", vec![d, taps], q8);
+            add("attn_v_conv_proj.weight", vec![d, taps], q8);
         }
         if i > 0 {
-            let query = if windowed { vec![D] } else { vec![D, 3] };
+            let query = if windowed { vec![d] } else { vec![d, 3] };
             add("attn_res_query.weight", query, f32);
         }
-        add("ffn_res_query.weight", vec![D], f32);
-        add("ffn_norm.weight", vec![D], f32);
-        add("ffn_gate_inp.weight", vec![D, experts], f32);
+        add("ffn_res_query.weight", vec![d], f32);
+        add("ffn_norm.weight", vec![d], f32);
+        add("ffn_gate_inp.weight", vec![d, experts], f32);
         add("exp_probs_b.bias", vec![experts], f32);
-        add("ffn_gate_up_exps.weight", vec![D, 2 * ff, experts], exps);
-        add("ffn_down_exps.weight", vec![ff, D, experts], exps);
+        add("ffn_gate_up_exps.weight", vec![d, 2 * ff, experts], exps);
+        add("ffn_down_exps.weight", vec![ff, d, experts], exps);
         if exps == TensorType::NVFP4 {
             add("ffn_gate_up_exps.scale", vec![experts], f32);
             add("ffn_down_exps.scale", vec![experts], f32);
         }
         if LOOP.contains(&i) {
-            add("loop_msg_query.weight", vec![D, 4], f32);
+            add("loop_msg_query.weight", vec![d, 4], f32);
             for x in ["q", "k", "v", "ffn"] {
                 add(
                     &format!("loop_{x}_ctrl_down.weight"),
-                    vec![2 * D, rank],
+                    vec![2 * d, rank],
                     f32,
                 );
-                add(&format!("loop_{x}_ctrl_gain.weight"), vec![rank, D], f32);
-                add(&format!("loop_{x}_ctrl_forget.weight"), vec![rank, D], f32);
+                add(&format!("loop_{x}_ctrl_gain.weight"), vec![rank, d], f32);
+                add(&format!("loop_{x}_ctrl_forget.weight"), vec![rank, d], f32);
             }
         }
     }
@@ -153,7 +166,7 @@ fn data(k: usize, name: &str, n: usize, ty: TensorType) -> Vec<u8> {
                     .chain(codes(b, 32))
             })
             .collect(),
-        _ => {
+        TensorType::F32 => {
             let shift =
                 if name.contains("norm") || name.contains("_clip") || name.ends_with(".scale") {
                     1.0
@@ -166,6 +179,16 @@ fn data(k: usize, name: &str, n: usize, ty: TensorType) -> Vec<u8> {
                 .flat_map(|i| (step(i) as f32 * 0.07 * gain + shift).to_le_bytes())
                 .collect()
         }
+        TensorType::F16 | TensorType::BF16 => (0..n)
+            .flat_map(|i| {
+                let v = step(i) as f32 * 0.07;
+                match ty {
+                    TensorType::F16 => f16::from_f32(v).to_le_bytes(),
+                    _ => half::bf16::from_f32(v).to_le_bytes(),
+                }
+            })
+            .collect(),
+        _ => scaled(ty, n, k, if name.contains("_exps") { 0.06 } else { 0.3 }),
     }
 }
 
@@ -187,7 +210,7 @@ fn tensors_with_data(c: &Tiny) -> Vec<(String, Vec<u64>, TensorType, Vec<u8>)> {
     let (mut t, mut res, mut kv) = (Vec::new(), Vec::new(), Vec::new());
     for (name, dims, ty, data) in looped {
         if name.ends_with("loop_msg_query.weight") {
-            let q = |j: usize| &data[j * 4 * D as usize..][..4 * D as usize];
+            let q = |j: usize| &data[j * 4 * c.dims().0 as usize..][..4 * c.dims().0 as usize];
             res.extend([q(0), q(3)].concat());
             kv.extend([q(1), q(2)].concat());
             continue;
@@ -203,13 +226,13 @@ fn tensors_with_data(c: &Tiny) -> Vec<(String, Vec<u64>, TensorType, Vec<u8>)> {
     let rows = 2 * LOOP.len() as u64;
     t.push((
         "loop_res_query.weight".into(),
-        vec![D, rows],
+        vec![c.dims().0, rows],
         TensorType::F32,
         res,
     ));
     t.push((
         "loop_kv_res_query.weight".into(),
-        vec![D, rows],
+        vec![c.dims().0, rows],
         TensorType::F32,
         kv,
     ));
@@ -234,9 +257,12 @@ fn tiny_model(c: Tiny) -> Memory {
     let mut keys = vec![
         ("block_count", Value::U32(slots as u32)),
         ("context_length", Value::U32(128)),
-        ("embedding_length", Value::U32(D as u32)),
-        ("feed_forward_length", Value::U32(128)),
-        ("attention.head_count", per_layer(Value::U32(2))),
+        ("embedding_length", Value::U32(c.dims().0 as u32)),
+        ("feed_forward_length", Value::U32(c.dims().2 as u32)),
+        (
+            "attention.head_count",
+            per_layer(Value::U32(c.dims().1 as u32)),
+        ),
         ("attention.head_count_kv", per_layer(Value::U32(1))),
         ("attention.layer_norm_rms_epsilon", Value::F32(1e-6)),
         ("expert_count", Value::U32(4)),
@@ -245,7 +271,7 @@ fn tiny_model(c: Tiny) -> Memory {
         ("attention.value_length", Value::U32(64)),
         ("vocab_size", Value::U32(VOCAB as u32)),
         ("vocab_size_unpadded", Value::U32(60)),
-        ("expert_feed_forward_length", Value::U32(128)),
+        ("expert_feed_forward_length", Value::U32(c.dims().2 as u32)),
         ("rope.dimension_count", Value::U32(0)),
         ("attention.sliding_window", Value::U32(WINDOW)),
         // the core's layers alternate too, so each pass repeats the pattern
@@ -324,6 +350,7 @@ fn inkling_on_cuda_matches_the_cpu_and_changes_no_bit() {
                 experts,
                 used: 4,
                 unrolled,
+                wide: false,
             };
             let file = tiny_model(close);
             let model = kinetic_models::load(&file).unwrap();
@@ -608,4 +635,36 @@ fn truncating_to_a_mark_matches_stopping_there<'m>(
     gpu.run(&mut plain, &PROMPT[..8], false).unwrap();
     let want = gpu.run(&mut plain, &NEXT, true).unwrap().logits;
     assert_eq!(bits(&got), bits(&want));
+}
+
+/// Bytes of `n` weights of `ty`, a type this test writes no encoder for:
+/// code bytes that vary with `k`, and every block's scale set so that the
+/// weights' root mean square is `rms`.
+fn scaled(ty: TensorType, n: usize, k: usize, rms: f32) -> Vec<u8> {
+    let (len, size) = (ty.block_len(), ty.block_bytes());
+    let mut bytes: Vec<u8> = (0..n / len * size)
+        .map(|i| (i * (2 * k + 5) % 251) as u8)
+        .collect();
+    let set = |bytes: &mut [u8], s: f32| {
+        let half = f16::from_f32(s).to_le_bytes();
+        let at: &[usize] = match ty {
+            TensorType::Q2K => &[80, 82],
+            TensorType::Q3K => &[108],
+            TensorType::Q4K | TensorType::Q5K => &[0, 2],
+            TensorType::Q6K => &[208],
+            _ => &[0],
+        };
+        for b in bytes.chunks_exact_mut(size) {
+            match ty {
+                TensorType::MXFP4 => b[0] = (128.0 + s.log2().round()) as u8,
+                _ => at.iter().for_each(|&a| b[a..a + 2].copy_from_slice(&half)),
+            }
+        }
+    };
+    set(&mut bytes, 1.0);
+    let mut x = vec![0.0; n];
+    kinetic_quant::dequantize(ty, &bytes, &mut x).unwrap();
+    let r = (x.iter().map(|v| v * v).sum::<f32>() / n as f32).sqrt();
+    set(&mut bytes, rms / r);
+    bytes
 }

@@ -6,8 +6,19 @@ use std::fmt;
 
 use super::cache::SlotLayout;
 
-/// Device memory kept free for the driver and for buffers made later.
-pub const DEVICE_RESERVE: usize = 384 << 20;
+/// Device memory the planner leaves free on a device of `total` bytes:
+/// the larger of [`MIN_RESERVE`] and a tenth of the device. The desktop
+/// and other programs take and return memory while a model runs, and on
+/// Windows an allocation past the dedicated memory does not fail but lands
+/// in system memory, reached over PCIe, which makes every kernel that
+/// touches it many times slower. A margin that stays free keeps everything
+/// in dedicated memory.
+pub fn device_reserve(total: usize) -> usize {
+    MIN_RESERVE.max(total / 10)
+}
+
+/// The least [`device_reserve`] keeps free.
+pub const MIN_RESERVE: usize = 600 << 20;
 
 /// The placement chosen at load time.
 #[derive(Clone, Debug)]

@@ -336,6 +336,10 @@ struct RuntimeArgs {
     /// Most layers on the GPU; the rest run on the CPU [default: as many as fit]
     #[arg(long, value_name = "N")]
     gpu_layers: Option<usize>,
+    /// MiB of GPU memory to leave free for the desktop and other programs
+    /// [default: the larger of 600 MiB and a tenth of the GPU]
+    #[arg(long, value_name = "MIB")]
+    gpu_reserve: Option<usize>,
     /// CUDA GPUs to spread the model's layers over, in CUDA's order as
     /// `kinetic doctor` lists them, such as 0,1; the first also holds the
     /// embeddings and the output head [default: 0]
@@ -1044,6 +1048,7 @@ fn cuda_backend<'a>(
 ) -> Option<std::result::Result<Placed<'a>, kinetic_models::LoadError>> {
     let placement = kinetic_models::cuda::Placement {
         gpu_layers: runtime.gpu_layers,
+        device_reserve: runtime.gpu_reserve.map(|m| m << 20),
         devices: runtime.gpus.clone(),
         eager: runtime.is_off(Tech::Torque),
         cache_k: runtime.cache_type_k.into(),

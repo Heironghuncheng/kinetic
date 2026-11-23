@@ -38,9 +38,9 @@ use crate::offload::{cache, plan, stats};
 use crate::LoadError;
 
 pub(super) use offload::Offload;
+pub(super) use plan::device_reserve;
 pub use plan::Plan;
 pub use plan::PoolPlan;
-pub(super) use plan::DEVICE_RESERVE;
 pub use stats::Stats;
 pub(super) use work::{ExpertDims, ExpertWork};
 

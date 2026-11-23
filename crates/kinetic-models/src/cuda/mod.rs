@@ -115,6 +115,8 @@ struct Gpu {
     cache: [KvType; 2],
     /// The weights uploaded expanded, for the line said after loading.
     expanded: Expanded,
+    /// Device bytes the planner leaves free.
+    reserve: usize,
 }
 
 /// Layers that run on a further device, after those of the device before.
@@ -143,6 +145,7 @@ impl Gpu {
             copied: Event::new(&ctx)?,
             cache: [KvType::F16; 2],
             expanded: Expanded::default(),
+            reserve: 0,
             ctx,
         })
     }
@@ -333,6 +336,10 @@ impl<'m> CudaModel<'m> {
             let ctx = Context::new(Device::get(d).map_err(cuda_error)?).map_err(cuda_error)?;
             let mut gpu = Gpu::new(ctx).map_err(cuda_error)?;
             gpu.cache = [placement.cache_k, placement.cache_v];
+            let (_, total) = gpu.ctx.memory_info().map_err(cuda_error)?;
+            gpu.reserve = placement
+                .device_reserve
+                .unwrap_or_else(|| experts::device_reserve(total));
             Ok(gpu)
         };
         let gpu = device(placement.devices.first().copied().unwrap_or(0))?;
@@ -528,14 +535,33 @@ impl<'m> CudaModel<'m> {
         let state_bytes = state.work.size_bytes();
         drop(state);
         let (free, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
-        let budget = free.saturating_sub(state_bytes + experts::DEVICE_RESERVE);
-        Offload::new(
-            &self.gpu,
-            moes,
-            budget,
-            cache,
-            self.weight_bytes() + state_bytes,
-        )
+        let mut budget = free.saturating_sub(state_bytes + self.gpu.reserve);
+        loop {
+            let off = Offload::new(
+                &self.gpu,
+                moes.clone(),
+                budget,
+                cache,
+                self.weight_bytes() + state_bytes,
+            )?;
+            // the desktop may have taken memory meanwhile: check what is left
+            let (left, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
+            let short = (state_bytes + self.gpu.reserve).saturating_sub(left);
+            if short == 0 || budget == 0 {
+                eprintln!(
+                    "kinetic: the model takes {} MiB of the GPU with one sequence; {} MiB stay free",
+                    (self.weight_bytes() + state_bytes + free.saturating_sub(left)) >> 20,
+                    left.saturating_sub(state_bytes) >> 20
+                );
+                return Ok(off);
+            }
+            drop(off);
+            budget = budget.saturating_sub(short);
+            eprintln!(
+                "kinetic: the GPU has {} MiB less free than planned; the expert cache shrinks to fit",
+                short >> 20
+            );
+        }
     }
 
     fn expert_work(&self, moes: &[Moe]) -> kinetic_cuda::Result<ExpertWork> {
@@ -620,6 +646,14 @@ impl<'m> CudaModel<'m> {
         if let Some(off) = &self.offload {
             state.work.experts = Some(self.expert_work(&off.borrow().moes)?);
             state.work.pass = Some(PassRows::new(&self.gpu, self.n_embd)?);
+        }
+        // a state past the reserve would spill out of the GPU's own memory
+        let (free, _) = self.gpu.ctx.memory_info()?;
+        if free < self.gpu.reserve / 2 {
+            return Err(shape(format!(
+                "no room on the GPU for another sequence: {} MiB left",
+                free >> 20
+            )));
         }
         Ok(state)
     }
