@@ -7,7 +7,8 @@
 //! new prompt from the longest cached prefix it can return to exactly.
 //! Attention caches cut back to any length; recurrent layers only to the
 //! marks taken every few hundred tokens, where prompts part and where they
-//! resume.
+//! resume, and to the end of each kept prompt, where the next request of an
+//! agent loop resumes.
 //!
 //! A restored state is bit for bit the one its run left behind, so a warm
 //! prefill gives exactly the logits of a cold one on models whose results
@@ -33,9 +34,11 @@ use disk::Disk;
 use hash::Hasher;
 
 /// Marks are taken at multiples of this many tokens, or of a larger
-/// multiple of it when a mark is expensive next to the cache it saves.
+/// multiple of it when a mark is expensive next to the cache it saves;
+/// see [`Warm::marks_every`].
 const GRID: usize = 256;
-const MAX_GRID: usize = 8192;
+/// The widest spacing of marks.
+pub const MAX_GRID: usize = 8192;
 
 /// What runs prompts for a [`Warm`] cache: the [`Model`] itself, or a copy
 /// of it on a device whose states have an exact host form.
@@ -122,12 +125,17 @@ impl Meta {
             .unwrap_or(0)
     }
 
-    /// Whether every length `old` returns to is also reachable from here.
-    fn covers(&self, old: &Meta) -> bool {
+    /// Whether every length `old` returns to is also reachable from here,
+    /// but for off-grid marks that marks here replace; see [`replaced`].
+    fn covers(&self, old: &Meta, grid: Option<usize>) -> bool {
         let n = old.tokens.len();
         self.tokens.starts_with(&old.tokens)
             && (self.in_place || !old.in_place)
-            && old.marks.iter().chain([&n]).all(|&m| self.reach(m) == m)
+            && self.reach(n) == n
+            && old
+                .marks
+                .iter()
+                .all(|&m| self.reach(m) == m || replaced(&self.marks, m, grid))
     }
 
     /// The tokens of `prompt` a warm start from this entry skips, a
@@ -208,7 +216,7 @@ impl<'m> Warm<'m> {
         Warm {
             model,
             model_id,
-            grid: grid(model),
+            grid: grid(model, GRID),
             align: 1,
             batches_per_call: 1,
             budget: memory_bytes,
@@ -256,6 +264,16 @@ impl<'m> Warm<'m> {
     /// `None` when its caches cut back anywhere.
     pub fn grid(&self) -> Option<usize> {
         self.grid
+    }
+
+    /// Takes marks every `tokens` tokens rather than every 256, or every
+    /// larger multiple of it when a mark is expensive next to the cache it
+    /// saves, rounded up to the alignment. Closer marks resume more prompts
+    /// and take more memory.
+    pub fn marks_every(mut self, tokens: usize) -> Self {
+        let base = tokens.clamp(1, MAX_GRID);
+        self.grid = grid(self.model, base).map(|g| g.next_multiple_of(self.align));
+        self
     }
 
     /// Runs `prompt` from the longest cached prefix it can resume exactly,
@@ -368,7 +386,8 @@ impl<'m> Warm<'m> {
     }
 
     /// Keeps a copy of `state`, which `tokens` produced and whose next-token
-    /// logits are `logits`. Entries it makes redundant are dropped, and the
+    /// logits are `logits`, with its marks off the grid thinned out as
+    /// [`replaced`] says. Entries it makes redundant are dropped, and the
     /// least recently used ones go once memory is over budget. The copy is
     /// in memory either way and the disk write runs in the background; an
     /// error means only that the write could not start.
@@ -379,7 +398,9 @@ impl<'m> Warm<'m> {
             self.model.n_vocab(),
             "logits of another model"
         );
-        let state = state.clone();
+        let mut state = state.clone();
+        let marks: Vec<usize> = state.marks().collect();
+        state.marks.retain(|m| !replaced(&marks, m.pos, self.grid));
         let in_place = self
             .model
             .layers
@@ -392,12 +413,12 @@ impl<'m> Warm<'m> {
             rate: self.rate,
         };
         let mut entry = Entry::new(meta, state, logits.to_vec());
-        let saved = self
-            .disk
-            .as_mut()
-            .map_or(Ok(()), |d| d.save(&entry.meta, &entry.saved, entry.bytes));
+        let saved = self.disk.as_mut().map_or(Ok(()), |d| {
+            d.save(&entry.meta, &entry.saved, entry.bytes, self.grid)
+        });
 
-        self.entries.retain(|e| !entry.meta.covers(&e.meta));
+        self.entries
+            .retain(|e| !entry.meta.covers(&e.meta, self.grid));
         self.clock += 1;
         entry.used = self.clock;
         self.keep(entry);
@@ -504,10 +525,10 @@ impl<'m> Warm<'m> {
     }
 }
 
-/// Mark spacing for `model`: none if every layer cuts back in place,
-/// otherwise wide enough that a mark costs about as much memory as the
-/// attention cache of the tokens between two marks.
-fn grid(model: &Model) -> Option<usize> {
+/// Mark spacing for `model`, a multiple of `base`: none if every layer cuts
+/// back in place, otherwise wide enough that a mark costs about as much
+/// memory as the attention cache of the tokens between two marks.
+fn grid(model: &Model, base: usize) -> Option<usize> {
     let bytes = |pos: usize, marked: bool| -> usize {
         model
             .layers
@@ -523,9 +544,27 @@ fn grid(model: &Model) -> Option<usize> {
     let per_token = bytes(1, false).max(1);
     Some(
         (mark / per_token)
-            .next_multiple_of(GRID)
-            .clamp(GRID, MAX_GRID),
+            .next_multiple_of(base)
+            .clamp(base, MAX_GRID),
     )
+}
+
+/// Whether mark `m` off the grid gives way to off-grid `marks` on both
+/// sides of it before the next grid point. Keeping only the first and the
+/// last between two grid points, usually where conversations part from a
+/// shared prefix and where the previous request ended, holds off-grid marks
+/// to twice as many as the grid has, so they never crowd out the grid marks
+/// long prompts resume from.
+fn replaced(marks: &[usize], m: usize, grid: Option<usize>) -> bool {
+    let Some(g) = grid.filter(|&g| !m.is_multiple_of(g)) else {
+        return false;
+    };
+    let near = || {
+        marks
+            .iter()
+            .filter(|&&k| k / g == m / g && !k.is_multiple_of(g))
+    };
+    near().any(|&k| k < m) && near().any(|&k| k > m)
 }
 
 /// `measured` folded into the running average `old`.

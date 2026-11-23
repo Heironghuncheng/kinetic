@@ -53,11 +53,35 @@ fn aligned_hits_fall_on_multiples() {
 #[test]
 fn an_entry_covers_the_prefixes_it_can_return_to() {
     let long = meta(100, &[32, 64], false);
-    assert!(long.covers(&meta(64, &[32], false)));
-    assert!(!long.covers(&meta(50, &[32], false)));
-    assert!(!long.covers(&meta(64, &[16], false)));
-    assert!(!long.covers(&meta(64, &[], true)));
-    assert!(meta(100, &[], true).covers(&meta(50, &[], true)));
+    assert!(long.covers(&meta(64, &[32], false), None));
+    assert!(!long.covers(&meta(50, &[32], false), None));
+    assert!(!long.covers(&meta(64, &[16], false), None));
+    assert!(!long.covers(&meta(64, &[], true), None));
+    assert!(meta(100, &[], true).covers(&meta(50, &[], true), None));
+}
+
+#[test]
+fn the_first_and_last_off_grid_marks_between_grid_points_stay() {
+    let marks = [32, 64, 96, 256, 288, 320, 384, 512];
+    let kept: Vec<usize> = marks
+        .iter()
+        .copied()
+        .filter(|&m| !replaced(&marks, m, Some(256)))
+        .collect();
+    assert_eq!(kept, [32, 96, 256, 288, 384, 512]);
+    assert!(!replaced(&marks, 64, None));
+}
+
+#[test]
+fn each_request_of_an_agent_loop_covers_the_one_before() {
+    // a shared system prompt parts at 128, then each request resumes where
+    // the one before ended and marks that point
+    let grid = Some(256);
+    let (first, second) = (meta(224, &[128, 192], false), meta(250, &[128, 224], false));
+    assert!(second.covers(&first, grid));
+    assert!(!second.covers(&first, None));
+    // grid marks are never given up
+    assert!(!meta(320, &[288], false).covers(&meta(288, &[256], false), grid));
 }
 
 /// Pseudo-random token ids, the same for every run.
@@ -233,6 +257,28 @@ fn warm_prefills_match_cold_ones() {
     warm.insert(&second, &b.state, &b.logits).unwrap();
     assert_eq!(warm.prefill(&ask(6, 30)).hit, system.len());
 
+    // The next request of an agent loop resumes where this one ended, off
+    // the grid, and keeps where the system prompt parts.
+    let longer = [second.clone(), tokens(25, 7, vocab)].concat();
+    let c = warm.prefill(&longer);
+    assert_eq!(c.hit, second.len());
+    let mut cuts: Vec<usize> = b.state.marks().collect();
+    cuts.push(second.len());
+    let mut cold = model.new_state();
+    let want = run_split(&model, &mut cold, &longer, &cuts);
+    assert_eq!(
+        bits(&c.logits),
+        bits(&want),
+        "off-grid warm and cold differ"
+    );
+    warm.insert(&longer, &c.state, &c.logits).unwrap();
+    assert_eq!(
+        warm.entries.len(),
+        2,
+        "the agent's entries cover each other"
+    );
+    assert_eq!(warm.prefill(&ask(8, 30)).hit, system.len());
+
     Warm::new(&model, id, 0)
         .with_disk(&dir, 1 << 30)
         .unwrap()
@@ -245,6 +291,28 @@ fn warm_prefills_match_cold_ones() {
     assert_eq!(from_disk.hit, b.hit);
     assert_eq!(bits(&from_disk.logits), bits(&b.logits));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Cutting a prompt into batches on the CPU changes no bit as long as the
+/// cuts fall on the 32-token grid warm starts on the CPU resume from, and
+/// the last batch starts on the grid's last point before the end, as the
+/// server cuts it.
+#[test]
+#[ignore = "needs KINETIC_TEST_GGUF"]
+fn cpu_prompt_cuts_on_the_grid_change_no_bit() {
+    let (_, file) = test_model();
+    let model = crate::load(&file).unwrap();
+    let prompt = tokens(600, 10, model.n_vocab());
+    let cold = run_split(&model, &mut model.new_state(), &prompt, &[256, 512, 576]);
+    for cuts in [
+        &[96, 576][..],
+        &[32, 288, 576],
+        &[160, 416, 576],
+        &[192, 224, 576],
+    ] {
+        let got = run_split(&model, &mut model.new_state(), &prompt, cuts);
+        assert_eq!(bits(&got), bits(&cold), "{cuts:?}");
+    }
 }
 
 /// Time to first token for a long system prompt and a short question, cold

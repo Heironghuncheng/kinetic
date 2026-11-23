@@ -58,10 +58,15 @@ impl<'a> CpuBackend<'a> {
     }
 
     /// Starts every new sequence from the longest prefix `warm` holds, and
-    /// keeps each new prompt's state there. Warm starts resume where a cold
-    /// prefill cuts its batches, so they give exactly its output.
+    /// keeps each new prompt's state there, up to where its last batch
+    /// starts. Warm starts resume on [`PREFILL_GRID`], where cutting a
+    /// prompt changes no bit, so they give exactly the output of a cold
+    /// prefill.
     pub fn with_warm(mut self, warm: Warm<'a>) -> Self {
-        self.warm = Some(warm.aligned(PREFILL_CHUNK));
+        let warm = warm
+            .aligned(PREFILL_GRID)
+            .batches_per_call(PREFILL_CHUNK / PREFILL_GRID);
+        self.warm = Some(warm);
         self
     }
 
@@ -81,7 +86,7 @@ impl<'a> CpuBackend<'a> {
         }
         self.decoder.reset(self.model);
         // The batches a cold prefill runs before its last one.
-        let head = &prompt[..(prompt.len() - 1) / PREFILL_CHUNK * PREFILL_CHUNK];
+        let head = &prompt[..sequence::ahead_end(0, prompt.len(), PREFILL_GRID)];
         if let Some(mut seq) = self.cut_cached(head) {
             let reused = seq.tokens.len();
             self.extend(&mut seq, prompt, policy);
@@ -117,9 +122,9 @@ impl<'a> CpuBackend<'a> {
 
     /// [`sequence::extend`] that runs the prompt up to its last multiple of
     /// [`PREFILL_GRID`] first, as running ahead stops there, and marks the
-    /// state after its last whole batch, which is where the next turn of a
-    /// chat parts from it when the template writes the reply differently
-    /// from how it was generated.
+    /// state after its last whole batch and there, which is where the next
+    /// turn of a chat or request of an agent loop parts from it when the
+    /// template writes the reply differently from how it was generated.
     fn extend(
         &mut self,
         seq: &mut Sequence<State>,
@@ -136,8 +141,9 @@ impl<'a> CpuBackend<'a> {
             PREFILL_CHUNK,
             PREFILL_CHUNK,
         ) {}
-        if seq.tokens.len().is_multiple_of(PREFILL_CHUNK) {
-            // one mark at a time: on hybrid models each copies every recurrent state
+        // two marks at most: on hybrid models each copies every recurrent state
+        let whole = seq.tokens.len().is_multiple_of(PREFILL_CHUNK);
+        if whole {
             seq.state.forget_marks();
             self.model.mark(&mut seq.state);
         }
@@ -150,6 +156,12 @@ impl<'a> CpuBackend<'a> {
             PREFILL_CHUNK,
             PREFILL_GRID,
         );
+        if seq.tokens.len().is_multiple_of(PREFILL_GRID) {
+            if !whole {
+                seq.state.forget_marks();
+            }
+            self.model.mark(&mut seq.state);
+        }
         sequence::extend(
             self.model,
             &mut self.decoder,
@@ -160,8 +172,9 @@ impl<'a> CpuBackend<'a> {
         );
     }
 
-    /// The cached sequence cut back to the last batch edge it shares with
-    /// `head` that it returns to exactly, if that leaves any of it.
+    /// The cached sequence cut back to the last multiple of [`PREFILL_GRID`]
+    /// it shares with `head` that it returns to exactly, if that leaves any
+    /// of it.
     fn cut_cached(&mut self, head: &[u32]) -> Option<Sequence<State>> {
         let mut seq = self.cached.take()?;
         let common = seq
@@ -172,9 +185,9 @@ impl<'a> CpuBackend<'a> {
             .count();
         let to = self
             .model
-            .reach(&seq.state, common / PREFILL_CHUNK * PREFILL_CHUNK);
-        // only batch edges resume with the batches of a cold run
-        if to == 0 || !to.is_multiple_of(PREFILL_CHUNK) {
+            .reach(&seq.state, common / PREFILL_GRID * PREFILL_GRID);
+        // only the grid resumes with the bits of a cold run
+        if to == 0 || !to.is_multiple_of(PREFILL_GRID) {
             return None;
         }
         self.model.truncate(&mut seq.state, to);
@@ -202,7 +215,7 @@ impl<'a> CpuBackend<'a> {
     /// Takes the sequence a request for `prompt` would start from when it
     /// cannot continue the cached one: the longest warm prefix, or none.
     fn restart(&mut self, prompt: &[u32]) -> bool {
-        let head = &prompt[..(prompt.len() - 1) / PREFILL_CHUNK * PREFILL_CHUNK];
+        let head = &prompt[..sequence::ahead_end(0, prompt.len(), PREFILL_GRID)];
         if head.is_empty() {
             return false;
         }

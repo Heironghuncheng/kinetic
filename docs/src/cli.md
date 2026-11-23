@@ -111,6 +111,7 @@ seeded answer is the same for the same seed.
 | `--gpus <LIST>` | CUDA GPUs to spread the layers over, such as `0,1`; the first also holds the embeddings and output head [default: 0]; see [Devices](devices.md#several-gpus) |
 | `--cache-dir <DIR>` | where Warm Start keeps prompt states [default: `kinetic/warm` in the user's cache directory] |
 | `--no-prompt-cache` | run every prompt from its first token; same as `--off warm-start` |
+| `--cache-spacing <N>` | tokens between the states Warm Start keeps inside a prompt on models with recurrent layers, a multiple of 32 up to 8192; closer resumes more prompts and takes more memory, and a GPU rounds it up to its prompt batch [default: 256] |
 | `--off <LIST>` | turn speed technologies off, comma-separated: `rad1`, `warm-start`, `zero-wait`, `shortlist`, `torque`, `convoy` |
 | `--cache-type-k <f16\|q8_0>`, `--cache-type-v <f16\|q8_0>` | how the CUDA cache stores keys and values; `q8_0` takes about half the memory but changes outputs [default: f16]; see [Devices](devices.md#memory) |
 | `--rope-scaling <none\|linear\|yarn>` | rotary scaling for contexts longer than the model was trained on; overrides the file |

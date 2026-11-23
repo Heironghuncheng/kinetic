@@ -328,6 +328,11 @@ struct RuntimeArgs {
     /// Run every prompt from its first token; same as --off warm-start
     #[arg(long, conflicts_with = "cache_dir")]
     no_prompt_cache: bool,
+    /// Tokens between the states kept inside a prompt on models with
+    /// recurrent layers, a multiple of 32; closer resumes more prompts and
+    /// takes more memory, and a GPU rounds it up to its prompt batch
+    #[arg(long, value_name = "N", default_value_t = 256, value_parser = cache_spacing)]
+    cache_spacing: usize,
     /// How the CUDA cache stores keys; q8_0 takes about half the memory of
     /// f16 but rounds them, so outputs change
     #[arg(long, value_enum, value_name = "TYPE", default_value_t = CacheType::F16)]
@@ -1096,18 +1101,32 @@ fn warm_cache<'a>(
     }
     let id = warm::model_id(path).ok()?;
     let id = device.map_or(id, |d| warm::device_id(id, d));
+    let new = || Warm::new(model, id, WARM_MEMORY).marks_every(runtime.cache_spacing);
     let Some(dir) = runtime.cache_dir.clone().or_else(warm::default_dir) else {
-        return Some(Warm::new(model, id, WARM_MEMORY));
+        return Some(new());
     };
-    match Warm::new(model, id, WARM_MEMORY).with_disk(&dir, WARM_DISK) {
+    match new().with_disk(&dir, WARM_DISK) {
         Ok(w) => Some(w),
         Err(e) => {
             eprintln!(
                 "kinetic: prompt cache in memory only, {} is not usable: {e}",
                 dir.display()
             );
-            Some(Warm::new(model, id, WARM_MEMORY))
+            Some(new())
         }
+    }
+}
+
+/// A `--cache-spacing`: on the grid CPU prompts are cut on without
+/// changing a bit, as states off it could not be resumed from.
+fn cache_spacing(arg: &str) -> std::result::Result<usize, String> {
+    let grid = kinetic_server::PREFILL_GRID;
+    match arg.parse::<usize>() {
+        Ok(n) if n > 0 && n.is_multiple_of(grid) && n <= warm::MAX_GRID => Ok(n),
+        _ => Err(format!(
+            "a multiple of {grid} from {grid} to {}",
+            warm::MAX_GRID
+        )),
     }
 }
 
