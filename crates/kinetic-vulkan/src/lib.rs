@@ -45,6 +45,7 @@
 mod argmax;
 mod attention;
 mod batch;
+mod budget;
 mod delta_net;
 mod depth;
 mod error;
