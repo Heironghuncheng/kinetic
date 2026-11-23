@@ -120,7 +120,7 @@ impl Kernels {
     pub fn load_with(device: &Rc<Device>, matrix: bool) -> Result<Kernels> {
         let gemv = |name, spirv| Kernel::new(device, name, spirv, 6, 5);
         let attend = |name, spirv| Kernel::new(device, name, spirv, 8, 13);
-        let experts = |name, spirv| Kernel::new(device, name, spirv, 7, 7);
+        let experts = |name, spirv| Kernel::new(device, name, spirv, 8, 8);
         #[cfg(not(metal_driver))]
         let matrix = matrix && device.info().features.matrix_f16;
         #[cfg(metal_driver)]

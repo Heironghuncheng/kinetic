@@ -82,7 +82,9 @@ fn random_matrix(ty: TensorType, rows: usize, cols: usize, rng: &mut Lcg) -> Vec
             if ty == TensorType::NVFP4 {
                 // E4M3 scales between 2^-4 and 2^-2
                 for blk in data.chunks_exact_mut(size) {
-                    blk[..4].iter_mut().for_each(|s| *s = 0x18 + (rng.next() % 16) as u8);
+                    blk[..4]
+                        .iter_mut()
+                        .for_each(|s| *s = 0x18 + (rng.next() % 16) as u8);
                 }
                 return data;
             }
@@ -323,6 +325,7 @@ fn check_experts(ty: TensorType, rows: usize, cols: usize) {
                     &picks,
                     &input,
                     used,
+                    None,
                     &y,
                     out,
                     &batch,
@@ -689,5 +692,50 @@ fn k_quant_matrix_passes_match_reference() {
     for ty in [TensorType::Q4K, TensorType::Q5K, TensorType::Q6K] {
         check_matrix_pass(ty, 37, 5 * 256, 32, 21, false);
         check_matrix_pass(ty, 128, 3 * 256, 160, 130, false);
+    }
+}
+
+/// Expert products with a scale per expert give the unscaled products
+/// times their expert's scale.
+#[test]
+fn expert_scales_multiply_each_job() {
+    let (count, used, tokens, rows, cols) = (3, 2, 2, 8, 64);
+    for gpu in gpus() {
+        let mut rng = Lcg(31);
+        let data = random_matrix(TensorType::Q8_0, count * rows, cols, &mut rng);
+        let m = Matrix::new(TensorType::Q8_0, &data, count * rows, cols);
+        let x: Vec<f32> = (0..tokens * cols).map(|_| rng.f32()).collect();
+        let picks: Vec<u32> = [2, 0, 1, 2].iter().flat_map(|&e| [e, 0]).collect();
+        let w = DeviceMatrix::upload(&gpu.device, &m).unwrap();
+        let picks = DeviceBuffer::from_slice(&gpu.device, &picks).unwrap();
+        let table = [0.5f32, 2.0, -1.5];
+        let scales = DeviceBuffer::from_slice(&gpu.device, &table).unwrap();
+        let mut input = GemvInput::batch(&gpu.device, cols, tokens).unwrap();
+        let mut batch = Batch::new(&gpu.device, tokens, 1, 64, 0).unwrap();
+        batch.set(tokens, 0, 0..0, None).unwrap();
+        let out = Out {
+            stride: rows,
+            offset: 0,
+        };
+        let mut run = |s: Option<&DeviceBuffer<f32>>| {
+            let y = DeviceBuffer::new(&gpu.device, tokens * used * rows).unwrap();
+            let mut c = Commands::new(&gpu.device).unwrap();
+            batch.record_upload(&mut c).unwrap();
+            input.upload(&gpu.kernels, &x, &mut c).unwrap();
+            gpu.kernels
+                .gemv_experts(
+                    &w, count, used, &picks, &input, used, s, &y, out, &batch, &mut c,
+                )
+                .unwrap();
+            c.submit().unwrap();
+            y.to_vec().unwrap()
+        };
+        let (plain, scaled) = (run(None), run(Some(&scales)));
+        for (j, e) in [2usize, 0, 1, 2].into_iter().enumerate() {
+            for r in 0..rows {
+                let i = j * rows + r;
+                assert_eq!(scaled[i], plain[i] * table[e], "job {j} row {r}");
+            }
+        }
     }
 }

@@ -110,7 +110,7 @@ pub use device::Device;
 pub use error::{Error, Result};
 pub use experts::{Gating, Shared};
 pub use ffn::Glu;
-pub use gemv::{DeviceMatrix, GemvInput, Out, Rows};
+pub use gemv::{has_kernel, DeviceMatrix, GemvInput, Out, Rows};
 pub use info::{DeviceInfo, DeviceKind, Features};
 pub use instance::Instance;
 pub use kernels::Kernels;

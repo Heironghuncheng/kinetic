@@ -43,6 +43,11 @@ pub(crate) fn block_len(ty: TensorType) -> Option<usize> {
     })
 }
 
+/// Whether weights of type `ty` have GEMV and expert kernels.
+pub fn has_kernel(ty: TensorType) -> bool {
+    block_len(ty).is_some()
+}
+
 /// A weight matrix in device memory, laid out for the GEMV kernels.
 pub struct DeviceMatrix {
     pub(crate) ty: TensorType,
@@ -447,7 +452,8 @@ impl Kernels {
     /// `count` experts of equal shape one after another, and for each token
     /// of the batch and each of its `used` picks in `picks` (see
     /// [`Kernels::route`]), job `j` multiplies the picked expert with input
-    /// row `j / per_input` of `x` and writes output row `j` as `out` says.
+    /// row `j / per_input` of `x` and writes output row `j` as `out` says,
+    /// times the entry of `scales` its pick names, if given.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_experts(
         &self,
@@ -457,6 +463,7 @@ impl Kernels {
         picks: &DeviceBuffer<u32>,
         x: &GemvInput,
         per_input: usize,
+        scales: Option<&DeviceBuffer<f32>>,
         y: &DeviceBuffer<f32>,
         out: Out,
         batch: &Batch,
@@ -474,6 +481,7 @@ impl Kernels {
             || x.width() != w.cols
             || x.rows() < jobs.div_ceil(per_input)
             || picks.len() < 2 * jobs
+            || scales.is_some_and(|s| s.len() < count)
             || out.stride < out.offset + rows
             || needed.is_none_or(|n| n > y.len() || u32::try_from(n).is_err())
             || jobs > MAX_GROUPS as usize
@@ -505,9 +513,10 @@ impl Kernels {
         // SAFETY: matches experts.wgsl: weights, x, qs, ds, y, the batch and
         // the picks at bindings 0..6, then the rows of an expert, blocks per
         // row, experts, picks per token, jobs per input row, output stride
-        // and offset. Checked above: the picks, input rows and output rows of
-        // every job the batch can hold; jobs of experts past the last are
-        // skipped.
+        // and offset, the scales at 7 and whether to read them. Checked
+        // above: the picks, input rows and output rows of every job the
+        // batch can hold, and a scale per expert; jobs of experts past the
+        // last are skipped.
         unsafe {
             commands.dispatch(
                 kernel,
@@ -519,6 +528,7 @@ impl Kernels {
                     y.allocation(),
                     batch.device().allocation(),
                     picks.allocation(),
+                    scales.unwrap_or(y).allocation(),
                 ],
                 &[
                     rows as u32,
@@ -528,6 +538,7 @@ impl Kernels {
                     per_input as u32,
                     out.stride as u32,
                     out.offset as u32,
+                    scales.is_some() as u32,
                 ],
                 [rows.div_ceil(ROWS_PER_EXPERT_GROUP) as u32, jobs as u32, 1],
             )
