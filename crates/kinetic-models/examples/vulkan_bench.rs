@@ -22,17 +22,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = GgufFile::open(&path)?;
     let model = kinetic_models::load(&file)?;
     let physical = devices()?.into_iter().nth(index).ok_or("no such device")?;
-    let gpu = VulkanModel::load_on(&model, PROMPT + DECODE + 1, &physical)?;
+    let gpu = VulkanModel::load_on(&model, PROMPT + DECODE + 1, &physical, true)?;
     let vocab = gpu.n_vocab() as u64;
     let tokens: Vec<u32> = (0..PROMPT as u64)
         .map(|i| (i.wrapping_mul(2_654_435_761) % vocab) as u32)
         .collect();
 
     let mut state = gpu.new_state()?;
+    gpu.set_prompt(&mut state, true);
     gpu.run_greedy(&mut state, &tokens[..16], false)?;
     let (mut pp, mut tg) = (0.0f64, 0.0f64);
     for _ in 0..TRIALS {
         gpu.reset(&mut state)?;
+        gpu.set_prompt(&mut state, true);
         let start = Instant::now();
         let (next, _) = gpu.run_greedy(&mut state, &tokens, false)?;
         pp = pp.max(PROMPT as f64 / start.elapsed().as_secs_f64());

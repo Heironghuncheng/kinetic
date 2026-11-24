@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use kinetic_gguf::GgufFile;
 use kinetic_models::speculative::argmax;
-use kinetic_models::vulkan::{devices, VulkanModel, VulkanRunner};
+use kinetic_models::vulkan::{devices, VulkanModel, VulkanRunner, VulkanState};
 use kinetic_models::warm::Warm;
 use kinetic_tokenizer::Tokenizer;
 
@@ -34,13 +34,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ids = tokenizer.encode(&prompt, true);
     let physical = devices()?.into_iter().nth(index).ok_or("no such device")?;
     // Room for the wrong tokens of the last draft.
-    let gpu = VulkanModel::load_on(&model, ids.len() + n + 3, &physical)?;
+    let gpu = VulkanModel::load_on(&model, ids.len() + n + 3, &physical, true)?;
     println!("device: {}", gpu.device_name());
 
     let mut cpu_state = model.new_state();
     let mut gpu_state = gpu.new_state()?;
     let mut cpu_logits = model.forward_batch(&mut cpu_state, &ids);
+    gpu.set_prompt(&mut gpu_state, true);
     let mut gpu_logits = gpu.run(&mut gpu_state, &ids, false)?.logits;
+    gpu.set_prompt(&mut gpu_state, false);
 
     println!("prompt {} tokens", ids.len());
     println!("step  cpu top4 (token:prob)                          gpu top4");
@@ -66,9 +68,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("---\n{}\n---", tokenizer.decode(&tokens));
 
+    // the prompt runs as a prompt, then each token decoded alone
+    let prompt = |state: &mut VulkanState| -> Result<u32, Box<dyn std::error::Error>> {
+        gpu.set_prompt(state, true);
+        let first = gpu.run_greedy(state, &ids, false);
+        gpu.set_prompt(state, false);
+        Ok(first?.0[0])
+    };
     let mut state = gpu.new_state()?;
-    let (first, _) = gpu.run_greedy(&mut state, &ids, false)?;
-    let mut alone = vec![first[0]];
+    let mut alone = vec![prompt(&mut state)?];
     let start = Instant::now();
     for step in 1..n {
         let (next, _) = gpu.run_greedy(&mut state, &alone[step - 1..step], false)?;
@@ -80,17 +88,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("gpu decode: {rate:.1} tokens/s");
 
     let mut state = gpu.new_state()?;
-    let mut fed = ids.clone();
-    fed.extend_from_slice(&alone[..n - 1]);
-    let (batched, _) = gpu.run_greedy(&mut state, &fed, true)?;
-    let same = batched[ids.len() - 1..] == alone[..];
+    let mut batched = vec![prompt(&mut state)?];
+    batched.extend(gpu.run_greedy(&mut state, &alone[..n - 1], true)?.0);
+    let same = batched == alone;
     println!("batched rows give the same greedy tokens: {same}");
 
     let mut state = gpu.new_state()?;
-    gpu.run_greedy(&mut state, &ids[..ids.len() - 1], false)?;
-    let mut fed = vec![ids[ids.len() - 1]];
-    fed.extend_from_slice(&alone[..n - 1]);
-    let mut drafted = Vec::new();
+    let mut drafted = vec![prompt(&mut state)?];
+    let fed = &alone[..n - 1];
     for good in fed.chunks(3) {
         let mut draft = good.to_vec();
         draft.extend([0, 1, 2]);
@@ -127,12 +132,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut state = gpu.new_state()?;
+    gpu.set_prompt(&mut state, true);
     let full = gpu.run(&mut state, &ids, false)?.logits;
     gpu.reset(&mut state)?;
+    gpu.set_prompt(&mut state, true);
     let top = gpu.run_top1(&mut state, &ids, false)?.logits;
     let at = argmax(&full);
     let exact = argmax(&top) == at && top[at as usize].to_bits() == full[at as usize].to_bits();
     println!("top logit kept exactly: {exact}");
+
+    // where a prompt is cut changes no bit
+    let mut cut_same = true;
+    for cut in [1, 3, 17, 64, 65, 100] {
+        gpu.reset(&mut state)?;
+        gpu.set_prompt(&mut state, true);
+        let mut last = Vec::new();
+        for piece in ids.chunks(cut) {
+            last = gpu.run(&mut state, piece, false)?.logits;
+        }
+        cut_same &= last
+            .iter()
+            .zip(&full)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+    }
+    println!("prompts cut in pieces give the same logits: {cut_same}");
     Ok(())
 }
 

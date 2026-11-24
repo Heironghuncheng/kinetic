@@ -113,7 +113,7 @@ seeded answer is the same for the same seed.
 | `--cache-dir <DIR>` | where Warm Start keeps prompt states [default: `kinetic/warm` in the user's cache directory] |
 | `--no-prompt-cache` | run every prompt from its first token; same as `--off warm-start` |
 | `--cache-spacing <N>` | tokens between the states Warm Start keeps inside a prompt on models with recurrent layers, a multiple of 32 up to 8192; closer resumes more prompts and takes more memory, and a GPU rounds it up to its prompt batch [default: 256] |
-| `--off <LIST>` | turn speed technologies off, comma-separated: `rad1`, `warm-start`, `zero-wait`, `shortlist`, `torque`, `convoy` |
+| `--off <LIST>` | turn speed technologies off, comma-separated: `rad1`, `warm-start`, `zero-wait`, `shortlist`, `torque`, `convoy`; `coopmat` runs Vulkan prompts without the matrix units, as decoding does |
 | `--cache-type-k <f16\|q8_0>`, `--cache-type-v <f16\|q8_0>` | how the CUDA cache stores keys and values; `q8_0` takes about half the memory but changes outputs [default: f16]; see [Devices](devices.md#memory) |
 | `--rope-scaling <none\|linear\|yarn>` | rotary scaling for contexts longer than the model was trained on; overrides the file |
 | `--rope-scale <N>` | context stretch factor (`--rope-freq-scale` takes its inverse, as llama.cpp does) |
@@ -133,6 +133,9 @@ change`, rather than moving layers to the CPU. An explicit `-c` always wins.
 
 Every speed technology is exact, so `--off` changes only speed: use it to
 measure what each one gives, or to rule one out when reporting a bug.
+`coopmat` is not one of them: prompts on the matrix units round
+differently, so turning it off changes a prompt's bits slightly; see
+[Devices](devices.md#vulkan).
 `kinetic serve` prints which run on the device it picked, for example
 `Speed technologies on: RAD-1, Warm Start, Zero Wait, Torque, Convoy; off: Shortlist`.
 

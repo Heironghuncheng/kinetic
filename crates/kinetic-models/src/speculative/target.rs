@@ -71,6 +71,12 @@ pub trait Target {
         None
     }
 
+    /// Marks the tokens runs of `state` take from now on as a prompt's
+    /// (`true`) or as generated ones. A target whose prompt passes give
+    /// other bits than decoding runs every prompt token in them, so that
+    /// where a prompt is cut changes no bit; others ignore it.
+    fn set_prompt(&self, _state: &mut Self::State, _prompt: bool) {}
+
     /// The greedy token after row `row` of `scores`.
     fn greedy(&self, scores: &Self::Scores, row: usize) -> u32;
 

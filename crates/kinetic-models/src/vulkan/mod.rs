@@ -54,21 +54,10 @@ pub const MAX_BATCH: usize = 16;
 /// decoded with are the faster ones.
 const PROMPT_MIN: usize = 4;
 
-/// Most tokens a prompt pass runs: what the driver asks for, or
-/// [`MAX_BATCH`] if it has no kernels of its own for such passes. They
-/// give every token the bits it gets alone, so nothing but speed depends
-/// on how a prompt is split.
-const PROMPT_BATCH: usize = larger(kinetic_vulkan::PROMPT_BATCH, MAX_BATCH);
-
-// Not `max`: clippy refuses to compare the 0 of a driver without a prompt
-// kernel as a constant.
-const fn larger(a: usize, b: usize) -> usize {
-    if a > b {
-        a
-    } else {
-        b
-    }
-}
+/// Rows of the smaller prompt pass, for the short prompts and prompt ends
+/// that would leave most of a full pass's rows idle: every kernel of a
+/// pass runs its full rows, those past its tokens returning at once.
+const PROMPT_SHORT: usize = 64;
 
 /// The device and its kernels.
 struct Gpu {
@@ -114,6 +103,8 @@ pub fn devices() -> kinetic_vulkan::Result<Vec<PhysicalDevice>> {
 pub struct VulkanModel<'m> {
     gpu: Gpu,
     name: String,
+    /// The driver's name, version string and version number.
+    driver: String,
     /// Most tokens a state holds.
     context: usize,
     n_embd: usize,
@@ -127,26 +118,32 @@ pub struct VulkanModel<'m> {
     layers: Vec<VulkanLayer>,
     mtp: Option<VulkanMtp>,
     ropes: RopeTables,
+    /// Most tokens a prompt pass runs: what the device's kernels ask for,
+    /// or [`MAX_BATCH`] if it has none of its own for such passes.
+    prompt_batch: usize,
+    /// Whether prompt passes run on the matrix units, which give other
+    /// bits than the kernels tokens are decoded with.
+    matrix: bool,
 }
 
 /// A sequence's caches and buffers on the device.
 pub struct VulkanState {
     pos: usize,
     checkpoint: Option<usize>,
+    /// Whether the tokens being run are a prompt's; see
+    /// [`VulkanModel::set_prompt`].
+    prompt: bool,
     work: Work,
-    /// The buffers of a prompt pass, if it runs more tokens than any
-    /// other: a pass costs a little by the rows its buffers hold, which
-    /// would slow every token decoded.
-    prompt_work: Option<Work>,
     layers: Vec<LayerState>,
     /// The recorded pass, and the same with the logits of one head row
     /// brought back.
     step: Graph,
     step_logits: Graph,
-    /// The same two for a pass of many prompt tokens, which the device may
-    /// run with kernels written for many tokens at once.
-    step_prompt: Graph,
-    step_prompt_logits: Graph,
+    /// Prompt passes, which the device may run with kernels written for
+    /// many tokens at once, by rows, fewest first; none where it has no
+    /// such kernels. Each has buffers of its own: a pass costs a little by
+    /// the rows its buffers hold, which would slow every token decoded.
+    prompt_passes: Vec<PromptPass>,
     /// Brings back the logits of every head row.
     all_logits: Graph,
     /// What a rollback runs, when a layer needs it.
@@ -167,6 +164,14 @@ impl VulkanState {
     }
 }
 
+/// A prompt pass of some number of rows: its buffers, and its recorded
+/// pass without and with the logits of its last token brought back.
+struct PromptPass {
+    work: Work,
+    step: Graph,
+    step_logits: Graph,
+}
+
 /// What a run produces besides the state it advances.
 struct Output {
     /// The greedy token after each row given to the head.
@@ -181,21 +186,29 @@ struct Output {
 
 impl<'m> VulkanModel<'m> {
     /// Uploads `model` to the first Vulkan device that can run it, for
-    /// sequences of up to `context` tokens.
-    pub fn load(model: &Model<'m>, context: usize) -> Result<VulkanModel<'m>, LoadError> {
+    /// sequences of up to `context` tokens. With `matrix`, prompt passes run
+    /// on the device's matrix units where it has them; see
+    /// [`VulkanModel::matrix`].
+    pub fn load(
+        model: &Model<'m>,
+        context: usize,
+        matrix: bool,
+    ) -> Result<VulkanModel<'m>, LoadError> {
         let physical = devices()
             .map_err(vulkan_error)?
             .into_iter()
             .next()
             .ok_or_else(|| LoadError("no Vulkan device can run models".into()))?;
-        VulkanModel::load_on(model, context, &physical)
+        VulkanModel::load_on(model, context, &physical, matrix)
     }
 
-    /// Uploads `model` to `physical` for sequences of up to `context` tokens.
+    /// Uploads `model` to `physical` for sequences of up to `context` tokens;
+    /// `matrix` as for [`VulkanModel::load`].
     pub fn load_on(
         model: &Model<'m>,
         context: usize,
         physical: &PhysicalDevice,
+        matrix: bool,
     ) -> Result<VulkanModel<'m>, LoadError> {
         if model.folded {
             return Err(LoadError(
@@ -212,10 +225,11 @@ impl<'m> VulkanModel<'m> {
             .map_err(|_| LoadError(format!("{} embeddings are not supported", e.ty)))?;
         let device = Device::new(physical).map_err(vulkan_error)?;
         let gpu = Gpu {
-            kernels: Kernels::load(&device).map_err(vulkan_error)?,
+            kernels: Kernels::load_with(&device, matrix).map_err(vulkan_error)?,
             device,
         };
-        let mut ropes = RopeTables::new(PROMPT_BATCH);
+        let prompt_batch = gpu.kernels.prompt_batch().max(MAX_BATCH);
+        let mut ropes = RopeTables::new(prompt_batch);
         let layers = model
             .layers
             .iter()
@@ -228,6 +242,13 @@ impl<'m> VulkanModel<'m> {
             .transpose()?;
         Ok(VulkanModel {
             name: physical.info().name.clone(),
+            driver: {
+                let info = physical.info();
+                format!(
+                    "{} {} ({:#x})",
+                    info.driver_name, info.driver_info, info.driver_version
+                )
+            },
             context,
             n_embd: model.n_embd,
             eps: model.eps,
@@ -239,13 +260,47 @@ impl<'m> VulkanModel<'m> {
             output_norm: gpu.vector(&model.output_norm)?,
             layers,
             ropes,
+            prompt_batch,
+            matrix: gpu.kernels.matrix(),
             gpu,
         })
+    }
+
+    /// Whether prompt passes run on the matrix units. Their products are
+    /// sums of f16 terms, close to the decode kernels' but not equal, so a
+    /// prompt's state differs slightly from the same tokens decoded one at
+    /// a time. Decode steps and draft checks never run there, so drafts
+    /// still give exactly the tokens plain decoding would; and every token
+    /// marked as a prompt's runs there, so where a prompt is cut changes no
+    /// bit.
+    pub fn matrix(&self) -> bool {
+        self.matrix
+    }
+
+    /// Turns [`VulkanModel::matrix`] off, along with the prompt passes it
+    /// takes, for states made from now on: they need far less memory.
+    pub fn without_matrix(&mut self) {
+        if self.matrix {
+            self.matrix = false;
+            self.prompt_batch = MAX_BATCH;
+        }
+    }
+
+    /// Marks the tokens `state` runs from now on as a prompt's (`true`) or
+    /// as decoded ones. With [`VulkanModel::matrix`], prompt tokens all run
+    /// in prompt passes, however few, as long as no checkpoint is set.
+    pub fn set_prompt(&self, state: &mut VulkanState, prompt: bool) {
+        state.prompt = prompt;
     }
 
     /// The name of the device the model runs on.
     pub fn device_name(&self) -> &str {
         &self.name
+    }
+
+    /// The device's driver: its name, version string and version number.
+    pub fn driver(&self) -> &str {
+        &self.driver
     }
 
     pub fn n_vocab(&self) -> usize {
@@ -266,21 +321,15 @@ impl<'m> VulkanModel<'m> {
     /// An empty state for a new sequence.
     pub fn new_state(&self) -> kinetic_vulkan::Result<VulkanState> {
         let dev = &self.gpu.device;
-        let work = |rows, head_rows| {
+        let new_work = |rows, head_rows| {
             let batch = Batch::new(dev, rows, head_rows, self.context, self.ropes.words())?;
             Work::new(&self.gpu, &self.layers, self.n_embd, batch, self.n_vocab())
         };
-        // A prompt pass wants the logits of its last token at most.
-        let many = PROMPT_BATCH > MAX_BATCH;
-        let prompt_work = match many {
-            true => Some(work(PROMPT_BATCH, 1)?),
-            false => None,
-        };
-        let work = work(MAX_BATCH, MAX_BATCH)?;
+        let work = new_work(MAX_BATCH, MAX_BATCH)?;
         let layers = self
             .layers
             .iter()
-            .map(|l| l.new_state(dev, self.context, PROMPT_BATCH))
+            .map(|l| l.new_state(dev, self.context, self.prompt_batch))
             .collect::<kinetic_vulkan::Result<Vec<_>>>()?;
         let vocab = self.n_vocab();
         let mut all_logits = Commands::new(dev)?;
@@ -289,27 +338,35 @@ impl<'m> VulkanModel<'m> {
             true => Some(self.record_replay(&work, &layers)?),
             false => None,
         };
+        // A prompt pass wants the logits of its last token at most.
+        let mut sizes = vec![self.prompt_batch];
+        if self.prompt_batch > PROMPT_SHORT {
+            sizes.insert(0, PROMPT_SHORT);
+        }
+        let prompt_passes = match self.prompt_batch > MAX_BATCH {
+            true => sizes
+                .into_iter()
+                .map(|rows| {
+                    let work = new_work(rows, 1)?;
+                    Ok(PromptPass {
+                        step: self.record(&work, &layers, false, true)?,
+                        step_logits: self.record(&work, &layers, true, true)?,
+                        work,
+                    })
+                })
+                .collect::<kinetic_vulkan::Result<Vec<_>>>()?,
+            false => Vec::new(),
+        };
         Ok(VulkanState {
             pos: 0,
             checkpoint: None,
+            prompt: false,
             step: self.record(&work, &layers, false, false)?,
             step_logits: self.record(&work, &layers, true, false)?,
-            step_prompt: self.record(
-                prompt_work.as_ref().unwrap_or(&work),
-                &layers,
-                false,
-                many,
-            )?,
-            step_prompt_logits: self.record(
-                prompt_work.as_ref().unwrap_or(&work),
-                &layers,
-                true,
-                many,
-            )?,
+            prompt_passes,
             all_logits: all_logits.finish()?,
             replay,
             work,
-            prompt_work,
             layers,
             marks: Vec::new(),
         })
@@ -319,6 +376,7 @@ impl<'m> VulkanModel<'m> {
     pub fn reset(&self, state: &mut VulkanState) -> kinetic_vulkan::Result<()> {
         state.pos = 0;
         state.checkpoint = None;
+        state.prompt = false;
         state.marks.clear();
         for (layer, s) in self.layers.iter().zip(&mut state.layers) {
             layer.clear(s)?;
@@ -329,7 +387,11 @@ impl<'m> VulkanModel<'m> {
     /// Device bytes held by `state`.
     pub fn state_bytes(&self, state: &VulkanState) -> usize {
         let layers: usize = state.layers.iter().map(LayerState::size_bytes).sum();
-        let prompt = state.prompt_work.as_ref().map_or(0, Work::size_bytes);
+        let prompt: usize = state
+            .prompt_passes
+            .iter()
+            .map(|p| p.work.size_bytes())
+            .sum();
         state.work.size_bytes() + prompt + layers
     }
 
@@ -516,14 +578,21 @@ impl<'m> VulkanModel<'m> {
         while !rest.is_empty() {
             // Tokens whose rows are not each wanted, and that no draft may
             // be rolled back over, are prompt processing, which takes them
-            // in passes as large as it can.
-            let prompt = PROMPT_BATCH > MAX_BATCH
-                && !all_rows
+            // in passes as large as it can. Prompt passes on the matrix
+            // units give their own bits, so there every token of a prompt
+            // takes one, and only those; a prompt whose every row is wanted
+            // takes one pass per token, since a prompt pass keeps the head
+            // rows of its last token only.
+            let prompt = self.prompt_batch > MAX_BATCH
                 && state.checkpoint.is_none()
-                && rest.len() >= PROMPT_MIN;
-            let n = rest.len().min(match prompt {
-                true => PROMPT_BATCH,
-                false => MAX_BATCH,
+                && match self.matrix {
+                    true => state.prompt,
+                    false => !all_rows && rest.len() >= PROMPT_MIN,
+                };
+            let n = rest.len().min(match (prompt, all_rows) {
+                (true, true) => 1,
+                (true, false) => self.prompt_batch,
+                (false, _) => MAX_BATCH,
             });
             let chunk;
             (chunk, rest) = rest.split_at(n);
@@ -532,20 +601,27 @@ impl<'m> VulkanModel<'m> {
                 (false, true) => n - 1..n,
                 (false, false) => n..n,
             };
-            let w = match (prompt, &mut state.prompt_work) {
-                (true, Some(w)) => w,
-                _ => &mut state.work,
+            // the smallest prompt pass that holds them
+            let pass = prompt
+                .then(|| {
+                    state
+                        .prompt_passes
+                        .iter_mut()
+                        .find(|p| p.work.batch.rows() >= n)
+                })
+                .flatten();
+            let (w, step, step_logits) = match pass {
+                Some(p) => (&mut p.work, &p.step, &p.step_logits),
+                None => (&mut state.work, &state.step, &state.step_logits),
             };
             w.batch.set(n, state.pos, head.clone(), state.checkpoint)?;
             self.ropes.fill(&mut w.batch, state.pos, n);
             let x = &mut w.embedded.as_mut_slice()[..n * d];
             embed_into(&self.embd, self.embd_scale, chunk, x);
             let one = logits && head.len() == 1;
-            match (one, prompt) {
-                (true, true) => state.step_prompt_logits.launch()?,
-                (true, false) => state.step_logits.launch()?,
-                (false, true) => state.step_prompt.launch()?,
-                (false, false) => state.step.launch()?,
+            match one {
+                true => step_logits.launch()?,
+                false => step.launch()?,
             }
             for pair in w.greedy.as_slice()[..2 * head.len()].chunks_exact(2) {
                 out.greedy.push(pair[0]);

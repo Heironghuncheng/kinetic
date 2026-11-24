@@ -90,8 +90,8 @@ fn vulkan_rows_match_generation() {
     let file =
         GgufFile::open(std::env::var("KINETIC_TEST_GGUF").expect("set KINETIC_TEST_GGUF")).unwrap();
     let model = load(&file).unwrap();
-    let mut backend =
-        kinetic_server::VulkanBackend::new(&model, 4096).unwrap_or_else(|e| panic!("Vulkan: {e}"));
+    let mut backend = kinetic_server::VulkanBackend::new(&model, 4096, true)
+        .unwrap_or_else(|e| panic!("Vulkan: {e}"));
     parity(&mut backend, model.n_vocab());
 }
 

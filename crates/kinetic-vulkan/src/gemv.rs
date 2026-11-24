@@ -8,6 +8,8 @@ use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::kernels::{Kernels, MAX_GROUPS};
 use crate::layout::device_layout;
+#[cfg(not(metal_driver))]
+use crate::matrix_tile::MATRIX_TILE;
 use crate::memory::{Allocation, DeviceBuffer};
 use crate::pipeline::Kernel;
 
@@ -287,10 +289,15 @@ impl Kernels {
             )));
         }
         // A pass of many prompt tokens runs every row of the batch.
-        #[cfg(metal_driver)]
         let many = rows == Rows::Tokens && commands.prompt();
         #[cfg(not(metal_driver))]
-        let many = false;
+        if many {
+            if let Some(kernel) = self.matrix_kernel(w.ty) {
+                // SAFETY: as below; the kernel takes the same bindings.
+                unsafe { self.record_matrix(kernel, w, x, y, out, capacity, batch, commands) };
+                return Ok(());
+            }
+        }
         // SAFETY: checked above: `x` holds every row the batch can name and
         // `y` every output row it can ask for.
         unsafe {
@@ -356,6 +363,81 @@ impl Kernels {
             )
         };
         Ok(())
+    }
+
+    /// Whether prompt passes with weights of type `ty` give every token the
+    /// bits of the GEMV, which they don't where they run on the matrix units.
+    pub fn exact_prompt(&self, ty: TensorType) -> bool {
+        #[cfg(not(metal_driver))]
+        {
+            self.matrix_kernel(ty).is_none()
+        }
+        #[cfg(metal_driver)]
+        {
+            let _ = ty;
+            true
+        }
+    }
+
+    /// The kernel on the matrix units for weights of type `ty`, where the
+    /// device has one.
+    #[cfg(not(metal_driver))]
+    fn matrix_kernel(&self, ty: TensorType) -> Option<&Rc<Kernel>> {
+        self.mm
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .map(|(_, kernel)| kernel)
+    }
+
+    /// Records a product on the matrix units: tiles of 64 rows by 64 of
+    /// the batch's `capacity` tokens.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::record_gemv`].
+    #[cfg(not(metal_driver))]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_matrix(
+        &self,
+        kernel: &Rc<Kernel>,
+        w: &DeviceMatrix,
+        x: &GemvInput,
+        y: &DeviceBuffer<f32>,
+        out: Out,
+        capacity: usize,
+        batch: &Batch,
+        commands: &mut Commands,
+    ) {
+        let block = block_len(w.ty).expect("matrix kernels take types with GEMV kernels");
+        // SAFETY: matches mm_*.wgsl, which takes gemv.wgsl's bindings and
+        // push constants; it reads the rows and writes the outputs of the
+        // tokens the batch selects, which the caller vouches for, and
+        // tiles past them return early.
+        unsafe {
+            commands.dispatch(
+                kernel,
+                &[
+                    w.data.allocation(),
+                    x.x.allocation(),
+                    x.qs.allocation(),
+                    x.ds.allocation(),
+                    y.allocation(),
+                    batch.device().allocation(),
+                ],
+                &[
+                    w.rows as u32,
+                    (w.cols / block) as u32,
+                    out.stride as u32,
+                    out.offset as u32,
+                    0,
+                ],
+                [
+                    w.rows.div_ceil(MATRIX_TILE) as u32,
+                    capacity.max(1).div_ceil(MATRIX_TILE) as u32,
+                    1,
+                ],
+            )
+        };
     }
 
     /// The kernel for weights of type `ty` and the rows one of its

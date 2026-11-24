@@ -76,6 +76,17 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   names its base images in full, so that Podman builds it without asking
   for a registry; the install guide shows Podman with the NVIDIA Container
   Toolkit's CDI devices.
+- Vulkan prompts on the matrix units of GPUs with cooperative f16 matrices
+  (`VK_KHR_cooperative_matrix`, such as AMD's RDNA3 and NVIDIA's RTX cards):
+  Q8_0, Q4_K, Q5_K and Q6_K products of prompt passes of up to 512 tokens
+  run as 16x16x16 f16 products into f32, three to four times as fast on long
+  prompts. As on CUDA,
+  a prompt's state differs slightly from the same tokens decoded one at a
+  time; where a prompt is cut changes no bit, and decoding and drafts stay
+  exact. Warm Start keeps such states apart, also by driver version,
+  receipts record them, and
+  `--off coopmat` runs prompts as before, as does a GPU whose memory has no
+  room for the larger buffers.
 
 ### Server
 

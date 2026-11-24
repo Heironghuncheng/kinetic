@@ -169,7 +169,11 @@ impl Runner for VulkanRunner<'_, '_> {
     }
 
     fn forward(&self, state: &mut VulkanState, tokens: &[u32]) -> Vec<f32> {
-        device(self.gpu.run(state, tokens, false)).logits
+        // a warm start runs only prompt tokens
+        self.gpu.set_prompt(state, true);
+        let out = self.gpu.run(state, tokens, false);
+        self.gpu.set_prompt(state, false);
+        device(out).logits
     }
 
     fn mark(&self, state: &mut VulkanState) {

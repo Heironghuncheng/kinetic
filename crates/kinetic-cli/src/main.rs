@@ -890,9 +890,14 @@ fn with_engine(
         true => Some(1),
         false => parallel,
     };
-    let ((mut backends, device), kind) = backend(&model, path, runtime, context, parallel)?;
+    let (placed, kind) = backend(&model, path, runtime, context, parallel)?;
+    let Placed {
+        mut backends,
+        device,
+        matrix,
+    } = placed;
     let first = backends.remove(0);
-    let receipts = receipt::receipts(path, kind, &device, runtime, context)?;
+    let receipts = receipt::receipts(path, kind, &device, matrix, runtime, context)?;
     let mut engine = Engine::new(name, file.source().header(), first, context)?
         .with_backends(backends)
         .with_receipts(receipts);
@@ -975,9 +980,14 @@ fn default_slots(model: &Model, context: usize) -> usize {
     })
 }
 
-/// Backends for one model on one device, one per request answered at once,
-/// and the description of the device.
-type Placed<'a> = (Vec<Box<dyn Backend + 'a>>, String);
+/// Backends for one model on one device, one per request answered at once.
+struct Placed<'a> {
+    backends: Vec<Box<dyn Backend + 'a>>,
+    /// The description of the device.
+    device: String,
+    /// Whether prompts run on the device's matrix units, in their own bits.
+    matrix: bool,
+}
 
 /// Backends on the device `runtime` asks for, `parallel` of them or as many
 /// as memory allows, the device's description and its kind.
@@ -1016,7 +1026,12 @@ fn backend<'a>(
     }
     let mut backends: Vec<Box<dyn Backend + 'a>> = vec![Box::new(cpu)];
     backends.extend((1..slots).map(|_| Box::new(new()) as Box<dyn Backend>));
-    Ok(((backends, CPU.into()), Device::Cpu))
+    let placed = Placed {
+        backends,
+        device: CPU.into(),
+        matrix: false,
+    };
+    Ok((placed, Device::Cpu))
 }
 
 #[cfg(feature = "cuda")]
@@ -1057,7 +1072,11 @@ fn cuda_backend<'a>(
         None => gpu,
     };
     slots.insert(0, Box::new(gpu));
-    Some(Ok((slots, name)))
+    Some(Ok(Placed {
+        backends: slots,
+        device: name,
+        matrix: false,
+    }))
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -1078,18 +1097,30 @@ fn vulkan_backend<'a>(
     runtime: &RuntimeArgs,
     context: usize,
 ) -> Option<std::result::Result<Placed<'a>, kinetic_models::LoadError>> {
+    let matrix = !runtime.is_off(Tech::Coopmat);
     Some(
-        kinetic_server::VulkanBackend::new(model, context).map(|gpu| {
+        kinetic_server::VulkanBackend::new(model, context, matrix).map(|gpu| {
             let gpu = match runtime.is_off(Tech::Rad1) {
                 true => gpu.without_drafts(),
                 false => gpu,
             };
-            let name = gpu.device().to_owned();
-            let gpu = match warm_cache(model, path, runtime, Some("vulkan")) {
+            if gpu.matrix_dropped() {
+                eprintln!(
+                    "kinetic: prompt passes on the matrix units are off: their buffers do \
+                     not fit in the GPU's memory"
+                );
+            }
+            let device = gpu.device().to_owned();
+            let matrix = gpu.matrix();
+            let gpu = match warm_cache(model, path, runtime, Some(&gpu.class())) {
                 Some(w) => gpu.with_warm(w),
                 None => gpu,
             };
-            (vec![Box::new(gpu) as Box<dyn Backend>], name)
+            Placed {
+                backends: vec![Box::new(gpu)],
+                device,
+                matrix,
+            }
         }),
     )
 }

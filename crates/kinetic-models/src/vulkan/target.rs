@@ -18,6 +18,10 @@ impl Target for VulkanModel<'_> {
         VulkanModel::n_vocab(self)
     }
 
+    fn set_prompt(&self, state: &mut VulkanState, prompt: bool) {
+        VulkanModel::set_prompt(self, state, prompt);
+    }
+
     fn score(
         &self,
         state: &mut VulkanState,

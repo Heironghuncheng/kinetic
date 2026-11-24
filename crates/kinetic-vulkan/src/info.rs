@@ -52,6 +52,10 @@ pub struct Features {
     pub storage_8bit: bool,
     /// Cooperative matrix operations (`VK_KHR_cooperative_matrix`).
     pub cooperative_matrix: bool,
+    /// What the f16 matrix kernels for prompt passes need: cooperative
+    /// 16x16x16 f16 products into f32 in a subgroup, f16 arithmetic, 16-bit
+    /// storage and the Vulkan memory model.
+    pub matrix_f16: bool,
     /// Descriptors pushed straight into command buffers (`VK_KHR_push_descriptor`).
     pub push_descriptor: bool,
     /// The compute queue can write timestamps.
@@ -70,6 +74,8 @@ pub struct DeviceInfo {
     pub driver_name: String,
     /// The driver's own version string.
     pub driver_info: String,
+    /// The driver's version number, encoded as its vendor chooses.
+    pub driver_version: u32,
     /// Size of the largest device-local memory heap.
     pub device_local_bytes: u64,
     /// The largest storage buffer a kernel can bind.
@@ -129,6 +135,7 @@ mod tests {
             api_version,
             driver_name: String::new(),
             driver_info: String::new(),
+            driver_version: 0,
             device_local_bytes: 0,
             max_buffer_bytes: 0,
             timestamp_period: 1.0,
