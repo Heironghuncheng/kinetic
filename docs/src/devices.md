@@ -128,8 +128,9 @@ turns grow slow; keep Warm Start on for chats, or turn the matrix units off.
 Warm Start keeps states made this way apart from the others and from other
 driver versions, receipts record them, and `--off coopmat` runs prompts with
 the decode kernels. Prompt passes keep buffers for 512 tokens in every
-state; when those don't fit in the GPU's memory, Kinetic says so and runs
-prompts with the decode kernels instead.
+state; when those don't fit in the GPU's memory, or one is larger than the
+GPU allows for a single buffer, Kinetic says so and runs prompts with the
+decode kernels instead.
 
 ## Dense models larger than the GPU
 

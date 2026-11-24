@@ -24,6 +24,9 @@ pub enum Error {
     Unsupported(TensorType),
     /// Sizes that do not fit together.
     Shape(String),
+    /// A buffer of `elements` larger than the device's limit of `limit`
+    /// bytes for one buffer.
+    TooLarge { elements: usize, limit: u64 },
 }
 
 /// `Result` with this crate's [`Error`].
@@ -40,6 +43,10 @@ impl fmt::Display for Error {
             Error::DeviceUnsupported(why) => write!(f, "device not supported: {why}"),
             Error::Unsupported(ty) => write!(f, "no Vulkan GEMV kernel for {ty}"),
             Error::Shape(msg) => f.write_str(msg),
+            Error::TooLarge { elements, limit } => write!(
+                f,
+                "buffer of {elements} elements exceeds the device's limit of {limit} bytes"
+            ),
         }
     }
 }
@@ -57,6 +64,12 @@ impl Error {
             ),
             _ => false,
         }
+    }
+
+    /// Whether the device has no room for what was asked: it ran out of
+    /// memory, or a buffer was larger than it allows.
+    pub fn does_not_fit(&self) -> bool {
+        self.out_of_memory() || matches!(self, Error::TooLarge { .. })
     }
 }
 

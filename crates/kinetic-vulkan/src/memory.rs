@@ -123,10 +123,9 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             .checked_mul(size_of::<T>())
             .map(|b| b as u64)
             .filter(|&b| b <= device.info().max_buffer_bytes)
-            .ok_or_else(|| {
-                Error::Shape(format!(
-                    "buffer of {len} elements exceeds the device's storage buffer limit"
-                ))
+            .ok_or(Error::TooLarge {
+                elements: len,
+                limit: device.info().max_buffer_bytes,
             })?;
         let alloc = Allocation::new(
             device,

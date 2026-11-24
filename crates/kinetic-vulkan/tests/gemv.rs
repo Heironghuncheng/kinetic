@@ -449,3 +449,17 @@ fn k_quant_matrix_passes_match_reference() {
         check_matrix_pass(ty, 128, 3 * 256, 160, 130, false);
     }
 }
+
+#[test]
+fn a_buffer_past_the_device_limit_does_not_fit() {
+    for gpu in gpus() {
+        let limit = gpu.device.info().max_buffer_bytes;
+        let len = (limit / 4 + 1) as usize;
+        match DeviceBuffer::<f32>::new(&gpu.device, len) {
+            Err(e @ Error::TooLarge { .. }) => assert!(e.does_not_fit(), "{e}"),
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("a buffer of {len} f32 past a limit of {limit} bytes"),
+        }
+        assert!(!Error::Shape("x".into()).does_not_fit());
+    }
+}

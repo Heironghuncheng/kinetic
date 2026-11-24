@@ -86,7 +86,7 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   exact. Warm Start keeps such states apart, also by driver version,
   receipts record them, and
   `--off coopmat` runs prompts as before, as does a GPU whose memory has no
-  room for the larger buffers.
+  room for the larger buffers or whose limit for one buffer is below them.
 
 ### Server
 
