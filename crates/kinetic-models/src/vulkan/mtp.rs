@@ -140,7 +140,7 @@ impl VulkanModel<'_> {
             &mut c,
         )?;
         mtp.layer
-            .record(&self.gpu, w, layer, &mtp.head_norm, self.eps, &mut c)?;
+            .record(&self.gpu, w, layer, &mtp.head_norm, self.eps, None, &mut c)?;
         c.download(w.h.values(), 0, &w.hidden, 0, w.hidden.len())?;
         c.finish()
     }

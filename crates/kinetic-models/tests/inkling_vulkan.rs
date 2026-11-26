@@ -45,7 +45,7 @@ fn with_device(experts: Option<usize>, f: impl FnOnce(&Model, &VulkanModel)) {
         eprintln!("skipped: no Vulkan device can run models");
         return;
     };
-    let gpu = VulkanModel::load_capped(&cpu, 64, &physical, experts).unwrap();
+    let gpu = VulkanModel::load_capped(&cpu, 64, &physical, true, experts).unwrap();
     f(&cpu, &gpu);
 }
 
@@ -85,6 +85,7 @@ fn every_layer_matches_the_cpu() {
 #[test]
 fn logits_match_the_cpu_in_any_batches() {
     with_device(None, |cpu, gpu| {
+        assert!(gpu.expert_report().is_none());
         let mut state = cpu.new_state();
         let want = cpu.run(&mut state, &TOKENS, true).logits;
         let mut first: Option<Vec<f32>> = None;
@@ -114,26 +115,25 @@ fn logits_match_the_cpu_in_any_batches() {
     });
 }
 
-/// Bytes of one expert of the tiny model: its gate and up rows, and its
-/// down rows, of f32.
-const EXPERT_BYTES: usize = 4 * (2 * 32 * 64 + 64 * 32);
+/// Bytes of the routed experts of one layer of the tiny model: four
+/// experts, each its gate and up rows and its down rows, of f32.
+const LAYER_EXPERT_BYTES: usize = 4 * 4 * (2 * 32 * 64 + 64 * 32);
 
-/// Experts offloaded to two slots per layer, which a token fills, give the
-/// bits of every expert resident, in any batches and after a rollback; a
-/// batch whose layers need more experts than that runs them in rounds.
+/// With room for the experts of two layers, the device keeps those of the
+/// looped layers, which a token runs once per pass, and the CPU runs the
+/// others: the logits match the CPU's, with the same bits in any batches
+/// and after a rollback.
 #[test]
-fn offloaded_experts_change_no_bit() {
-    let mut want = None;
-    with_device(None, |_, gpu| {
-        assert!(gpu.expert_report().is_none());
-        want = Some(logits(gpu, &[4]));
-    });
-    let Some(want) = want else { return };
-    with_device(Some(N_PHYS * 2 * EXPERT_BYTES), |_, gpu| {
-        let report = gpu.expert_report().expect("experts are offloaded");
-        assert_eq!((report.slots, report.experts), (2, 4));
-        for sizes in [&[4][..], &[1, 1, 1, 1], &[2, 2]] {
-            assert_eq!(logits(gpu, sizes), want, "batches {sizes:?}");
+fn looped_layers_keep_their_experts_on_the_device() {
+    with_device(Some(LOOP.len() * LAYER_EXPERT_BYTES), |cpu, gpu| {
+        let report = gpu.expert_report().expect("experts run on the CPU");
+        assert_eq!(report.device_layers, LOOP.len());
+        assert_eq!(report.bytes, LOOP.len() * LAYER_EXPERT_BYTES);
+        let want = cpu.run(&mut cpu.new_state(), &TOKENS, true).logits;
+        let first = logits(gpu, &[4]);
+        close("logits", &first, &want);
+        for sizes in [&[1, 1, 1, 1][..], &[2, 2]] {
+            assert_eq!(logits(gpu, sizes), first, "batches {sizes:?}");
         }
         let mut state = gpu.new_state().unwrap();
         let mut got = gpu.run(&mut state, &TOKENS[..1], true).unwrap().logits;
@@ -142,8 +142,8 @@ fn offloaded_experts_change_no_bit() {
         got.extend(&draft.logits[..gpu.n_vocab()]);
         gpu.rollback(&mut state, 1).unwrap();
         got.extend(gpu.run(&mut state, &TOKENS[2..], true).unwrap().logits);
-        assert_eq!(got, want, "after a rollback");
+        assert_eq!(got, first, "after a rollback");
         let stats = gpu.expert_report().unwrap().stats;
-        assert!(stats.loaded > 0 && stats.hits > 0, "{stats:?}");
+        assert!(stats.host_experts > 0, "{stats:?}");
     });
 }

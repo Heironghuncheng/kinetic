@@ -19,6 +19,7 @@
 mod attention;
 mod delta_net;
 mod ffn;
+mod forms;
 mod host;
 mod layer;
 mod moe;
@@ -42,8 +43,8 @@ use kinetic_vulkan::{
 };
 
 use crate::model::{embed_into, Mark};
-use crate::offload::forms::{expanded, on_vulkan, Form, HostWeights};
 use crate::{Forward, LoadError, Model};
+use forms::{expanded, on_vulkan, Form, HostWeights};
 use layer::{LayerState, VulkanLayer};
 use mtp::VulkanMtp;
 use network::VulkanNetwork;
@@ -141,7 +142,7 @@ pub struct VulkanModel<'m> {
     /// the physical layer a pass of its core runs.
     slots: Vec<usize>,
     network: Option<VulkanNetwork>,
-    /// Fills slots for the routed experts when they do not all fit.
+    /// Runs on the CPU the routed experts that do not fit on the device.
     offload: Option<VulkanOffload<'m>>,
     mtp: Option<VulkanMtp>,
     ropes: RopeTables,
@@ -175,7 +176,7 @@ pub struct VulkanState {
     all_logits: Graph,
     /// What a rollback runs, when a layer needs it.
     replay: Option<Graph>,
-    /// The passes' parts before their last layer of offloaded experts.
+    /// The pass cut before the last layer whose experts run on the CPU.
     segments: Option<Segments>,
     /// Host copies of recurrent layers at earlier lengths, for the warm
     /// cache; see [`Model::mark`].
@@ -239,15 +240,16 @@ impl<'m> VulkanModel<'m> {
         physical: &PhysicalDevice,
         matrix: bool,
     ) -> Result<VulkanModel<'m>, LoadError> {
-        VulkanModel::load_capped(model, context, physical, None)
+        VulkanModel::load_capped(model, context, physical, matrix, None)
     }
 
     /// [`VulkanModel::load_on`] with at most `experts` device bytes for the
-    /// routed experts of a model that runs them offloaded.
+    /// routed experts; the experts of layers past them run on the CPU.
     pub fn load_capped(
         model: &Model<'m>,
         context: usize,
         physical: &PhysicalDevice,
+        matrix: bool,
         experts: Option<usize>,
     ) -> Result<VulkanModel<'m>, LoadError> {
         if model.folded {
@@ -283,16 +285,14 @@ impl<'m> VulkanModel<'m> {
         let uploaded = slots.iter().max().map_or(0, |&s| s + 1);
         let mut layers = model.layers[..uploaded]
             .iter()
-            .map(|l| VulkanLayer::upload(&gpu, l, &mut ropes, network.is_none()))
+            .map(|l| VulkanLayer::upload(&gpu, l, &mut ropes, false))
             .collect::<Result<Vec<_>, _>>()?;
-        let offload = match &network {
-            Some(_) => {
-                // state_bytes counts f32; the device keeps its caches in f16
-                let elsewhere = model.output.data.len() + model.state_bytes(context) / 2;
-                offload::place(&gpu, model, &mut layers, elsewhere, experts)?
-            }
-            None => None,
-        };
+        // how many times a token runs each layer
+        let mut runs = vec![0; layers.len()];
+        slots.iter().for_each(|&l| runs[l] += 1);
+        // state_bytes counts f32; the device keeps its caches in f16
+        let elsewhere = model.output.data.len() + model.state_bytes(context) / 2;
+        let offload = offload::place(&gpu, model, &mut layers, &runs, elsewhere, experts)?;
         let mtp = model
             .mtp
             .as_ref()
@@ -500,7 +500,7 @@ impl<'m> VulkanModel<'m> {
                 cuts,
                 &mut c,
             )?,
-            None => self.record_layers(w, states, &mut c)?,
+            None => self.record_layers(w, states, cuts, &mut c)?,
         }
         let vocab = self.n_vocab();
         let out = Out {
@@ -526,11 +526,13 @@ impl<'m> VulkanModel<'m> {
     }
 
     /// Records the layers of a model on one residual stream, from the
-    /// embeddings in `w.x` to the input of the head in `w.h`.
+    /// embeddings in `w.x` to the input of the head in `w.h`, cut where
+    /// `cuts` says.
     fn record_layers(
         &self,
         w: &Work,
         states: &[LayerState],
+        mut cuts: Option<&mut Segments>,
         c: &mut Commands,
     ) -> kinetic_vulkan::Result<()> {
         fn norm(l: &VulkanLayer) -> &DeviceBuffer<f32> {
@@ -549,7 +551,8 @@ impl<'m> VulkanModel<'m> {
         )?;
         for (i, (layer, state)) in self.layers.iter().zip(states).enumerate() {
             let next = self.layers.get(i + 1).map_or(&self.output_norm, norm);
-            layer.record(&self.gpu, w, state, next, self.eps, c)?;
+            let cut = cuts.as_deref_mut().map(|s| (s, i));
+            layer.record(&self.gpu, w, state, next, self.eps, cut, c)?;
         }
         Ok(())
     }

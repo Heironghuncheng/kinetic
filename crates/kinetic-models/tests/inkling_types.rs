@@ -1,9 +1,10 @@
 //! Every weight type a published Inkling 2 file holds, on a Vulkan GPU
 //! against the CPU: a tiny looped model whose experts and query, key and
 //! value projections are in that type, in ggml-org's and in Unsloth's
-//! layout, with its experts offloaded to two slots per layer. Types with a
-//! kernel run on the device; the others run from the host, which must give
-//! the same answers. The next type is one more row of [`TYPES`]. Passes
+//! layout, with room on the device for the experts of half its layers.
+//! Types with a kernel run on the device, the experts of the other layers
+//! on the CPU; types without one run from the host. All must give the same
+//! answers. The next type is one more row of [`TYPES`]. Passes
 //! with a message when no device can run models.
 //!
 //! cargo test --release -p kinetic-models --features vulkan --test inkling_types
@@ -53,15 +54,15 @@ const TOKENS: [u32; 4] = [3, 7, 1, 9];
 const TOLERANCE: f32 = 0.25;
 const CLEAR: f32 = 0.1;
 
-/// Logits after every token: the CPU's, and the device's with experts in
-/// two slots per layer.
+/// Logits after every token: the CPU's, and the device's with room for
+/// the experts of half the layers.
 fn run(file: &Memory, ty: TensorType) -> Option<(Vec<f32>, Vec<f32>)> {
     let cpu = kinetic_models::load(file).unwrap_or_else(|e| panic!("{ty}: {e}"));
     let physical = devices().ok()?.into_iter().next()?;
     let (len, bytes) = (ty.block_len(), ty.block_bytes());
     let (d, ff) = (TYPED.d as usize, TYPED.n_ff as usize);
-    let expert = (2 * ff * d + d * ff) / len * bytes;
-    let gpu = VulkanModel::load_capped(&cpu, 64, &physical, Some(N_PHYS * 2 * expert))
+    let layer = 4 * (2 * ff * d + d * ff) / len * bytes;
+    let gpu = VulkanModel::load_capped(&cpu, 64, &physical, true, Some(N_PHYS / 2 * layer))
         .unwrap_or_else(|e| panic!("{ty}: {e}"));
     let want = cpu.run(&mut cpu.new_state(), &TOKENS, true).logits;
     let mut state = gpu.new_state().unwrap();

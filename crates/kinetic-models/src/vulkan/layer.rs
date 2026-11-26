@@ -6,6 +6,7 @@ use super::attention::VulkanAttention;
 use super::delta_net::VulkanDeltaNet;
 use super::ffn::VulkanFfn;
 use super::moe::VulkanMoe;
+use super::offload::Segments;
 use super::relative::{RelativeState, VulkanRelative};
 use super::rope::RopeTables;
 use super::short_conv::VulkanShortConv;
@@ -198,7 +199,9 @@ impl VulkanLayer {
     /// Records the layer over the batch, whose input `w.h` holds the stream
     /// `w.x` after this layer's input norm. Leaves `w.h` holding `x` after
     /// the layer, normalized by `next`, the following layer's input norm or
-    /// the output norm.
+    /// the output norm. A pass with `cut` is cut after the routing of
+    /// experts the device does not hold.
+    #[allow(clippy::too_many_arguments)]
     pub fn record<'a>(
         &'a self,
         gpu: &Gpu,
@@ -206,6 +209,7 @@ impl VulkanLayer {
         state: &LayerState,
         next: &DeviceBuffer<f32>,
         eps: f32,
+        cut: Option<(&mut Segments, usize)>,
         c: &mut Commands,
     ) -> R {
         match (&self.mixer, state) {
@@ -227,7 +231,7 @@ impl VulkanLayer {
             ffn.record(gpu, w, c)?;
         }
         if let Some(moe) = &self.experts {
-            moe.record(gpu, w, self.ffn.is_some(), c)?;
+            moe.record(gpu, w, self.ffn.is_some(), cut, c)?;
         }
         let fed = add(self.ffn_out_norm.as_ref());
         k.norm(&w.batch, &w.x, Some(fed), next, eps, &w.h, c)

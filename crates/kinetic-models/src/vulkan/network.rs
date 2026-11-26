@@ -402,14 +402,7 @@ impl Ctx<'_> {
         }
         k.norm(&w.batch, h, None, self.layer.ffn_norm(), eps, &w.h, c)?;
         let moe = self.layer.experts().expect("network layers have experts");
-        match cuts {
-            None => moe.record(gpu, w, false, c)?,
-            Some(cuts) => {
-                moe.record_route(gpu, w, c)?;
-                cuts.cut(gpu, w, self.index, c)?;
-                moe.record_mix(gpu, w, false, c)?;
-            }
-        }
+        moe.record(gpu, w, false, cuts.map(|s| (s, self.index)), c)?;
         attn.record_conv(gpu, w, 3, self.state, cur, true, c)?;
         Ok(blocks)
     }

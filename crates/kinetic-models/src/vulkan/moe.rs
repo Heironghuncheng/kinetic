@@ -2,14 +2,15 @@ use kinetic_quant::{Matrix, TensorType};
 use kinetic_vulkan::{Commands, DeviceBuffer, DeviceMatrix, Out, Rows, Shared};
 
 use super::layer::R;
+use super::offload::Segments;
 use super::work::Work;
 use super::Gpu;
-use crate::blocks::{Experts, Gating, Moe};
+use crate::blocks::{Experts, Gating, Glu, Moe};
 use crate::LoadError;
 
 /// The routed experts of a layer on the device; see [`Moe`]. Their
-/// matrices are resident, or for a model larger than the device held in
-/// slots that its offload fills.
+/// matrices are resident, or for a model larger than the device left
+/// where they are for the CPU to run.
 pub(super) struct VulkanMoe {
     router: DeviceMatrix,
     gating: kinetic_vulkan::Gating,
@@ -25,7 +26,7 @@ pub(super) struct VulkanMoe {
 }
 
 /// Expert matrices of equal shape one after another, `count` of each.
-pub(super) struct ExpertWeights {
+struct ExpertWeights {
     /// Per expert, multipliers of the gate and up products and of the
     /// down product, if the file has them.
     pub scales: [Option<DeviceBuffer<f32>>; 2],
@@ -35,25 +36,6 @@ pub(super) struct ExpertWeights {
     pub gate_up: Vec<(DeviceMatrix, usize)>,
     pub down: DeviceMatrix,
     pub count: usize,
-}
-
-/// [`ExpertWeights`] wherever they are held.
-pub(super) struct ExpertView<'a> {
-    pub scales: [Option<&'a DeviceBuffer<f32>>; 2],
-    pub gate_up: Vec<(&'a DeviceMatrix, usize)>,
-    pub down: &'a DeviceMatrix,
-    pub count: usize,
-}
-
-impl ExpertWeights {
-    fn view(&self) -> ExpertView<'_> {
-        ExpertView {
-            scales: [self.scales[0].as_ref(), self.scales[1].as_ref()],
-            gate_up: self.gate_up.iter().map(|(m, at)| (m, *at)).collect(),
-            down: &self.down,
-            count: self.count,
-        }
-    }
 }
 
 /// The experts of `m` the products run: the gate and up experts, each with
@@ -116,6 +98,11 @@ impl VulkanMoe {
             glu: match m.glu {
                 Glu::Silu => kinetic_vulkan::Glu::Silu,
                 Glu::Situ { beta, linear } => kinetic_vulkan::Glu::Situ { beta, linear },
+                Glu::Gelu => {
+                    return Err(LoadError(
+                        "experts with a GELU gate do not run on Vulkan yet".into(),
+                    ))
+                }
             },
             n_ff: m.gate.rows,
             weights: None,
@@ -146,6 +133,11 @@ impl VulkanMoe {
         Ok(())
     }
 
+    /// Frees the experts [`VulkanMoe::upload_experts`] uploaded.
+    pub fn drop_experts(&mut self) {
+        self.weights = None;
+    }
+
     pub fn n_experts(&self) -> usize {
         self.router.rows()
     }
@@ -164,16 +156,27 @@ impl VulkanMoe {
     }
 
     /// Reads `w.h` and leaves the layer's output in `w.y`, which holds the
-    /// shared expert's output if `shared`. The experts must be resident.
-    pub fn record(&self, gpu: &Gpu, w: &Work, shared: bool, c: &mut Commands) -> R {
-        let weights = self.weights.as_ref().expect("experts are on the device");
+    /// shared expert's output if `shared`. Experts not on the device run
+    /// where `cut` says: the pass is cut after the routing of `layer`.
+    pub fn record(
+        &self,
+        gpu: &Gpu,
+        w: &Work,
+        shared: bool,
+        cut: Option<(&mut Segments, usize)>,
+        c: &mut Commands,
+    ) -> R {
         self.record_route(gpu, w, c)?;
-        self.record_products(gpu, w, &weights.view(), c)?;
+        match (&self.weights, cut) {
+            (Some(weights), _) => self.record_products(gpu, w, weights, c)?,
+            (None, Some((cuts, layer))) => cuts.cut(gpu, w, layer, c)?,
+            (None, None) => unreachable!("a pass over experts off the device is cut"),
+        }
         self.record_mix(gpu, w, shared, c)
     }
 
     /// Records the routing of `w.h` into the picks of `w`.
-    pub fn record_route(&self, gpu: &Gpu, w: &Work, c: &mut Commands) -> R {
+    fn record_route(&self, gpu: &Gpu, w: &Work, c: &mut Commands) -> R {
         let k = &gpu.kernels;
         let e = w.experts.as_ref().expect("work has expert buffers");
         let n_exp = self.n_experts();
@@ -213,26 +216,19 @@ impl VulkanMoe {
         )
     }
 
-    /// Records the products of the picks of `w`, which name experts of
-    /// `weights`, into the rows of each pick's output; picks of experts
-    /// past `weights` are left alone.
-    pub fn record_products(
-        &self,
-        gpu: &Gpu,
-        w: &Work,
-        weights: &ExpertView,
-        c: &mut Commands,
-    ) -> R {
+    /// Records the products of the picks of `w` into the rows of each
+    /// pick's output.
+    fn record_products(&self, gpu: &Gpu, w: &Work, weights: &ExpertWeights, c: &mut Commands) -> R {
         let k = &gpu.kernels;
         let (n_ff, used, d, count) = (self.n_ff, self.used, w.d, weights.count);
         let e = w.experts.as_ref().expect("work has expert buffers");
         c.independent(|c| {
-            for &(m, offset) in &weights.gate_up {
+            for (m, offset) in &weights.gate_up {
                 let out = Out {
                     stride: 2 * n_ff,
-                    offset,
+                    offset: *offset,
                 };
-                let s = weights.scales[0];
+                let s = weights.scales[0].as_ref();
                 k.gemv_experts(
                     m, count, used, &e.picks, &w.h, used, s, &e.gu, out, &w.batch, c,
                 )?;
@@ -246,13 +242,13 @@ impl VulkanMoe {
             offset: 0,
         };
         k.gemv_experts(
-            weights.down,
+            &weights.down,
             count,
             used,
             &e.picks,
             act,
             1,
-            weights.scales[1],
+            weights.scales[1].as_ref(),
             &e.routed,
             out,
             &w.batch,
@@ -262,7 +258,7 @@ impl VulkanMoe {
 
     /// Records the mix of the picks' outputs into `w.y`, which holds the
     /// shared expert's output if `shared`.
-    pub fn record_mix(&self, gpu: &Gpu, w: &Work, shared: bool, c: &mut Commands) -> R {
+    fn record_mix(&self, gpu: &Gpu, w: &Work, shared: bool, c: &mut Commands) -> R {
         let e = w.experts.as_ref().expect("work has expert buffers");
         let shared = match (shared, &self.shared_gate) {
             (false, _) => Shared::None,

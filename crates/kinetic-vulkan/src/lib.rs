@@ -58,7 +58,6 @@ mod layout;
 #[cfg(not(metal_driver))]
 mod matrix_tile;
 mod norm;
-mod pool;
 mod relative;
 mod short_conv;
 
@@ -118,6 +117,5 @@ pub use kernels::Kernels;
 pub use memory::{DeviceBuffer, DeviceCopy, HostBuffer};
 pub use norm::Residual;
 pub use physical::PhysicalDevice;
-pub use pool::ExpertSlots;
 pub use relative::RelativeShape;
 pub use short_conv::{ConvRing, Strided};

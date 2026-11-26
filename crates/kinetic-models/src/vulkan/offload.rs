@@ -1,276 +1,174 @@
-//! Routed experts of a model larger than the device.
+//! Flywheel on Vulkan: where the routed experts of a model larger than the
+//! device run.
 //!
-//! Everything else lives on the device; what device memory is left holds
-//! slots for each layer's experts. A pass stops after each layer's routing,
-//! the picks come back, and [`assign`] says which slot each pick runs from
-//! and which experts to copy there first, least recently used slots taken
-//! first; a pass needing more experts than a layer's slots runs that layer
-//! in rounds. The products run from the slots, then the pass goes on. Where
-//! an expert sits never changes the bits of its product.
-//!
-//! Experts of a type the device has no kernel for run on the host instead,
-//! on the CPU's kernels: the layer's input comes back with its picks, and
-//! the outputs go to the device, which mixes them.
+//! Everything else lives on the device. The layers whose experts run most
+//! often per token keep every expert there (a layer the loop of its network
+//! repeats runs once per pass), as many layers as fit beside the rest of
+//! the model, one sequence's state and a reserve. The experts of the other
+//! layers run on the CPU where they are, in the mapped file, and nothing is
+//! copied to the device: a pass stops after such a layer's routing, the
+//! CPU runs the picks on the layer's input, and the device mixes their
+//! outputs. Experts of a type the device has no kernel for run there too.
 
 use std::cell::RefCell;
+use std::cmp::Reverse;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use kinetic_vulkan::{Commands, DeviceBuffer, ExpertSlots, Graph, HostBuffer};
+use kinetic_vulkan::{Commands, Graph, HostBuffer};
 
+use super::forms::{on_vulkan, Form};
 use super::layer::{VulkanLayer, R};
-use super::moe::{sources, ExpertView};
+use super::moe::sources;
 use super::work::Work;
-use super::{vulkan_error, Gpu, VulkanModel, VulkanState};
-use crate::blocks::{Experts, Job, Moe};
-use crate::offload::assign::assign;
-use crate::offload::cache::ExpertCache;
-use crate::offload::forms::{on_vulkan, Form};
-use crate::offload::plan;
+use super::{Gpu, VulkanModel, VulkanState};
+use crate::blocks::{Job, Moe};
+use crate::offload::plan::DEVICE_RESERVE;
 use crate::offload::stats::Stats;
 use crate::{LoadError, Model};
-
-/// Experts staged in host memory per copy to the device.
-const STAGED: usize = 16;
-
-/// The slots of one layer and where its experts come from.
-struct LayerSlots<'m> {
-    /// Slots of the gate and up products, each with where it writes in a
-    /// row of both, then of the down product.
-    gate_up: Vec<(ExpertSlots, usize)>,
-    down: ExpertSlots,
-    sources: (Vec<(Experts<'m>, usize)>, Experts<'m>),
-    /// Per slot, the scale of the gate and up products and of the down
-    /// product of the expert it holds, and each expert's scales, when the
-    /// file has them.
-    scales: [Option<(DeviceBuffer<f32>, Vec<f32>)>; 2],
-}
-
-impl LayerSlots<'_> {
-    /// Bytes of one of this layer's experts.
-    fn bytes(&self) -> usize {
-        self.parts().map(|(s, _)| s.expert_bytes()).sum()
-    }
-
-    fn view(&self) -> ExpertView<'_> {
-        ExpertView {
-            gate_up: self
-                .gate_up
-                .iter()
-                .map(|(s, at)| (s.matrix(), *at))
-                .collect(),
-            down: self.down.matrix(),
-            count: self.down.slots(),
-            scales: self.scales.each_ref().map(|s| s.as_ref().map(|(t, _)| t)),
-        }
-    }
-
-    fn parts(&self) -> impl Iterator<Item = (&ExpertSlots, &Experts<'_>)> {
-        let gate_up = self.gate_up.iter().zip(&self.sources.0);
-        gate_up
-            .map(|((s, _), (e, _))| (s, e))
-            .chain([(&self.down, &self.sources.1)])
-    }
-}
 
 /// Seconds spent per part of the passes, since load or the last reset.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Times {
-    /// Running the layers up to each routing, and reading the picks back.
+    /// Running the layers up to each routing on the CPU's experts, and
+    /// reading the picks back.
     pub layers: Duration,
-    /// Writing experts into host staging.
-    pub staging: Duration,
-    /// Copying them to the device.
-    pub copies: Duration,
-    /// Running the experts.
-    pub experts: Duration,
-    /// Running experts on the host, with their inputs and outputs.
+    /// Running experts on the CPU, with their inputs and outputs.
     pub host: Duration,
 }
 
 pub(super) struct VulkanOffload<'m> {
-    /// Per physical layer, if it has routed experts the device runs.
-    layers: Vec<Option<LayerSlots<'m>>>,
-    /// Per physical layer, if it has routed experts the host runs.
+    /// Per physical layer, if the CPU runs its experts.
     host: Vec<Option<Moe<'m>>>,
-    /// Experts of a layer.
-    experts: usize,
-    cache: RefCell<ExpertCache>,
+    /// Layers with routed experts, and the device bytes of those it holds.
+    layers: usize,
+    device_bytes: usize,
     stats: RefCell<Stats>,
     times: RefCell<Times>,
-    staging: RefCell<HostBuffer<u8>>,
-    /// The scales of the experts staged.
-    scales: RefCell<HostBuffer<f32>>,
 }
 
-/// Plans the routed experts of `model`, whose other weights `layers` hold:
-/// every expert on the device if they fit in what it has left after
-/// `elsewhere` bytes, and at most `cap` bytes; else slots for as many as
-/// fit, and the offload that fills them.
+/// Device memory a plan leaves free on a device of `total` bytes. The
+/// desktop and other programs take and return memory while a model runs,
+/// and a driver out of dedicated memory spills to system memory, where the
+/// model runs at a fraction of its speed.
+fn reserve(total: usize) -> usize {
+    DEVICE_RESERVE.max(total / 20)
+}
+
+/// Bytes of every expert of `m`.
+fn bytes(m: &Moe) -> usize {
+    let (gate_up, down) = sources(m);
+    let one = gate_up.iter().map(|(e, _)| e.expert_bytes()).sum::<usize>() + down.expert_bytes();
+    m.n_experts() * one
+}
+
+/// Whether the device has kernels for every expert matrix of `m`.
+fn kernels(m: &Moe) -> bool {
+    let (gate_up, down) = sources(m);
+    let mut types = gate_up.iter().map(|(e, _)| e.ty).chain([down.ty]);
+    types.all(|ty| on_vulkan(ty) == Form::Kernel)
+}
+
+/// Uploads the routed experts of `model`'s layers, of which a token runs
+/// physical layer `l` `runs[l]` times: every expert if they fit in what
+/// the device has left after `elsewhere` bytes, and in at most `cap`
+/// bytes; else whole layers, those that run most first, and the offload
+/// that runs the rest on the CPU.
 pub(super) fn place<'m>(
     gpu: &Gpu,
     model: &Model<'m>,
     layers: &mut [VulkanLayer],
+    runs: &[usize],
     elsewhere: usize,
     cap: Option<usize>,
 ) -> Result<Option<VulkanOffload<'m>>, LoadError> {
-    let all: Vec<_> = model.layers[..layers.len()]
+    let moes: Vec<Option<&Moe<'m>>> = model.layers[..layers.len()]
         .iter()
         .map(|l| l.experts.as_ref())
         .collect();
-    let kernel = |m: &&Moe| {
-        let (gate_up, down) = sources(m);
-        let mut types = gate_up.iter().map(|(e, _)| e.ty).chain([down.ty]);
-        types.all(|ty| on_vulkan(ty) == Form::Kernel)
-    };
-    // experts of types without kernels run on the host
-    let moes: Vec<_> = all.iter().map(|m| m.filter(kernel)).collect();
-    let host: Vec<Option<Moe<'m>>> = all
-        .iter()
-        .map(|m| m.filter(|m| !kernel(m)).cloned())
-        .collect();
-    let expert_bytes = |m: &crate::blocks::Moe| {
-        let (gate_up, down) = sources(m);
-        gate_up.iter().map(|(e, _)| e.expert_bytes()).sum::<usize>() + down.expert_bytes()
-    };
-    let total: usize = moes
-        .iter()
-        .flatten()
-        .map(|m| m.n_experts() * expert_bytes(m))
-        .sum();
+    if moes.iter().all(Option::is_none) {
+        return Ok(None);
+    }
     // what the driver says is free now, less what is still to come and
     // what the plan leaves free
     let card = gpu.device.info().device_local_bytes as usize;
-    let reserve = plan::reserve(card, None);
     let held: usize = layers.iter().map(VulkanLayer::size_bytes).sum();
-    let measured = gpu.device.free_bytes().map(|f| f as usize);
-    let free = measured
-        .unwrap_or(card.saturating_sub(held))
-        .saturating_sub(elsewhere + reserve);
-    let budget = cap.map_or(free, |c| c.min(free));
-    if total <= budget && host.iter().all(Option::is_none) {
-        for (layer, m) in layers.iter_mut().zip(&moes) {
-            if let (Some(vm), Some(m)) = (layer.experts_mut(), m) {
-                vm.upload_experts(gpu, m)?;
-            }
+    let need = elsewhere + reserve(card);
+    let free = gpu.device.free_bytes().map(|f| f as usize);
+    let free = free.unwrap_or(card.saturating_sub(held));
+    let mut budget = free.saturating_sub(need).min(cap.unwrap_or(usize::MAX));
+
+    let mut order: Vec<usize> = (0..moes.len())
+        .filter(|&l| moes[l].is_some_and(kernels))
+        .collect();
+    order.sort_by_key(|&l| Reverse(runs[l]));
+    let mut resident = Vec::new();
+    for l in order {
+        let m = moes[l].expect("a layer of experts");
+        if bytes(m) <= budget {
+            budget -= bytes(m);
+            let moe = layers[l].experts_mut().expect("uploaded routing");
+            moe.upload_experts(gpu, m)?;
+            resident.push(l);
         }
+    }
+    // others may have taken memory meanwhile: keep the reserve free
+    while let Some(&l) = resident.last() {
+        let left = gpu.device.free_bytes().map_or(usize::MAX, |f| f as usize);
+        if left >= need {
+            break;
+        }
+        layers[l].experts_mut().expect("resident").drop_experts();
+        resident.pop();
+    }
+    let with_experts = moes.iter().flatten().count();
+    if resident.len() == with_experts {
         return Ok(None);
     }
-    // a slot in every layer, each the size of that layer's experts
-    let per_slot: usize = moes.iter().flatten().map(|m| expert_bytes(m)).sum();
-    // staging holds the largest experts
-    let slot_bytes = moes
+    let host = moes
         .iter()
-        .flatten()
-        .map(|m| expert_bytes(m))
-        .max()
-        .unwrap_or(0);
-    let most = moes
-        .iter()
-        .flatten()
-        .map(|m| m.n_experts())
-        .max()
-        .unwrap_or(0);
-    let mut slots = (budget / per_slot.max(1)).min(most);
-    let fewest = moes.iter().flatten().map(|m| m.n_used).max().unwrap_or(0);
-    let device = &gpu.device;
-    let allocate = |slots: usize| -> Result<Vec<Option<LayerSlots<'m>>>, LoadError> {
-        moes.iter()
-            .map(|m| layer_slots(gpu, m.as_ref(), slots))
-            .collect()
-    };
-    let planned = loop {
-        if slots < fewest {
-            return Err(LoadError(format!(
-                "the device has room for {slots} experts per layer and a token needs {fewest}"
-            )));
-        }
-        let planned = allocate(slots)?;
-        // others may have taken memory meanwhile: keep the reserve free
-        let left = gpu.device.free_bytes().map_or(usize::MAX, |f| f as usize);
-        let need = elsewhere + reserve;
-        if left >= need {
-            break planned;
-        }
-        drop(planned);
-        let short = (need - left).div_ceil(per_slot.max(1));
-        slots = match slots > fewest {
-            true => slots.saturating_sub(short).max(fewest),
-            false => 0,
-        };
-    };
-    let counts: Vec<usize> = planned
-        .iter()
-        .map(|p| if p.is_some() { slots } else { 0 })
+        .enumerate()
+        .map(|(l, m)| m.filter(|_| !resident.contains(&l)).cloned())
         .collect();
     Ok(Some(VulkanOffload {
-        cache: RefCell::new(ExpertCache::new(&counts, (0..counts.len()).collect(), most)),
-        layers: planned,
         host,
-        experts: most,
+        layers: with_experts,
+        device_bytes: resident.iter().flat_map(|&l| moes[l]).map(bytes).sum(),
         stats: RefCell::default(),
         times: RefCell::default(),
-        staging: RefCell::new(HostBuffer::new(device, STAGED * slot_bytes).map_err(vulkan_error)?),
-        scales: RefCell::new(HostBuffer::new(device, 2 * STAGED).map_err(vulkan_error)?),
     }))
 }
 
-/// The slots for the experts `m` of one layer, if it has experts the
-/// device runs.
-fn layer_slots<'m>(
-    gpu: &Gpu,
-    m: Option<&&Moe<'m>>,
-    slots: usize,
-) -> Result<Option<LayerSlots<'m>>, LoadError> {
-    let device = &gpu.device;
-    Ok(match m {
-        Some(m) => {
-            let (gate_up, down) = sources(m);
-            let pool = |e: &Experts| ExpertSlots::new(device, e.ty, slots, e.rows, e.cols);
-            let table = |s: &Option<Vec<f32>>| -> Result<_, LoadError> {
-                let Some(s) = s else { return Ok(None) };
-                Ok(Some((gpu.vector(&vec![0.0; slots])?, s.clone())))
-            };
-            Some(LayerSlots {
-                scales: [table(&m.scales[0])?, table(&m.scales[2])?],
-                gate_up: gate_up
-                    .iter()
-                    .map(|(e, at)| Ok((pool(e)?, *at)))
-                    .collect::<kinetic_vulkan::Result<_>>()
-                    .map_err(vulkan_error)?,
-                down: pool(&down).map_err(vulkan_error)?,
-                sources: (gate_up, down),
-            })
-        }
-        None => None,
-    })
-}
-
-/// A pass cut after each layer's routing: the command lists up to each
-/// cut, the physical layer each cut belongs to, and each layer's products.
+/// A pass cut after the routing of each layer whose experts run on the
+/// CPU: the command lists up to each cut and the physical layer of each.
 pub(super) struct Segments {
     before: Vec<Graph>,
     layers: Vec<usize>,
-    products: Vec<Option<Graph>>,
-    /// The picks each cut reads back, and the slots it runs them from.
+    /// The picks and the input each cut reads back, and the outputs of
+    /// their experts.
     picks: HostBuffer<u32>,
-    slots: HostBuffer<u32>,
-    /// For layers whose experts run on the host: which, and their inputs
-    /// and outputs.
-    host: Vec<bool>,
     inputs: HostBuffer<f32>,
     outputs: HostBuffer<f32>,
 }
 
 impl Segments {
-    /// Ends the commands `c` records with the readback of the picks of
-    /// physical layer `layer`, keeps them, and leaves `c` empty.
+    fn new(gpu: &Gpu, w: &Work) -> kinetic_vulkan::Result<Segments> {
+        let e = w.experts.as_ref().expect("work has expert buffers");
+        Ok(Segments {
+            before: Vec::new(),
+            layers: Vec::new(),
+            picks: HostBuffer::new(&gpu.device, e.picks.len())?,
+            inputs: HostBuffer::new(&gpu.device, w.h.len())?,
+            outputs: HostBuffer::new(&gpu.device, e.routed.len())?,
+        })
+    }
+
+    /// Ends the commands `c` records with the readback of the picks and
+    /// input of physical layer `layer`, keeps them, and leaves `c` empty.
     pub fn cut(&mut self, gpu: &Gpu, w: &Work, layer: usize, c: &mut Commands) -> R {
         let e = w.experts.as_ref().expect("work has expert buffers");
         c.download(&e.picks, 0, &self.picks, 0, self.picks.len())?;
-        if self.host[layer] {
-            c.download(w.h.values(), 0, &self.inputs, 0, self.inputs.len())?;
-        }
+        c.download(w.h.values(), 0, &self.inputs, 0, self.inputs.len())?;
         let done = std::mem::replace(c, Commands::new(&gpu.device)?);
         self.before.push(done.finish()?);
         self.layers.push(layer);
@@ -279,40 +177,8 @@ impl Segments {
 }
 
 impl VulkanOffload<'_> {
-    /// The command lists of a pass over `w` before the network records it.
-    pub fn segments(
-        &self,
-        gpu: &Gpu,
-        layers: &[VulkanLayer],
-        w: &Work,
-    ) -> kinetic_vulkan::Result<Segments> {
-        let e = w.experts.as_ref().expect("work has expert buffers");
-        let products = layers
-            .iter()
-            .zip(&self.layers)
-            .map(|(layer, slots)| {
-                let (Some(slots), Some(moe)) = (slots, layer.experts()) else {
-                    return Ok(None);
-                };
-                let mut c = Commands::new(&gpu.device)?;
-                moe.record_products(gpu, w, &slots.view(), &mut c)?;
-                c.finish().map(Some)
-            })
-            .collect::<kinetic_vulkan::Result<_>>()?;
-        Ok(Segments {
-            before: Vec::new(),
-            layers: Vec::new(),
-            products,
-            picks: HostBuffer::new(&gpu.device, e.picks.len())?,
-            slots: HostBuffer::new(&gpu.device, e.picks.len())?,
-            host: self.host.iter().map(Option::is_some).collect(),
-            inputs: HostBuffer::new(&gpu.device, w.h.len())?,
-            outputs: HostBuffer::new(&gpu.device, e.routed.len())?,
-        })
-    }
-
     /// Runs the part of a pass of `n` tokens before its last cut: each
-    /// segment, then the experts of its layer from their slots.
+    /// segment, then the experts of its layer on the CPU.
     pub fn run(
         &self,
         gpu: &Gpu,
@@ -323,166 +189,63 @@ impl VulkanOffload<'_> {
     ) -> R {
         let e = w.experts.as_ref().expect("work has expert buffers");
         let mut times = self.times.borrow_mut();
-        self.stats.borrow_mut().tokens += n as u64;
+        let mut stats = self.stats.borrow_mut();
+        stats.tokens += n as u64;
         for k in 0..s.before.len() {
             let start = Instant::now();
             s.before[k].launch()?;
-            times.layers += start.elapsed();
+            let launched = Instant::now();
+            times.layers += launched - start;
             let layer = s.layers[k];
             let used = layers[layer].experts().expect("a layer of experts").used;
-            let jobs = n * used;
-            let experts: Vec<u32> = s.picks.as_slice()[..2 * jobs]
+            let moe = self.host[layer].as_ref().expect("experts the CPU runs");
+            let jobs: Vec<Job> = s.picks.as_slice()[..2 * n * used]
                 .iter()
                 .step_by(2)
-                .copied()
+                .enumerate()
+                .map(|(j, &expert)| Job {
+                    row: (j / used) as u32,
+                    expert,
+                })
                 .collect();
-            if let Some(moe) = &self.host[layer] {
-                self.run_on_host(gpu, moe, s, w, n, &experts, &mut times)?;
-                continue;
-            }
-            let slots = self.layers[layer]
-                .as_ref()
-                .expect("slots of a layer of experts");
-            let rounds = assign(
-                &mut self.cache.borrow_mut(),
-                layer,
-                &experts,
-                slots.bytes() as u64,
-                &mut self.stats.borrow_mut(),
-            );
-            for round in rounds {
-                for chunk in round.copies.chunks(STAGED) {
-                    self.copy(gpu, slots, chunk, &mut times)?;
-                }
-                let picks = s.picks.as_slice()[..2 * jobs].to_vec();
-                for (j, (dst, src)) in s
-                    .slots
-                    .as_mut_slice()
-                    .chunks_exact_mut(2)
-                    .zip(picks.chunks_exact(2))
-                    .take(jobs)
-                    .enumerate()
-                {
-                    dst[0] = round.slots[j];
-                    dst[1] = src[1];
-                }
-                let start = Instant::now();
-                let mut c = Commands::new(&gpu.device)?;
-                c.upload(&s.slots, 0, &e.picks, 0, 2 * jobs)?;
-                c.submit()?;
-                s.products[layer]
-                    .as_ref()
-                    .expect("products of a layer of experts")
-                    .launch()?;
-                times.experts += start.elapsed();
-            }
+            let out = moe.run_experts(&s.inputs.as_slice()[..n * w.d], &jobs);
+            s.outputs.as_mut_slice()[..out.len()].copy_from_slice(&out);
+            let mut c = Commands::new(&gpu.device)?;
+            c.upload(&s.outputs, 0, &e.routed, 0, out.len())?;
+            c.submit()?;
+            stats.picks += jobs.len() as u64;
+            stats.host_experts += jobs.len() as u64;
+            times.host += launched.elapsed();
         }
-        Ok(())
-    }
-
-    /// Runs the picks `experts` of a pass of `n` tokens on the host with
-    /// the inputs the cut read back, and puts their outputs where the
-    /// device's products would have.
-    #[allow(clippy::too_many_arguments)]
-    fn run_on_host(
-        &self,
-        gpu: &Gpu,
-        moe: &Moe,
-        s: &mut Segments,
-        w: &Work,
-        n: usize,
-        experts: &[u32],
-        times: &mut Times,
-    ) -> R {
-        let start = Instant::now();
-        let d = w.d;
-        let used = experts.len() / n;
-        let jobs: Vec<Job> = experts
-            .iter()
-            .enumerate()
-            .map(|(j, &expert)| Job {
-                row: (j / used) as u32,
-                expert,
-            })
-            .collect();
-        let out = moe.run_experts(&s.inputs.as_slice()[..n * d], &jobs);
-        s.outputs.as_mut_slice()[..out.len()].copy_from_slice(&out);
-        let e = w.experts.as_ref().expect("work has expert buffers");
-        let mut c = Commands::new(&gpu.device)?;
-        c.upload(&s.outputs, 0, &e.routed, 0, out.len())?;
-        c.submit()?;
-        self.stats.borrow_mut().host_experts += jobs.len() as u64;
-        times.host += start.elapsed();
-        Ok(())
-    }
-
-    /// Stages the experts of `copies` and copies each to its slot.
-    fn copy(&self, gpu: &Gpu, slots: &LayerSlots, copies: &[(usize, u32)], times: &mut Times) -> R {
-        let start = Instant::now();
-        let mut staging = self.staging.borrow_mut();
-        let mut held = self.scales.borrow_mut();
-        let mut c = Commands::new(&gpu.device)?;
-        let mut at = 0;
-        for (i, &(expert, slot)) in copies.iter().enumerate() {
-            for (k, (table, values)) in slots.scales.iter().flatten().enumerate() {
-                let j = 2 * i + k;
-                held.as_mut_slice()[j] = values[expert];
-                c.upload(&held, j, table, slot as usize, 1)?;
-            }
-            for (pool, source) in slots.parts() {
-                let bytes = pool.expert_bytes();
-                pool.stage(
-                    &source.expert(expert),
-                    &mut staging.as_mut_slice()[at..at + bytes],
-                )?;
-                pool.record_copy(&staging, at, slot as usize, &mut c)?;
-                at += bytes;
-            }
-        }
-        let staged = Instant::now();
-        times.staging += staged - start;
-        c.submit()?;
-        times.copies += staged.elapsed();
         Ok(())
     }
 }
 
-/// What the offload of routed experts holds and did, for the run summary.
+/// Where the routed experts of a model larger than the device run, and
+/// what that took, for the run summary.
 pub struct ExpertReport {
-    /// Slots per layer, layers with experts, and experts per layer.
-    pub slots: usize,
+    /// Layers with routed experts, and those whose experts the device holds.
     pub layers: usize,
-    pub experts: usize,
-    /// Device bytes the slots take.
+    pub device_layers: usize,
+    /// Device bytes those experts take.
     pub bytes: usize,
-    /// Layers whose experts run on the host.
-    pub host_layers: usize,
     pub stats: Stats,
     pub times: Times,
 }
 
 impl fmt::Display for ExpertReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = &self.stats;
-        let tokens = s.tokens.max(1) as f64;
+        let tokens = self.stats.tokens.max(1) as f64;
         let ms = |d: Duration| d.as_secs_f64() * 1e3 / tokens;
-        let t = &self.times;
         write!(
             f,
-            "experts: {} of {} per layer on the device ({:.0} MiB), hit rate {:.1}%, {:.1} MiB \
-             copied per token, {} layers on the host; ms per token: {:.1} layers, {:.1} staging, \
-             {:.1} copies, {:.1} experts, {:.1} host",
-            self.slots,
-            self.experts,
+            "experts of {} of {} layers on the GPU ({:.0} MiB), the rest on the CPU; \
+             ms per token: {:.1} on the GPU, {:.1} on the CPU",
+            self.device_layers,
+            self.layers,
             self.bytes as f64 / (1 << 20) as f64,
-            100.0 * s.hit_rate(),
-            s.loaded_bytes as f64 / tokens / (1 << 20) as f64,
-            self.host_layers,
-            ms(t.layers),
-            ms(t.staging),
-            ms(t.copies),
-            ms(t.experts),
-            ms(t.host),
+            ms(self.times.layers),
+            ms(self.times.host),
         )
     }
 }
@@ -490,39 +253,33 @@ impl fmt::Display for ExpertReport {
 impl VulkanModel<'_> {
     /// Command lists for the parts of a pass over `w`, if it is cut.
     pub(super) fn segments_for(&self, w: &Work) -> kinetic_vulkan::Result<Option<Segments>> {
-        let o = self.offload.as_ref();
-        o.map(|o| o.segments(&self.gpu, &self.layers, w))
+        self.offload
+            .as_ref()
+            .map(|_| Segments::new(&self.gpu, w))
             .transpose()
     }
 
-    /// What the offload of routed experts holds and did, if the model's
-    /// experts do not all fit on the device.
+    /// Where the routed experts run and what that took, if they do not
+    /// all fit on the device.
     pub fn expert_report(&self) -> Option<ExpertReport> {
         let o = self.offload.as_ref()?;
-        let held: Vec<&LayerSlots> = o.layers.iter().flatten().collect();
-        let bytes = held
-            .iter()
-            .flat_map(|l| l.parts())
-            .map(|(s, _)| s.matrix().size_bytes())
-            .sum();
         Some(ExpertReport {
-            slots: held.first().map_or(0, |l| l.down.slots()),
-            host_layers: o.host.iter().flatten().count(),
-            layers: held.len(),
-            experts: o.experts,
-            bytes,
+            layers: o.layers,
+            device_layers: o.layers - o.host.iter().flatten().count(),
+            bytes: o.device_bytes,
             stats: *o.stats.borrow(),
             times: *o.times.borrow(),
         })
     }
 
-    /// One line on the weights that run from the host for want of Vulkan
-    /// kernels, and what they cost, if any do.
+    /// One line on the weights that run from the host, if any do.
     pub fn host_weights(&self) -> Option<String> {
         let mut parts = Vec::new();
         let expanded = self.gpu.expanded.borrow();
         if !expanded.0.is_empty() {
-            parts.push(format!("expanded to f32 on the device: {expanded}"));
+            parts.push(format!(
+                "no Vulkan kernels for some weights, expanded to f32 on the device: {expanded}"
+            ));
         }
         if let Some(o) = &self.offload {
             let mut types: Vec<String> = o
@@ -534,24 +291,20 @@ impl VulkanModel<'_> {
                 .collect();
             types.sort();
             types.dedup();
-            let n = o.host.iter().flatten().count();
-            if n > 0 {
-                parts.push(format!(
-                    "experts of {n} layers ({}) run on the CPU, in host memory",
-                    types.join(", ")
-                ));
-            }
+            parts.push(format!(
+                "experts of {} layers ({}) run on the CPU, in host memory",
+                o.host.iter().flatten().count(),
+                types.join(", ")
+            ));
         }
-        (!parts.is_empty())
-            .then(|| format!("no Vulkan kernels for some weights: {}", parts.join("; ")))
+        (!parts.is_empty()).then(|| parts.join("; "))
     }
 
     /// One line on the device memory this model takes with `state`, and
     /// what the driver says is left free.
     pub fn memory_line(&self, state: &VulkanState) -> String {
         const MIB: usize = 1 << 20;
-        let slots = self.expert_report().map_or(0, |r| r.bytes);
-        let used = self.weight_bytes() + slots + self.state_bytes(state);
+        let used = self.weight_bytes() + self.state_bytes(state);
         match self.gpu.device.free_bytes() {
             Some(free) => format!(
                 "the model takes {} MiB of the GPU, {} MiB left free",
