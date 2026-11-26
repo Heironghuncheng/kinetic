@@ -18,6 +18,8 @@ pub enum Tile {
     Bench,
     Doctor,
     Settings,
+    /// The newer release the badge names.
+    Update,
 }
 
 const TILES: [(Tile, &str, &str); 6] = [
@@ -393,6 +395,7 @@ pub fn show(term: &mut Term, focus: &mut usize, badge: Option<&str>) -> io::Resu
         match key {
             Key::CtrlC | Key::Char('q' | 'Q') => return Err(quit()),
             Key::Esc => asking = true,
+            Key::Char('u' | 'U') if badge.is_some() => return Ok(Tile::Update),
             Key::Enter | Key::Char(' ') => return Ok(TILES[*focus].0),
             Key::Left => *focus = focus.saturating_sub(1),
             Key::Right | Key::Tab => *focus = (*focus + 1).min(last),

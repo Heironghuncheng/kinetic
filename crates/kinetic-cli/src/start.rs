@@ -10,10 +10,11 @@ use crate::{console, Result};
 pub fn run() -> Result<()> {
     println!("Welcome to Kinetic. Checking this computer...");
     let here = Here::check();
+    let badge = crate::update::available().map(|v| format!("Kinetic {v} is out   u updates"));
     let mut term = Term::enter()?;
     let mut focus = 0;
     loop {
-        match step(&mut term, &here, &mut focus) {
+        match step(&mut term, &here, &mut focus, badge.as_deref()) {
             Err(e) if tui::is_quit(&e) => return Ok(()),
             Err(e) => return Err(e.into()),
             Ok(None) => {}
@@ -27,8 +28,8 @@ pub fn run() -> Result<()> {
 type Todo = Option<(Action, Model, &'static str)>;
 
 /// The home screen and the screens a tile opens, up to something to run.
-fn step(term: &mut Term, here: &Here, focus: &mut usize) -> io::Result<Todo> {
-    let tile = home::show(term, focus, None)?;
+fn step(term: &mut Term, here: &Here, focus: &mut usize, badge: Option<&str>) -> io::Result<Todo> {
+    let tile = home::show(term, focus, badge)?;
     let direct = |term: &mut Term, title, action| -> io::Result<Todo> {
         let model = models::pick(term, here, title)?;
         Ok(model.map(|m| (action, m, "auto")))
@@ -49,6 +50,15 @@ fn step(term: &mut Term, here: &Here, focus: &mut usize) -> io::Result<Todo> {
         }
         Tile::Settings => {
             tui::settings::show(term, here)?;
+            Ok(None)
+        }
+        Tile::Update => {
+            term.suspend(|| {
+                if let Err(e) = crate::update::run(false) {
+                    crate::report(&*e);
+                }
+                wait();
+            })?;
             Ok(None)
         }
     }

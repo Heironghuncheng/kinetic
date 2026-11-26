@@ -30,6 +30,7 @@ mod start;
 mod system;
 mod tech;
 mod tui;
+mod update;
 
 use std::io::IsTerminal;
 use std::net::TcpListener;
@@ -66,6 +67,10 @@ const WARM_DISK: u64 = 2 << 30;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Skip the daily check for a newer release, as KINETIC_NO_UPDATE_CHECK=1
+    /// does
+    #[arg(long, global = true)]
+    no_update_check: bool,
 }
 
 #[derive(Subcommand)]
@@ -221,6 +226,14 @@ enum Command {
         /// CPU threads [default: all]
         #[arg(short = 't', long, value_name = "N")]
         threads: Option<usize>,
+    },
+    /// Download the newest release of Kinetic for this computer, check it
+    /// against the release's checksums and put it in place of this one
+    Update {
+        /// Follow the nightly build of main instead: untested, replaced
+        /// every night
+        #[arg(long)]
+        nightly: bool,
     },
     /// Measure perplexity over a text file, as llama-perplexity does (CPU)
     Perplexity {
@@ -569,6 +582,7 @@ impl GenArgs {
 }
 
 fn main() -> ExitCode {
+    update::tidy();
     if std::env::args().len() == 1 {
         if console::double_clicked() {
             return console::open_terminal();
@@ -589,9 +603,8 @@ fn main() -> ExitCode {
         Err(e) => match model_wanted(&e, &args) {
             Some(title) if interactive() => match tui::pick_model(title) {
                 Ok(Some(model)) => {
-                    let mut args = args;
-                    args.push(model.to_string_lossy().into_owned());
-                    Cli::parse_from(args)
+                    let model = model.to_string_lossy().into_owned();
+                    Cli::parse_from(args.iter().cloned().chain([model]))
                 }
                 Ok(None) => return ExitCode::SUCCESS,
                 Err(e) => return finish(Err(e)),
@@ -599,6 +612,9 @@ fn main() -> ExitCode {
             _ => e.exit(),
         },
     };
+    if !cli.no_update_check {
+        update::notice(&args);
+    }
     finish(run(cli))
 }
 
@@ -808,6 +824,7 @@ fn run(cli: Cli) -> Result<()> {
         })
         .map(drop),
         Command::Models => library::list(),
+        Command::Update { nightly } => update::run(nightly),
         Command::Info { model } => info::print(&model.locate()?.path),
         Command::Verify { file } => verify(&file),
         Command::VerifyReceipt {

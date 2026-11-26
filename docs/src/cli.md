@@ -19,6 +19,7 @@ kinetic <COMMAND> [OPTIONS] [MODEL] ...
 | [`verify-receipt`](#verify-receipt) | reruns the request a receipt records and checks every output token |
 | [`quantize`](#quantize) | writes a GGUF model in another type, as `llama-quantize` does |
 | [`perplexity`](#perplexity) | measures perplexity and KL divergence over a text file, as `llama-perplexity` does |
+| [`update`](#update) | installs the newest release in place of this one |
 
 ## Without typing
 
@@ -500,6 +501,29 @@ anything.
 When a command fails, the error ends with a line saying what to do: a path
 to check, a smaller model or `-c`, a driver to install, a free `--port`, or a
 download to repeat.
+
+## update
+
+```sh
+kinetic update
+kinetic update --nightly
+```
+
+Downloads the newest release for this computer and this build (the full
+build, or the CPU build when this one is), checks it against the release's
+`SHA256SUMS`, and puts it in place of the running binary. On Windows the
+old binary is moved aside to `kinetic.exe.old`, which the next start
+removes. `--nightly` follows the nightly build of main instead.
+`KINETIC_RELEASES` points both at a mirror that serves `latest`,
+`tags/<tag>` and `download/<tag>/<file>`.
+
+Once a day at most, a command run at a terminal asks GitHub for the newest
+release, in the background, sending nothing about you or this computer.
+When it is newer, the next interactive command prints one line on stderr,
+`Kinetic 0.1.2 is out: run kinetic update`, and the home screen shows it in
+its corner, where `u` runs the update. Nothing is downloaded or replaced
+until you ask. Scripts, pipes and `--json` output never see the line, and
+`--no-update-check` or `KINETIC_NO_UPDATE_CHECK=1` turn the check off.
 
 ## doctor
 

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{fit, library, system, Result};
 use hub::Hub;
+pub use hub::{find_curl as curl, sha256};
 use select::RepoFile;
 
 /// Disk left free after a download.
