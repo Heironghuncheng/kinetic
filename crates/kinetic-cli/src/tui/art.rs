@@ -94,11 +94,14 @@ const SETTINGS: [&str; 12] = [
 /// The icons in the order of the tiles.
 pub const ICONS: [[&str; 12]; 6] = [CHAT, MODELS, API, BENCH, DOCTOR, SETTINGS];
 
-/// Row `row` of `icon`, in full colour when `lit`, softer otherwise.
-pub fn icon_row(icon: &[&str; 12], row: usize, lit: bool) -> Line {
+/// Row `row` of `icon`, in full colour when `lit`, softer otherwise; in
+/// one colour, for a terminal without colours, when `mono`.
+pub fn icon_row(icon: &[&str; 12], row: usize, lit: bool, mono: bool) -> Line {
     quadrants(ICON.0, row, |x, y| {
         let c = icon.get(y)?.as_bytes().get(x)?;
         Some(match (c, lit) {
+            (b'.', _) => return None,
+            _ if mono => WHITE,
             (b'l', true) => LAVENDER,
             (b'p', true) => PURPLE,
             (b'o', true) => ORANGE,
@@ -220,7 +223,7 @@ pub fn word(text: &str, big: bool) -> Vec<String> {
 
 /// The rows of `text` in the pixel letters: white fading to lavender, with
 /// a purple shadow a pixel down and to the right.
-pub fn wordmark(text: &str, big: bool) -> Vec<Line> {
+pub fn wordmark(text: &str, big: bool, shadow: bool) -> Vec<Line> {
     let rows = word(text, big);
     let width = rows.first().map_or(0, |r| r.len()) + 2;
     let height = rows.len() + 1;
@@ -235,7 +238,7 @@ pub fn wordmark(text: &str, big: bool) -> Vec<Line> {
                 mix(WHITE.2, LAVENDER.2),
             ));
         }
-        (x >= 2 && y >= 1 && lit(x - 2, y - 1)).then_some(PURPLE)
+        (shadow && x >= 2 && y >= 1 && lit(x - 2, y - 1)).then_some(PURPLE)
     };
     (0..height.div_ceil(2))
         .map(|r| quadrants(width, r, px))
@@ -351,8 +354,8 @@ mod tests {
             assert!(rows.iter().all(|r| r.len() == rows[0].len()));
         }
         assert_eq!(word("KINETIC", true)[0].len(), 108);
-        assert_eq!(wordmark("KINETIC", true).len(), 5);
-        assert_eq!(wordmark("KINETIC", false)[0].width(), 38);
+        assert_eq!(wordmark("KINETIC", true, true).len(), 5);
+        assert_eq!(wordmark("KINETIC", false, true)[0].width(), 38);
         for rows in [4, 6] {
             let m = mark(rows);
             assert_eq!(m.len(), rows);

@@ -87,11 +87,11 @@ impl Wordmark {
 
     /// The mark, then the wordmark to its right with "by Velocity" under
     /// it when there is room.
-    fn lines(self) -> Vec<Line> {
+    fn lines(self, mono: bool) -> Vec<Line> {
         let (rows, mut word) = match self {
             Wordmark::Text => return vec![Line::new(Ink::Bright, "KINETIC")],
-            Wordmark::Small => (5, art::wordmark("KINETIC", false)),
-            Wordmark::Large => (8, art::wordmark("KINETIC", true)),
+            Wordmark::Small => (5, art::wordmark("KINETIC", false, !mono)),
+            Wordmark::Large => (8, art::wordmark("KINETIC", true, !mono)),
         };
         let width = word[0].width();
         if word.len() < rows {
@@ -105,8 +105,12 @@ impl Wordmark {
             .map(|_| blank())
             .chain(word)
             .chain(std::iter::repeat_with(blank));
-        art::mark(rows)
-            .into_iter()
+        // the mark is its colours; without them, the letters alone
+        let mark = match mono {
+            true => (0..rows).map(|_| Line::default()).collect(),
+            false => art::mark(rows),
+        };
+        mark.into_iter()
             .zip(word)
             .map(|(mut line, word)| {
                 line.push(Ink::Pixels(None, None), " ".repeat(GAP));
@@ -167,16 +171,17 @@ fn plan(cols: usize, rows: usize) -> Plan {
 }
 
 /// Row `r` of tile `i`, `width` by `rows`.
-fn tile_row(i: usize, focused: bool, width: usize, rows: usize, r: usize) -> Line {
+fn tile_row(i: usize, focused: bool, width: usize, rows: usize, r: usize, mono: bool) -> Line {
     let border = if focused { Ink::Accent } else { Ink::Muted };
     let inner = width - 2;
     if r == 0 || r + 1 == rows {
-        let (a, b) = if r == 0 {
-            ('╭', '╮')
-        } else {
-            ('╰', '╯')
+        let (a, b, line) = match (r == 0, focused) {
+            (true, false) => ('╭', '╮', '─'),
+            (false, false) => ('╰', '╯', '─'),
+            (true, true) => ('┏', '┓', '━'),
+            (false, true) => ('┗', '┛', '━'),
         };
-        return Line::new(border, format!("{a}{}{b}", "─".repeat(inner)));
+        return Line::new(border, format!("{a}{}{b}", line.to_string().repeat(inner)));
     }
     let body = rows - 2;
     let icon_rows = ICON.1 / 2;
@@ -187,11 +192,13 @@ fn tile_row(i: usize, focused: bool, width: usize, rows: usize, r: usize) -> Lin
     };
     let top = (body - icon - gap - 1) / 2;
     let at = r - 1;
-    let mut line = Line::new(border, "│");
+    let side = if focused { "┃" } else { "│" };
+    let mut line = Line::new(border, side);
     if icon > 0 && (top..top + icon).contains(&at) {
         let pad = (inner - ICON.0 / 2) / 2;
         line.push(Ink::Plain, " ".repeat(pad));
-        line.0.extend(art::icon_row(&ICONS[i], at - top, focused).0);
+        line.0
+            .extend(art::icon_row(&ICONS[i], at - top, focused, mono).0);
         line.push(Ink::Plain, " ".repeat(inner - pad - ICON.0 / 2));
     } else if at == top + icon + gap {
         let name = shorten(TILES[i].1, inner);
@@ -203,7 +210,7 @@ fn tile_row(i: usize, focused: bool, width: usize, rows: usize, r: usize) -> Lin
     } else {
         line.push(Ink::Plain, " ".repeat(inner));
     }
-    line.push(border, "│");
+    line.push(border, side);
     line
 }
 
@@ -303,7 +310,8 @@ fn layout(
     let mut canvas = Canvas::new(cols, rows, colors, tick);
     let centre = |line: &Line| cols.saturating_sub(line.width()) / 2;
     let mut y = plan.top;
-    let mark = plan.wordmark.lines();
+    let mono = colors == Colors::None;
+    let mark = plan.wordmark.lines(mono);
     let x = cols.saturating_sub(mark.iter().map(Line::width).max().unwrap_or(0)) / 2;
     for line in &mark {
         canvas.put(y, x, line, None);
@@ -317,7 +325,7 @@ fn layout(
                 let tx = left + (i % per) * (width + GUTTER);
                 let ty = y + (i / per) * (plan.tile_rows + 1);
                 for r in 0..plan.tile_rows {
-                    let row = tile_row(i, i == focus, width, plan.tile_rows, r);
+                    let row = tile_row(i, i == focus, width, plan.tile_rows, r, mono);
                     canvas.put(ty + r, tx, &row, Some(TILE_BG));
                 }
             }
@@ -518,7 +526,7 @@ mod tests {
             let shown = usize::from(plan(cols, rows).tile_rows >= 9);
             for (i, icon) in ICONS.iter().enumerate() {
                 for r in 0..ICON.1 / 2 {
-                    let row = cells(&art::icon_row(icon, r, i == 0));
+                    let row = cells(&art::icon_row(icon, r, i == 0, false));
                     let found: usize = screen
                         .iter()
                         .map(|l| {
