@@ -6,7 +6,7 @@ use std::time::Instant;
 use kinetic_cpu::pool;
 use kinetic_cuda::Event;
 
-use super::form::stage;
+use super::form::{stage, stage_spread};
 use super::offload::{Offload, DEMAND_STAGING, PREFETCH_STAGING, TRANSIT_SLOTS};
 use super::Gpu;
 use crate::blocks::{Job, Pick};
@@ -276,7 +276,7 @@ impl Offload<'_> {
         let region = self.staging.region;
         let at = self.in_flight * region;
         let staging = &mut self.staging.prefetch.as_mut_slice()[at..];
-        let len = stage(&self.moes[l], e, staging);
+        let len = stage_spread(&self.moes[l], e, staging);
         let pool = self.cache.pool_of(l);
         let slot_bytes = self.plan.pools[pool].slot_bytes;
         // SAFETY: this staging region is rewritten only after `copied` has
