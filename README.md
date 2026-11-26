@@ -115,7 +115,7 @@ included) and offers two to download, and a folder browser finds any other
 name typed slightly wrong is matched for you. See
 [the command line](docs/src/cli.md#without-typing).
 
-<!-- screenshot: the kinetic home screen (replace this line with the image) -->
+<!-- screenshot: the kinetic home screen only (replace this line with the image); never another screen, as they show the computer's processor and GPU -->
 
 A GGUF file you already have works too if its model family is
 [supported](#supported-models): `kinetic chat path/to/model.gguf`.

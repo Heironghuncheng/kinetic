@@ -28,7 +28,7 @@ keys, Enter opens, Esc goes back one screen (on the home screen it asks
 before quitting), and `q` quits. The line at the bottom of every screen
 lists its keys.
 
-<!-- screenshot: the home screen (replace this line with the image) -->
+<!-- screenshot: the home screen only (replace this line with the image); never another screen, as they show the computer's processor and GPU -->
 
 | Tile | Opens |
 |---|---|
