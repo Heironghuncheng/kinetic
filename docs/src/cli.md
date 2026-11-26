@@ -38,6 +38,7 @@ lists its keys.
 | Benchmark | the model list, then [bench](#bench) |
 | Doctor | [doctor](#doctor) |
 | Settings | the settings below |
+| Every command (under the tiles) | every command, then a form of all its options: Left and Right change a choice or a switch, typing sets a value, Enter on MODEL opens the model list, and the command line the form stands for shows under it until **Run** starts it |
 
 The model list shows every model [`models`](#models) finds: its name, size,
 where it was found, and where it runs (GPU, GPU + CPU or CPU) when that is

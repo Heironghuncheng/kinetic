@@ -118,7 +118,15 @@ impl List {
                     .unwrap_or(0)
             })
             .collect();
-        let rest: usize = widths.iter().skip(1).map(|w| w + GAP.len()).sum();
+        // the last column is cut at the edge; the ones between keep their width
+        let between: usize = widths
+            .iter()
+            .skip(1)
+            .take(columns.saturating_sub(2))
+            .map(|w| w + GAP.len())
+            .sum();
+        let last = widths.last().map_or(0, |w| (*w).min(MIN_NAME));
+        let rest = between + if columns > 1 { GAP.len() + last } else { 0 };
         if let Some(first) = widths.first_mut() {
             *first = (*first).min(cols.saturating_sub(MARGIN + rest).max(MIN_NAME));
         }

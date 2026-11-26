@@ -52,6 +52,20 @@ fn step(term: &mut Term, here: &Here, focus: &mut usize, badge: Option<&str>) ->
             tui::settings::show(term, here)?;
             Ok(None)
         }
+        Tile::More => {
+            if let Some(args) = tui::commands::pick(term, here)? {
+                let chat = args.get(1).is_some_and(|c| c == "chat");
+                term.suspend(|| {
+                    if let Err(e) = crate::launch(args) {
+                        crate::report(&*e);
+                    }
+                    if !chat {
+                        wait();
+                    }
+                })?;
+            }
+            Ok(None)
+        }
         Tile::Update => {
             term.suspend(|| {
                 if let Err(e) = crate::update::run(false) {

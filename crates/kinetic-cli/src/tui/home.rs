@@ -20,7 +20,14 @@ pub enum Tile {
     Settings,
     /// The newer release the badge names.
     Update,
+    /// Every command, under the tiles.
+    More,
 }
+
+const MORE: (&str, &str) = (
+    "Every command",
+    "run, pull, fit, info, quantize, perplexity and the rest, with all their options",
+);
 
 const TILES: [(Tile, &str, &str); 6] = [
     (Tile::Chat, "Chat", "Talk to a model here, in the terminal"),
@@ -134,8 +141,8 @@ fn plan(cols: usize, rows: usize) -> Plan {
         None => TILES.len(),
     };
     // a row on top, one under the wordmark, one under the tiles, the
-    // focused tile's line and the keys
-    let avail = rows.saturating_sub(5);
+    // button for every command, the focused tile's line and the keys
+    let avail = rows.saturating_sub(6);
     // a bigger wordmark first, then taller tiles, then the plainest
     let tiles: &[usize] = match grid {
         Some(_) => &TILE_ROWS,
@@ -328,7 +335,15 @@ fn layout(
         }
     }
     y += 1;
-    let what = Line::new(Ink::Dim, shorten(TILES[focus].2, cols.saturating_sub(2)));
+    let more = format!("  {} ›  ", MORE.0);
+    let button = match focus == TILES.len() {
+        true => Line::new(Ink::Accent, more),
+        false => Line::new(Ink::Plain, more),
+    };
+    canvas.put(y, centre(&button), &button, Some(TILE_BG));
+    y += 1;
+    let what = TILES.get(focus).map_or(MORE.1, |t| t.2);
+    let what = Line::new(Ink::Dim, shorten(what, cols.saturating_sub(2)));
     canvas.put(y, centre(&what), &what, None);
     let keys = Line::new(
         Ink::Dim,
@@ -383,7 +398,7 @@ pub fn show(term: &mut Term, focus: &mut usize, badge: Option<&str>) -> io::Resu
             tick += 1;
             continue;
         };
-        let last = TILES.len() - 1;
+        let last = TILES.len();
         if asking {
             match key {
                 Key::Enter | Key::CtrlC | Key::Char('q' | 'Q' | 'y' | 'Y') => return Err(quit()),
@@ -396,13 +411,17 @@ pub fn show(term: &mut Term, focus: &mut usize, badge: Option<&str>) -> io::Resu
             Key::CtrlC | Key::Char('q' | 'Q') => return Err(quit()),
             Key::Esc => asking = true,
             Key::Char('u' | 'U') if badge.is_some() => return Ok(Tile::Update),
-            Key::Enter | Key::Char(' ') => return Ok(TILES[*focus].0),
+            Key::Enter | Key::Char(' ') => {
+                return Ok(TILES.get(*focus).map_or(Tile::More, |t| t.0))
+            }
             Key::Left => *focus = focus.saturating_sub(1),
             Key::Right | Key::Tab => *focus = (*focus + 1).min(last),
             Key::Up if per == 1 => *focus = focus.saturating_sub(1),
             Key::Down if per == 1 => *focus = (*focus + 1).min(last),
+            Key::Up if *focus == last => *focus = last - per + (per - 1) / 2,
             Key::Up => *focus = focus.saturating_sub(per),
-            Key::Down if *focus + per <= last => *focus += per,
+            Key::Down if *focus + per < last => *focus += per,
+            Key::Down => *focus = last,
             Key::Home => *focus = 0,
             Key::End => *focus = last,
             _ => {}
@@ -450,6 +469,7 @@ mod tests {
                     assert!(text.contains(name), "{cols}x{rows} lacks {name}");
                 }
                 assert!(text.contains("Enter open"), "{cols}x{rows}");
+                assert!(text.contains("Every command"), "{cols}x{rows}");
                 assert!(text.contains("0.1.2 is out"), "{cols}x{rows}");
                 let asked = layout(cols, rows, 1, colors, None, 0, true);
                 let asked: String = asked

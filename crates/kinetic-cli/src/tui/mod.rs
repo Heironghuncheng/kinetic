@@ -4,6 +4,7 @@
 
 pub mod actions;
 mod art;
+pub mod commands;
 mod folder;
 pub mod home;
 mod keys;
