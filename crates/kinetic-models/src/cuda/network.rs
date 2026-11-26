@@ -6,12 +6,14 @@
 
 use std::rc::Rc;
 
-use kinetic_cuda::{DeviceBuffer, DeviceMatrix, GemvInput, RmsNorm, DEPTH_MAX_STATES};
+use kinetic_cuda::{
+    Batch, DeviceBuffer, DeviceMatrix, GemvInput, Graph, RmsNorm, DEPTH_MAX_STATES,
+};
 
 use super::experts::{CudaExperts, ExpertWork, Offload};
 use super::layer::{CudaLayer, CudaMixer, LayerState};
 use super::relative::{CudaRelative, RelBuffers, RelLayer};
-use super::scratch::Work;
+use super::scratch::{Scratch, Work};
 use super::{cuda_error, Gpu};
 use crate::arch::inkling2::Network;
 use crate::arch::inkling2_steps::Step;
@@ -67,6 +69,8 @@ pub(super) struct NetBuffers {
     normed: GemvInput,
     control: ControlBuffers,
     rel: RelBuffers,
+    /// The parts of a one-token step, recorded once.
+    graphs: Vec<Graph>,
 }
 
 struct ControlBuffers {
@@ -241,12 +245,16 @@ impl CudaNetwork {
             control: ControlBuffers::new(gpu, d, rank, rows)?,
 
             rel: relative(&layers[0]).buffers(gpu, rows)?,
+            graphs: Vec::new(),
         })
     }
 
     /// Queues the network over the batch of `work`, whose embeddings are in
     /// its scratch, and leaves the output normalized by `output_norm` in
-    /// the scratch for the head.
+    /// the scratch for the head. With `record` and experts off the device,
+    /// everything between two layers' read-back of their routing runs as a
+    /// graph the state keeps, recorded the first time.
+    #[allow(clippy::too_many_arguments)]
     pub fn queue(
         &self,
         gpu: &Gpu,
@@ -254,21 +262,111 @@ impl CudaNetwork {
         work: &mut Work,
         offload: &mut Offload,
         output_norm: &DeviceBuffer<f32>,
+        record: bool,
+    ) -> kinetic_cuda::Result<()> {
+        let stream = &gpu.stream;
+        let n = work.batch.len();
+        let routed: Vec<usize> = (0..self.steps.len())
+            .filter(|&i| matches!(self.steps[i], Step::Layer { .. }))
+            .collect();
+        let Work {
+            batch,
+            scratch,
+            layers: states,
+            experts,
+            net,
+            ..
+        } = work;
+        let b = net.as_mut().expect("a state of a network model");
+        let experts = experts.as_mut().expect("a state of an expert model");
+        let mut graphs = std::mem::take(&mut b.graphs);
+        let record = record && !offload.is_resident();
+        let replay = record && graphs.len() == routed.len() + 1;
+        if !replay {
+            graphs.clear();
+        }
+        let mut depth = Depth::default();
+        for part in 0..=routed.len() {
+            if let Some(&i) = part.checked_sub(1).map(|p| &routed[p]) {
+                let Step::Layer { layer, .. } = self.steps[i] else {
+                    unreachable!("a routed step is a layer")
+                };
+                let (h, y) = (b.normed.values(), &mut b.y);
+                self.experts[layer].finish(layer, gpu, h, y, experts, offload, n)?;
+            }
+            let mut queue_part = || {
+                let mut run = Part {
+                    states: &mut *states,
+                    b: &mut *b,
+                    experts: &mut *experts,
+                    scratch: &mut *scratch,
+                    batch,
+                    depth: &mut depth,
+                };
+                self.part(gpu, layers, &routed, part, &mut run, offload, output_norm)
+            };
+            if replay {
+                graphs[part].launch(stream)?;
+            } else if record {
+                let graph = stream.capture(queue_part)?;
+                graph.launch(stream)?;
+                graphs.push(graph);
+            } else {
+                queue_part()?;
+            }
+        }
+        b.graphs = graphs;
+        Ok(())
+    }
+
+    /// Queues part `part` of the network, the work between the read-back
+    /// of the routing of the layers at steps `routed[part - 1]` and
+    /// `routed[part]`: the first one's feed-forward output folded into the
+    /// stream, or the input norm for the first part, the steps between, and
+    /// the second layer's front, scores and their read-back.
+    #[allow(clippy::too_many_arguments)]
+    fn part(
+        &self,
+        gpu: &Gpu,
+        layers: &[CudaLayer],
+        routed: &[usize],
+        part: usize,
+        run: &mut Part,
+        offload: &Offload,
+        output_norm: &DeviceBuffer<f32>,
     ) -> kinetic_cuda::Result<()> {
         let (k, stream) = (&gpu.kernels, &gpu.stream);
-        let (n, d) = (work.batch.len(), self.d);
+        let (n, d) = (run.batch.len(), self.d);
         let len = n * d;
-        let b = work.net.as_mut().expect("a state of a network model");
-        let experts = work.experts.as_mut().expect("a state of an expert model");
-        let norm = RmsNorm {
-            weight: &self.embd_norm,
-            eps: self.eps,
+        let b = &mut *run.b;
+        let first = match part.checked_sub(1).map(|p| routed[p]) {
+            Some(i) => {
+                let Step::Layer { slot, .. } = self.steps[i] else {
+                    unreachable!("a routed step is a layer")
+                };
+                let LayerState::Relative(state) = &mut run.states[slot] else {
+                    unreachable!("network slots attend by relative distance")
+                };
+                let w = relative(&layers[slot]);
+                w.ffn_conv(gpu, &b.y, state, run.batch, &mut b.attn)?;
+                b.cur.copy_from_device(0, &b.ffn_in, 0..len, stream)?;
+                k.add(&mut b.cur, &b.attn, len, stream)?;
+                i + 1
+            }
+            None => {
+                let norm = RmsNorm {
+                    weight: &self.embd_norm,
+                    eps: self.eps,
+                };
+                k.rms_norm(&run.scratch.x, norm, &mut b.normed, 0, n, stream)?;
+                b.cur
+                    .copy_from_device(0, b.normed.values(), 0..len, stream)?;
+                0
+            }
         };
-        k.rms_norm(&work.scratch.x, norm, &mut b.normed, 0, n, stream)?;
-        b.cur
-            .copy_from_device(0, b.normed.values(), 0..len, stream)?;
-        let mut depth = Depth::default();
-        for &step in &self.steps {
+        let last = routed.get(part).map_or(self.steps.len(), |&i| i + 1);
+        let depth = &mut *run.depth;
+        for &step in &self.steps[first..last] {
             match step {
                 Step::Prelude => {
                     b.prelude.copy_from_device(0, &b.cur, 0..len, stream)?;
@@ -291,16 +389,20 @@ impl CudaNetwork {
                     slot,
                     looped,
                 } => {
-                    let LayerState::Relative(state) = &mut work.layers[slot] else {
+                    let LayerState::Relative(state) = &mut run.states[slot] else {
                         unreachable!("network slots attend by relative distance")
                     };
                     let w = relative(&layers[slot]);
-                    let run = LayerRun { layer, looped, n };
-                    self.layer(gpu, &run, w, state, b, &mut depth, &work.batch)?;
-                    self.experts[layer].score(gpu, &b.normed, n, &mut experts.gates)?;
-                    self.feed(gpu, &run, w, state, b, experts, offload, &work.batch)?;
+                    let layer_run = LayerRun { layer, looped, n };
+                    self.layer(gpu, &layer_run, w, state, b, depth, run.batch)?;
+                    let e = &self.experts[layer];
+                    e.score(gpu, &b.normed, n, &mut run.experts.gates)?;
+                    e.send(layer, gpu, b.normed.values(), run.experts, offload, n)?;
                 }
             }
+        }
+        if part < routed.len() {
+            return Ok(());
         }
         let mut states: Vec<&DeviceBuffer<f32>> = b.blocks[..depth.blocks].iter().collect();
         states.push(&b.cur);
@@ -309,7 +411,7 @@ impl CudaNetwork {
             weight: output_norm,
             eps: self.eps,
         };
-        k.rms_norm(&b.h, norm, &mut work.scratch.h, 0, n, stream)
+        k.rms_norm(&b.h, norm, &mut run.scratch.h, 0, n, stream)
     }
 
     /// The front of a layer as `Network::layer` runs it: its attention
@@ -393,37 +495,6 @@ impl CudaNetwork {
             eps: self.eps,
         };
         k.rms_norm(h, norm, normed, 0, n, stream)
-    }
-
-    /// The back of a layer: its routed experts on `b.normed`, scored into
-    /// `experts.gates`, their output's convolution, and the new stream.
-    #[allow(clippy::too_many_arguments)]
-    fn feed(
-        &self,
-        gpu: &Gpu,
-        run: &LayerRun,
-        w: &RelLayer,
-        state: &mut super::relative::RelState,
-        b: &mut NetBuffers,
-        experts: &mut ExpertWork,
-        offload: &mut Offload,
-        batch: &kinetic_cuda::Batch,
-    ) -> kinetic_cuda::Result<()> {
-        let (k, stream) = (&gpu.kernels, &gpu.stream);
-        let len = run.n * self.d;
-        let e = &self.experts[run.layer];
-        e.mix(
-            run.layer,
-            gpu,
-            b.normed.values(),
-            &mut b.y,
-            experts,
-            offload,
-            run.n,
-        )?;
-        w.ffn_conv(gpu, &b.y, state, batch, &mut b.attn)?;
-        b.cur.copy_from_device(0, &b.ffn_in, 0..len, stream)?;
-        k.add(&mut b.cur, &b.attn, len, stream)
     }
 
     fn control(
@@ -512,6 +583,16 @@ struct LayerRun {
     layer: usize,
     looped: bool,
     n: usize,
+}
+
+/// The state's buffers one part of the network runs on.
+struct Part<'a> {
+    states: &'a mut [LayerState],
+    b: &'a mut NetBuffers,
+    experts: &'a mut ExpertWork,
+    scratch: &'a mut Scratch,
+    batch: &'a Batch,
+    depth: &'a mut Depth,
 }
 
 fn relative(l: &CudaLayer) -> &RelLayer {

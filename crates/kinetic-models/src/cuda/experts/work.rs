@@ -1,4 +1,6 @@
-use kinetic_cuda::{DeviceBuffer, ExpertGroup, PinnedBuffer, Stream, EXPERT_GROUP, MAX_BATCH};
+use kinetic_cuda::{
+    DeviceBuffer, Event, ExpertGroup, PinnedBuffer, Stream, EXPERT_GROUP, MAX_BATCH,
+};
 
 use super::place::Place;
 use super::Gpu;
@@ -35,8 +37,10 @@ pub(in crate::cuda) struct ExpertWork {
     pub weights: DeviceBuffer<f32>,
     /// Per token and pick, its expert, when routing stays on the device.
     pub experts: DeviceBuffer<u32>,
-    /// Scores, then the feed-forward input, read back each layer.
+    /// Scores, then the feed-forward input, read back each layer, and the
+    /// event after their copy.
     pub down: PinnedBuffer<f32>,
+    pub ready: Event,
     /// Groups, inputs and rows on their way to the device.
     route: PinnedBuffer<u32>,
     route_weights: PinnedBuffer<f32>,
@@ -85,6 +89,7 @@ impl ExpertWork {
             weights: f32s(assigned)?,
             experts: u32s(assigned)?,
             down: PinnedBuffer::new(ctx, rows * (scores + d))?,
+            ready: Event::new(ctx)?,
             route: PinnedBuffer::new(ctx, 6 * assigned)?,
             route_weights: PinnedBuffer::new(ctx, assigned)?,
             host_out: PinnedBuffer::new(ctx, assigned * d)?,

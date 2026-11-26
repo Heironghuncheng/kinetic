@@ -94,6 +94,11 @@ impl ExpertCache {
         self.pools.iter_mut().for_each(|p| p.pending.fill(false));
     }
 
+    /// Marks `slot` of `layer`'s pool as awaiting a copy again.
+    pub fn set_pending(&mut self, layer: usize, slot: u32) {
+        self.pool_mut(layer).pending[slot as usize] = true;
+    }
+
     /// Keeps `slot` of `layer`'s pool until [`ExpertCache::release`].
     pub fn protect(&mut self, layer: usize, slot: u32) {
         self.pool_mut(layer).protected[slot as usize] = true;

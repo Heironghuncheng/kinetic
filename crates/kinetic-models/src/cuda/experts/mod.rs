@@ -142,23 +142,61 @@ impl CudaExperts {
         off: &mut Offload,
         n: usize,
     ) -> kinetic_cuda::Result<()> {
+        self.send(l, gpu, h, work, off, n)?;
+        self.finish(l, gpu, h, y, work, off, n)
+    }
+
+    /// The part of [`CudaExperts::mix`] before the host reads the routing,
+    /// which a graph can record: `h` quantized for the experts, and the
+    /// scores and `h` queued to be read back. Nothing with every expert on
+    /// the device.
+    pub fn send(
+        &self,
+        l: usize,
+        gpu: &Gpu,
+        h: &DeviceBuffer<f32>,
+        work: &mut ExpertWork,
+        off: &Offload,
+        n: usize,
+    ) -> kinetic_cuda::Result<()> {
         if off.is_resident() {
-            return self.mix_resident(l, gpu, h, y, work, off, n);
+            return Ok(());
         }
         let (k, stream) = (&gpu.kernels, &gpu.stream);
         let moe = &off.moes[l];
-        let (d, n_exp, picks_per) = (moe.router.cols, self.n_experts, moe.n_used);
-        let gating = moe.gating.clone();
-        let g = self.gates.rows();
+        let (d, g) = (moe.router.cols, self.gates.rows());
         let ty = form::device_type(moe.gate.ty);
         quantize(k, ty, h, n, d, &mut work.hq, &mut work.hd, stream)?;
-        // SAFETY: the host reads the buffer only after the synchronization
-        // below.
+        // SAFETY: the host reads the buffer only after `work.ready`, which
+        // [`CudaExperts::finish`] records next.
         unsafe {
             work.down.download(0, &work.gates, 0..n * g, stream)?;
-            work.down.download(n * g, h, 0..n * d, stream)?;
+            work.down.download(n * g, h, 0..n * d, stream)
         }
-        stream.synchronize()?;
+    }
+
+    /// The rest of [`CudaExperts::mix`] after [`CudaExperts::send`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish(
+        &self,
+        l: usize,
+        gpu: &Gpu,
+        h: &DeviceBuffer<f32>,
+        y: &mut DeviceBuffer<f32>,
+        work: &mut ExpertWork,
+        off: &mut Offload,
+        n: usize,
+    ) -> kinetic_cuda::Result<()> {
+        if off.is_resident() {
+            return self.mix_resident(l, gpu, h, y, work, off, n);
+        }
+        let stream = &gpu.stream;
+        let moe = &off.moes[l];
+        let (d, n_exp, picks_per) = (moe.router.cols, self.n_experts, moe.n_used);
+        let (gating, weight_scale) = (moe.gating.clone(), moe.weight_scale);
+        let g = self.gates.rows();
+        work.ready.record(stream)?;
+        off.wait(&work.ready)?;
         let down = work.down.as_slice();
         let (gates, h) = (down[..n * g].to_vec(), down[n * g..n * g + n * d].to_vec());
 
@@ -166,7 +204,7 @@ impl CudaExperts {
             .chunks_exact(g)
             .flat_map(|row| gating.pick(&mut row[..n_exp].to_vec(), picks_per))
             .map(|p| Pick {
-                weight: p.weight * moe.weight_scale,
+                weight: p.weight * weight_scale,
                 ..p
             })
             .collect();
@@ -178,20 +216,15 @@ impl CudaExperts {
             (off.transit_arena(), assigned.cached, assigned.transit),
         ];
         self.queue_device(l, gpu, work, off, (assigned.device, n), &parts)?;
-
-        let predicted = if self.predicts {
-            predict(&gates, &gating, n_exp, picks_per, g)
-        } else {
-            Vec::new()
-        };
-        let prefetch = off.admit_predicted(l + 1, &predicted)?;
-        let (lens, outputs) = off.stage_and_run(l, &prefetch, &h, &assigned.host);
-        off.queue_prefetch(l + 1, &prefetch, &lens)?;
+        if self.predicts {
+            off.admit_predicted(l + 1, &predict(&gates, &gating, n_exp, picks_per, g));
+        }
+        let outputs = off.run_jobs(l, &h, &assigned.host);
         if !assigned.host.is_empty() {
             let len = outputs.len();
             work.host_out.as_mut_slice()[..len].copy_from_slice(&outputs);
             // SAFETY: the region is rewritten only after the next layer's
-            // synchronization of this stream.
+            // event on this stream has passed.
             unsafe {
                 work.host_out
                     .upload(0..len, &mut work.out, assigned.device * d, stream)?

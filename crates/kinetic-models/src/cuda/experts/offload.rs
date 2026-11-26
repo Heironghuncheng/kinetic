@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use kinetic_cuda::{DeviceBuffer, Event, ExpertArena, ExpertTables, PinnedBuffer, Stream};
@@ -10,8 +11,8 @@ use super::Gpu;
 use crate::blocks::{Job, Moe};
 use crate::LoadError;
 
-/// Experts staged for copies a layer waits for, and for copies ahead of the
-/// next layer.
+/// Experts staged for copies a layer waits for, and for copies into the
+/// cache made while the host waits for the device.
 pub(super) const DEMAND_STAGING: usize = 48;
 pub(super) const PREFETCH_STAGING: usize = 16;
 
@@ -94,7 +95,11 @@ pub(in crate::cuda) struct Offload<'m> {
     pub(super) usage: Vec<u32>,
     /// The experts predicted for the layer about to run.
     pub(super) predicted: Vec<u32>,
-    /// The stream copies ahead of a layer go on, and the event recorded
+    /// Experts to copy into a cache slot reserved for them, by layer, and
+    /// the copies queued since `copied` last passed.
+    pub(super) admissions: VecDeque<(usize, usize, u32)>,
+    pub(super) in_flight: usize,
+    /// The stream copies into the cache go on, and the event recorded
     /// after the latest of them.
     pub(super) copies: Stream,
     pub(super) copied: Event,
@@ -158,6 +163,8 @@ impl<'m> Offload<'m> {
             plan,
             stats: Stats::default(),
             predicted: Vec::new(),
+            admissions: VecDeque::new(),
+            in_flight: 0,
             copies: Stream::new(&gpu.ctx).map_err(err)?,
             copied: Event::new(&gpu.ctx).map_err(err)?,
             staged: [

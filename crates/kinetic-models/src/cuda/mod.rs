@@ -1189,12 +1189,14 @@ impl<'m> CudaModel<'m> {
         if let Some(net) = &self.network {
             let offload = self.offload.as_ref().expect("a network has experts");
             let output_norm = &self.output_norm;
+            let record = flow == Flow::Commit && work.batch.len() == 1 && !self.eager;
             return net.queue(
                 &self.gpu,
                 &self.layers,
                 work,
                 &mut offload.borrow_mut(),
                 output_norm,
+                record,
             );
         }
         let n = work.batch.len();
