@@ -79,6 +79,13 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   names its base images in full, so that Podman builds it without asking
   for a registry; the install guide shows Podman with the NVIDIA Container
   Toolkit's CDI devices.
+- Mixture-of-experts models through Vulkan, Inkling 2 among them, with
+  kernels for the weight types of its published files (IQ4_NL, NVFP4,
+  IQ3_XXS, IQ3_S, IQ2_S, IQ2_XS and Q3_K among them); weights of other
+  types run from the host. When the experts do not fit, Flywheel keeps every
+  expert of the layers a token runs most often on the GPU, the looped layers
+  of Inkling 2 first, and runs the others on the CPU from the mapped file,
+  copying nothing while the model runs.
 - Vulkan prompts on the matrix units of GPUs with cooperative f16 matrices
   (`VK_KHR_cooperative_matrix`, such as AMD's RDNA3 and NVIDIA's RTX cards):
   Q8_0, Q4_K, Q5_K and Q6_K products of prompt passes of up to 512 tokens

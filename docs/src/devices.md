@@ -104,8 +104,9 @@ GPU is used unless `--gpus` names others; see [Several GPUs](#several-gpus).
 
 `--device vulkan` runs models on any GPU with a Vulkan driver: AMD, Intel and
 NVIDIA. Today it runs `llama`, `qwen2`, `qwen3`, `lfm3` and `qwen35` models,
-with drafting and Warm Start; MoE models and the other architectures are
-[coming](roadmap.md). Under `auto`, Vulkan is tried after CUDA, so an NVIDIA
+with drafting and Warm Start, and mixture-of-experts models such as
+Inkling 2 (see [Mixture-of-experts offload](#mixture-of-experts-offload));
+the other architectures are [coming](roadmap.md). Under `auto`, Vulkan is tried after CUDA, so an NVIDIA
 GPU uses CUDA and an AMD or Intel GPU uses Vulkan.
 
 The Vulkan kernels run in subgroups of 32 where the GPU offers them, as
@@ -245,6 +246,13 @@ needed.
 
 When every expert fits on the GPU, there is no offload: routing runs on the
 GPU too.
+
+On Vulkan, a model whose experts do not all fit keeps every expert of as
+many layers as fit on the GPU, the layers a token runs most often first: a
+looped model such as Inkling 2 runs the layers of its loop once per pass.
+The experts of the other layers run on the CPU where they are, in the
+memory-mapped file, so nothing is copied to the GPU while the model runs.
+Experts of a weight type without a Vulkan kernel run on the CPU as well.
 
 ## Coming
 
