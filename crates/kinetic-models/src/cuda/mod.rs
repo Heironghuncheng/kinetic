@@ -72,6 +72,9 @@ pub use lanes::{Ran, Run};
 pub use mtp::CudaMtpState;
 pub use split::Placement;
 
+/// Least growth of the expert cache worth placing it again for.
+const GROW_STEP: usize = 64 << 20;
+
 /// Most tokens one prefill pass runs on GPUs with tensor cores; a state
 /// keeps buffers for this many.
 const PREFILL_BATCH: usize = 512;
@@ -542,6 +545,9 @@ impl<'m> CudaModel<'m> {
         drop(state);
         let (free, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
         let mut budget = free.saturating_sub(state_bytes + self.gpu.reserve);
+        let need = state_bytes + self.gpu.reserve;
+        // Largest budget seen to leave the room needed, smallest seen not to.
+        let (mut fit, mut over) = (0, usize::MAX);
         loop {
             let off = Offload::new(
                 &self.gpu,
@@ -553,8 +559,19 @@ impl<'m> CudaModel<'m> {
             )?;
             // the desktop may have taken memory meanwhile: check what is left
             let (left, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
-            let short = (state_bytes + self.gpu.reserve).saturating_sub(left);
-            if short == 0 || budget == 0 {
+            // Large allocations can take more than they hold, so what is
+            // left need not move with the budget: the next one is between
+            // the two seen, and never past what was left.
+            let next = if left >= need {
+                fit = budget;
+                (budget + (left - need)).min(budget + (over - budget) / 2)
+            } else {
+                over = budget;
+                budget
+                    .saturating_sub(need - left)
+                    .max(fit + (budget - fit) / 2)
+            };
+            if (left >= need && next < budget + GROW_STEP) || budget == 0 {
                 eprintln!(
                     "kinetic: the model takes {} MiB of the GPU with one sequence; {} MiB stay free",
                     (self.weight_bytes() + state_bytes + free.saturating_sub(left)) >> 20,
@@ -563,11 +580,13 @@ impl<'m> CudaModel<'m> {
                 return Ok(off);
             }
             drop(off);
-            budget = budget.saturating_sub(short);
-            eprintln!(
-                "kinetic: the GPU has {} MiB less free than planned; the expert cache shrinks to fit",
-                short >> 20
-            );
+            if left < need && fit == 0 {
+                eprintln!(
+                    "kinetic: the GPU has {} MiB less free than planned; the expert cache shrinks to fit",
+                    (need - left) >> 20
+                );
+            }
+            budget = next;
         }
     }
 
