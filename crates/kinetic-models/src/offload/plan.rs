@@ -87,12 +87,16 @@ impl fmt::Display for Plan {
 }
 
 /// Groups layers by slot size and shares `budget` device bytes among the
-/// groups in proportion to the bytes of their experts, so every layer can
-/// cache about the same fraction of its experts. Returns the slot sizes,
-/// the slots of each and the group of every layer.
+/// groups in proportion to the bytes of their experts times how many times
+/// per token their layers run, `visits`, so that a layer run three times a
+/// token caches three times the share of its experts another one does. A
+/// group whose share would hold all its experts takes just those, and the
+/// rest is shared again. Returns the slot sizes, the slots of each and the
+/// group of every layer.
 pub fn share_cache(
     layouts: &[SlotLayout],
     n_experts: usize,
+    visits: &[usize],
     budget: usize,
 ) -> (Vec<PoolPlan>, Vec<usize>) {
     let mut sizes: Vec<usize> = layouts.iter().map(SlotLayout::bytes).collect();
@@ -102,19 +106,42 @@ pub fn share_cache(
         .iter()
         .map(|l| sizes.binary_search(&l.bytes()).expect("size is listed"))
         .collect();
-    let total: usize = layouts.iter().map(|l| l.bytes() * n_experts).sum();
+    let layers = |p: usize| pool_of.iter().filter(|&&q| q == p).count();
+    let weight = |p: usize| -> f64 {
+        let visited: usize = (0..layouts.len())
+            .filter(|&l| pool_of[l] == p)
+            .map(|l| visits[l])
+            .sum();
+        (sizes[p] * n_experts * visited) as f64
+    };
+    let all = |p: usize| sizes[p] * n_experts * layers(p);
+    let mut slots = vec![0; sizes.len()];
+    let mut open: Vec<usize> = (0..sizes.len()).collect();
+    let mut left = budget;
+    while !open.is_empty() {
+        let total: f64 = open.iter().map(|&p| weight(p)).sum();
+        let share = |p: usize| (left as f64 * weight(p) / total.max(1.0)) as usize;
+        let (full, rest): (Vec<usize>, Vec<usize>) =
+            open.iter().partition(|&&p| share(p) >= all(p));
+        if full.is_empty() {
+            for &p in &rest {
+                slots[p] = share(p) / sizes[p];
+            }
+            break;
+        }
+        for p in full {
+            slots[p] = n_experts * layers(p);
+            left -= all(p);
+        }
+        open = rest;
+    }
     let pools = sizes
         .iter()
         .enumerate()
-        .map(|(p, &slot_bytes)| {
-            let layers = pool_of.iter().filter(|&&q| q == p).count();
-            let bytes = slot_bytes * n_experts * layers;
-            let share = (budget as f64 * bytes as f64 / total.max(1) as f64) as usize;
-            PoolPlan {
-                slot_bytes,
-                slots: (share / slot_bytes).min(n_experts * layers),
-                layers,
-            }
+        .map(|(p, &slot_bytes)| PoolPlan {
+            slot_bytes,
+            slots: slots[p],
+            layers: layers(p),
         })
         .collect();
     (pools, pool_of)
@@ -138,12 +165,30 @@ mod tests {
             down: 200,
             scales: 0,
         };
-        let (pools, pool_of) = share_cache(&[small, large, small], 10, 6000);
+        let (pools, pool_of) = share_cache(&[small, large, small], 10, &[1; 3], 6000);
         assert_eq!(pool_of, [0, 1, 0]);
         // 6000 + 6000 bytes of experts per group: 3000 bytes each.
         assert_eq!((pools[0].slots, pools[0].layers), (10, 2));
         assert_eq!((pools[1].slots, pools[1].layers), (5, 1));
-        let (pools, _) = share_cache(&[small], 10, 1 << 30);
+        let (pools, _) = share_cache(&[small], 10, &[1], 1 << 30);
         assert_eq!(pools[0].slots, 10);
+    }
+
+    #[test]
+    fn layers_run_more_often_get_more_of_the_budget() {
+        let layout = |bytes| SlotLayout {
+            gate: bytes,
+            up: bytes,
+            down: bytes,
+            scales: 0,
+        };
+        let (once, thrice) = (layout(100), layout(200));
+        // weights 3000 and 3 * 6000: the second group's share of 9000 is
+        // more than its 6000 bytes, which it takes, leaving 3000 to the first
+        let (pools, _) = share_cache(&[once, thrice], 10, &[1, 3], 9000);
+        assert_eq!((pools[0].slots, pools[1].slots), (10, 10));
+        // 4200 * 3000 / 21000 = 600 bytes, two slots; 3600 bytes, six slots
+        let (pools, _) = share_cache(&[once, thrice], 10, &[1, 3], 4200);
+        assert_eq!((pools[0].slots, pools[1].slots), (2, 6));
     }
 }

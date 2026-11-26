@@ -263,7 +263,7 @@ fn routed_experts_match_the_host() {
     moe.forward(&h, &mut want);
 
     let e = CudaExperts::upload(&g, &moe, None, false).unwrap();
-    let mut off = Offload::new(&g, vec![moe.clone()], 1 << 30, None, 0).unwrap();
+    let mut off = Offload::new(&g, vec![moe.clone()], &[1], 1 << 30, None, 0).unwrap();
     assert!(off.is_resident());
     let dims = ExpertDims {
         d: D,

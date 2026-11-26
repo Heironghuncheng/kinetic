@@ -499,9 +499,11 @@ impl<'m> CudaModel<'m> {
             staging: RefCell::new(None),
         };
         if let Some(moes) = moes {
-            cuda.offload = Some(RefCell::new(
-                cuda.plan_offload(moes, placement.expert_cache)?,
-            ));
+            cuda.offload = Some(RefCell::new(cuda.plan_offload(
+                moes,
+                &expert_visits(model),
+                placement.expert_cache,
+            )?));
             if cuda.routes_on_host() {
                 model.page_in_experts();
             }
@@ -527,6 +529,7 @@ impl<'m> CudaModel<'m> {
     fn plan_offload(
         &self,
         moes: Vec<Moe<'m>>,
+        visits: &[usize],
         cache: Option<usize>,
     ) -> Result<Offload<'m>, LoadError> {
         let (before, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
@@ -543,6 +546,7 @@ impl<'m> CudaModel<'m> {
             let off = Offload::new(
                 &self.gpu,
                 moes.clone(),
+                visits,
                 budget,
                 cache,
                 self.weight_bytes() + state_bytes,
@@ -1472,6 +1476,21 @@ fn slices(rows: Range<usize>) -> impl Iterator<Item = Range<usize>> {
 
 /// The routed experts of the layers that have them, in order; the dense
 /// layers come before them (LFM2 MoE).
+/// How many times a token runs each layer [`routed_experts`] gives: once,
+/// or in a network, once for every step that runs it.
+fn expert_visits(model: &Model) -> Vec<usize> {
+    let Some(net) = &model.network else {
+        return vec![1; model.layers.iter().filter(|l| l.experts.is_some()).count()];
+    };
+    let mut visits = vec![0; net.wiring.len()];
+    for step in net.steps() {
+        if let crate::arch::inkling2_steps::Step::Layer { layer, .. } = step {
+            visits[layer] += 1;
+        }
+    }
+    visits
+}
+
 fn routed_experts<'m>(model: &Model<'m>) -> Result<Option<Vec<Moe<'m>>>, LoadError> {
     // later passes of a loop route to the experts of their physical layer
     if let Some(net) = &model.network {

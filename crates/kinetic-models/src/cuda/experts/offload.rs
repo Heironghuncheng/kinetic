@@ -111,11 +111,13 @@ pub(in crate::cuda) struct Offload<'m> {
 }
 
 impl<'m> Offload<'m> {
-    /// Plans the cache for `moes` in at most `budget` device bytes, besides
-    /// `dense_bytes` already taken, the cache itself at most `cache` bytes.
+    /// Plans the cache for `moes`, whose layers run `visits` times a token,
+    /// in at most `budget` device bytes, besides `dense_bytes` already
+    /// taken, the cache itself at most `cache` bytes.
     pub fn new(
         gpu: &Gpu,
         moes: Vec<Moe<'m>>,
+        visits: &[usize],
         budget: usize,
         cache: Option<usize>,
         dense_bytes: usize,
@@ -134,7 +136,7 @@ impl<'m> Offload<'m> {
         let budget = budget
             .saturating_sub(transit.len())
             .min(cache.unwrap_or(usize::MAX));
-        let (pools, pool_of) = plan::share_cache(&layouts, n_experts, budget);
+        let (pools, pool_of) = plan::share_cache(&layouts, n_experts, visits, budget);
         let arenas = pools
             .iter()
             .map(|p| DeviceBuffer::<u8>::new(&gpu.ctx, (p.slots * p.slot_bytes).max(1)))
