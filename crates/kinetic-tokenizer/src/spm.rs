@@ -10,7 +10,6 @@ use std::collections::{BinaryHeap, HashMap};
 use kinetic_gguf::Gguf;
 
 use crate::bpe::{Bpe, Merge, Scratch};
-use crate::profile::Profile;
 use crate::special::Specials;
 use crate::vocab::{self, token_type};
 use crate::Error;
@@ -73,7 +72,7 @@ impl PartialEq for Bigram {
 impl Eq for Bigram {}
 
 impl Spm {
-    pub(crate) fn load(gguf: &Gguf, profile: &Profile) -> Result<Spm, Error> {
+    pub(crate) fn load(gguf: &Gguf, trim_after: Option<fn(&str) -> bool>) -> Result<Spm, Error> {
         let (tokens, types) = vocab::tokens_and_types(gguf)?;
         let scores = match gguf.get("tokenizer.ggml.scores") {
             Some(v) => {
@@ -139,7 +138,7 @@ impl Spm {
         };
 
         let mut specials = Specials::new(specials);
-        if let Some(trim_after) = profile.trim_after {
+        if let Some(trim_after) = trim_after {
             specials.trim_after(trim_after);
         }
         Ok(Spm {
@@ -154,8 +153,11 @@ impl Spm {
     }
 
     /// [`Spm::load`] for a vocabulary that merges by `tokenizer.ggml.merges`.
-    pub(crate) fn load_with_merges(gguf: &Gguf, profile: &Profile) -> Result<Spm, Error> {
-        let mut spm = Spm::load(gguf, profile)?;
+    pub(crate) fn load_with_merges(
+        gguf: &Gguf,
+        trim_after: Option<fn(&str) -> bool>,
+    ) -> Result<Spm, Error> {
+        let mut spm = Spm::load(gguf, trim_after)?;
         let rules = vocab::strings(gguf, "tokenizer.ggml.merges")?;
         let rules = (0u32..).zip(rules).filter_map(|(rank, rule)| {
             let (left, right) = vocab::split_merge(rule)?;

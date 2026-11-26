@@ -445,6 +445,21 @@ fn sentencepiece_space_prefix_can_be_turned_off() {
 }
 
 #[test]
+fn stop_tokens_add_legacy_marker_only_for_phi3() {
+    let build = |arch: &str| {
+        sentencepiece(
+            &[("<|end|>", 4, 0.0)],
+            vec![
+                ("general.architecture".into(), Value::String(arch.into())),
+                ("tokenizer.ggml.eos_token_id".into(), Value::U32(3)),
+            ],
+        )
+    };
+    assert_eq!(build("phi3").stop_tokens(), [3, 2]);
+    assert_eq!(build("llama").stop_tokens(), [3]);
+}
+
+#[test]
 fn phi3_trims_whitespace_only_after_selected_special_tokens() {
     let tokens = [
         ("<|endoftext|>", 4, 0.0),
