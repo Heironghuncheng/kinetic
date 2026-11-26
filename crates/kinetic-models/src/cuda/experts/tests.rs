@@ -328,3 +328,59 @@ fn device_routing_picks_what_the_host_picks() {
         assert!(group[2] as usize <= EXPERT_GROUP);
     }
 }
+
+/// Every expert of several layers copied to the device at load holds the
+/// bytes the host stages for it: the copies of one layer never overwrite
+/// staging an earlier layer's copies still read.
+#[test]
+fn experts_loaded_at_once_hold_their_bytes() {
+    let Some(g) = gpu() else {
+        eprintln!("skipped: no CUDA device or kernels");
+        return;
+    };
+    let (d, f, count, layers) = (256, 256, 64, 4);
+    let mut seed = 3;
+    let ty = TensorType::Q8_0;
+    let data: Vec<[Vec<u8>; 3]> = (0..layers)
+        .map(|_| std::array::from_fn(|_| random_experts(ty, f, d, count, &mut seed)))
+        .collect();
+    let router = vec![0u8; 4 * d * count];
+    let moes: Vec<Moe> = data
+        .iter()
+        .map(|[gate, up, down]| {
+            let experts = |data, rows, cols| Experts {
+                ty,
+                data,
+                rows,
+                cols,
+                stride: rows * cols / ty.block_len() * ty.block_bytes(),
+            };
+            Moe {
+                router: Matrix::new(TensorType::F32, &router, count, d),
+                gate: experts(&gate[..], f, d),
+                up: experts(&up[..], f, d),
+                down: experts(&down[..], d, f),
+                n_used: 2,
+                shared_gate: None,
+                gating: Gating::Softmax,
+                glu: Glu::Silu,
+                weight_scale: 1.0,
+                scales: Default::default(),
+                norms: None,
+            }
+        })
+        .collect();
+    let off = super::Offload::new(&g, moes, &[1; 4], 1 << 30, None, 0).unwrap();
+    assert!(off.is_resident());
+    let arena = off.arenas[off.cache.pool_of(0)].to_vec().unwrap();
+    let slot_bytes = off.plan.pools[0].slot_bytes;
+    let mut want = vec![0; off.staging.region];
+    for (l, moe) in off.moes.iter().enumerate() {
+        for e in 0..count {
+            let len = form::stage(moe, e, &mut want);
+            let slot = off.cache.slot(l, e).unwrap() as usize;
+            let got = &arena[slot * slot_bytes..][..len];
+            assert!(got == &want[..len], "layer {l} expert {e}");
+        }
+    }
+}

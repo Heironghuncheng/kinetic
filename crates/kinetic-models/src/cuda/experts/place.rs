@@ -160,12 +160,11 @@ impl Offload<'_> {
         let pool = self.cache.pool_of(l);
         let slot_bytes = self.plan.pools[pool].slot_bytes;
         // Rounds alternate between the two halves of the staging, so one
-        // half is filled while the other's copies run.
+        // half is filled while the other's copies run; a half is refilled
+        // only once its copies, of this call or an earlier one, are done.
         for (round, batch) in loads.chunks(half).enumerate() {
             let side = round % 2;
-            if round >= 2 {
-                self.staged[side].synchronize()?;
-            }
+            self.staged[side].synchronize()?;
             let moe = &self.moes[l];
             let staging = &mut self.staging.demand.as_mut_slice()[side * half * region..];
             pool::for_each_chunk(&mut staging[..batch.len() * region], region, |i, dst| {
