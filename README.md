@@ -32,9 +32,9 @@ speed-up ever changes the answer.
 ## Status: beta, on the road to 0.2
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/coverage/progress-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="assets/coverage/progress-light.svg">
-  <img src="assets/coverage/progress-light.svg" alt="Next update 0.1.1: 33%, 4 of 12 done." width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/coverage/progress-0.1.1-4-of-12-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/coverage/progress-0.1.1-4-of-12-light.svg">
+  <img src="assets/coverage/progress-0.1.1-4-of-12-light.svg" alt="Next update 0.1.1: 33%, 4 of 12 done." width="100%">
 </picture>
 
 **0.2 is the release where Kinetic runs every popular model llama.cpp runs.** Until then we
