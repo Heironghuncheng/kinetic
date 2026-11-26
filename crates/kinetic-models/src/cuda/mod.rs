@@ -1196,7 +1196,8 @@ impl<'m> CudaModel<'m> {
         if let Some(net) = &self.network {
             let offload = self.offload.as_ref().expect("a network has experts");
             let output_norm = &self.output_norm;
-            let record = flow == Flow::Commit && work.batch.len() == 1 && !self.eager;
+            // the network takes no part in a flow: a draft's pass records too
+            let record = work.batch.len() <= MAX_BATCH && !self.eager;
             return net.queue(
                 &self.gpu,
                 &self.layers,

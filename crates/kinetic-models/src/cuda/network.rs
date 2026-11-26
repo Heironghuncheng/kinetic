@@ -69,8 +69,9 @@ pub(super) struct NetBuffers {
     normed: GemvInput,
     control: ControlBuffers,
     rel: RelBuffers,
-    /// The parts of a one-token step, recorded once.
-    graphs: Vec<Graph>,
+    /// Per batch length, the parts of a step over that many tokens,
+    /// recorded once.
+    graphs: Vec<Vec<Graph>>,
 }
 
 struct ControlBuffers {
@@ -253,7 +254,8 @@ impl CudaNetwork {
     /// its scratch, and leaves the output normalized by `output_norm` in
     /// the scratch for the head. With `record` and experts off the device,
     /// everything between two layers' read-back of their routing runs as a
-    /// graph the state keeps, recorded the first time.
+    /// graph the state keeps for batches of this length, recorded the first
+    /// time.
     #[allow(clippy::too_many_arguments)]
     pub fn queue(
         &self,
@@ -279,7 +281,10 @@ impl CudaNetwork {
         } = work;
         let b = net.as_mut().expect("a state of a network model");
         let experts = experts.as_mut().expect("a state of an expert model");
-        let mut graphs = std::mem::take(&mut b.graphs);
+        if b.graphs.len() <= n {
+            b.graphs.resize_with(n + 1, Vec::new);
+        }
+        let mut graphs = std::mem::take(&mut b.graphs[n]);
         let record = record && !offload.is_resident();
         let replay = record && graphs.len() == routed.len() + 1;
         if !replay {
@@ -315,7 +320,7 @@ impl CudaNetwork {
                 queue_part()?;
             }
         }
-        b.graphs = graphs;
+        b.graphs[n] = graphs;
         Ok(())
     }
 
