@@ -25,29 +25,51 @@ struct DepthMixArgs {
 
 // Per token and output: the states normalized by their root mean square,
 // weighted by the softmax of their dot products with the query over the
-// square root of d. grid n, block 256.
+// square root of d. grid n, block 256. Every thread runs through its values
+// once for all the squares and dot products, and they are added up across
+// the block together, each in the order `block_sum` adds one.
 extern "C" __global__ void depth_mix(DepthMixArgs a) {
+    constexpr unsigned SUMS = DEPTH_MAX_STATES * (1 + DEPTH_MAX_OUTS);
+    __shared__ float part[WARP][SUMS];
     const size_t row = static_cast<size_t>(blockIdx.x) * a.d;
+    // the squares of state s, then its dot products with each output's query
+    float sums[SUMS] = {};
+    for (unsigned k = threadIdx.x; k < a.d; k += blockDim.x) {
+#pragma unroll
+        for (unsigned s = 0; s < DEPTH_MAX_STATES; ++s) {
+            if (s >= a.n_states) break;
+            const float x = a.states[s][row + k];
+            sums[s] += x * x;
+#pragma unroll
+            for (unsigned o = 0; o < DEPTH_MAX_OUTS; ++o) {
+                if (o >= a.n_outs) break;
+                const float* q = a.queries + static_cast<size_t>(min(o, a.n_queries - 1)) * a.d;
+                sums[DEPTH_MAX_STATES * (1 + o) + s] += a.states[s][row + k] * q[k];
+            }
+        }
+    }
+    const unsigned warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+#pragma unroll
+    for (unsigned i = 0; i < SUMS; ++i) {
+        const float v = warp_sum(sums[i]);
+        if (lane == 0) part[warp][i] = v;
+    }
+    __syncthreads();
+#pragma unroll
+    for (unsigned i = 0; i < SUMS; ++i) sums[i] = warp_sum(lane < blockDim.x / WARP ? part[lane][i] : 0.0f);
+
     float inv[DEPTH_MAX_STATES];
     for (unsigned s = 0; s < DEPTH_MAX_STATES; ++s) {
         if (s >= a.n_states) break;
-        float ss = 0.0f;
-        for (unsigned k = threadIdx.x; k < a.d; k += blockDim.x) {
-            const float x = a.states[s][row + k];
-            ss += x * x;
-        }
-        inv[s] = 1.0f / sqrtf(block_sum(ss) / static_cast<float>(a.d) + DEPTH_EPS);
+        inv[s] = 1.0f / sqrtf(sums[s] / static_cast<float>(a.d) + DEPTH_EPS);
     }
     const float scale = 1.0f / sqrtf(static_cast<float>(a.d));
     for (unsigned o = 0; o < a.n_outs; ++o) {
-        const float* q = a.queries + static_cast<size_t>(min(o, a.n_queries - 1)) * a.d;
         float p[DEPTH_MAX_STATES];
         float top = -CUDART_INF_F;
         for (unsigned s = 0; s < DEPTH_MAX_STATES; ++s) {
             if (s >= a.n_states) break;
-            float dot = 0.0f;
-            for (unsigned k = threadIdx.x; k < a.d; k += blockDim.x) dot += a.states[s][row + k] * q[k];
-            p[s] = block_sum(dot) * inv[s] * scale;
+            p[s] = sums[DEPTH_MAX_STATES * (1 + o) + s] * inv[s] * scale;
             top = fmaxf(top, p[s]);
         }
         float sum = 0.0f;
