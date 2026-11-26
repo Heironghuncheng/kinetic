@@ -22,6 +22,7 @@
 #include "gemv_low_k.cuh"
 #include "gemv_mma.cuh"
 #include "gemv_q8_0.cuh"
+#include "mapped.cuh"
 #include "moe.cuh"
 #include "moe_wide.cuh"
 #include "norm.cuh"

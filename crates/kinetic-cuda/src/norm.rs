@@ -43,6 +43,36 @@ struct NormArgs {
     out_offset: u32,
 }
 
+/// The arguments of a norm of `rows` rows of `x` into the columns from `at`
+/// of `out`, checked.
+fn norm_args(
+    x: &DeviceBuffer<f32>,
+    norm: RmsNorm,
+    out: &mut GemvInput,
+    at: usize,
+    rows: usize,
+) -> Result<NormArgs> {
+    let len = norm.weight.len();
+    if !len.is_multiple_of(32) || len > MAX_ROW || !at.is_multiple_of(32) || at + len > out.width()
+    {
+        return Err(Error::Shape(format!(
+            "norm of {len} into columns {at}.. of inputs of {}",
+            out.width()
+        )));
+    }
+    x.check_holds(rows * len, "rms_norm input")?;
+    out.check_rows(rows)?;
+    Ok(NormArgs {
+        x: x.device_ptr(),
+        weight: norm.weight.device_ptr(),
+        out: out.act(),
+        eps: norm.eps,
+        len: len as u32,
+        out_stride: out.width() as u32,
+        out_offset: at as u32,
+    })
+}
+
 #[repr(C)]
 struct AddNormArgs {
     x: u64,
@@ -81,28 +111,7 @@ impl Kernels {
         rows: usize,
         stream: &Stream,
     ) -> Result<()> {
-        let len = norm.weight.len();
-        if !len.is_multiple_of(32)
-            || len > MAX_ROW
-            || !at.is_multiple_of(32)
-            || at + len > out.width()
-        {
-            return Err(Error::Shape(format!(
-                "norm of {len} into columns {at}.. of inputs of {}",
-                out.width()
-            )));
-        }
-        x.check_holds(rows * len, "rms_norm input")?;
-        out.check_rows(rows)?;
-        let args = NormArgs {
-            x: x.device_ptr(),
-            weight: norm.weight.device_ptr(),
-            out: out.act(),
-            eps: norm.eps,
-            len: len as u32,
-            out_stride: out.width() as u32,
-            out_offset: at as u32,
-        };
+        let args = norm_args(x, norm, out, at, rows)?;
         // SAFETY: matches `NormArgs`; the kernel reads `rows * len` inputs
         // and `len` weights and writes inside `rows` outputs, all checked.
         unsafe {
@@ -113,6 +122,32 @@ impl Kernels {
                 &args,
             )
         }
+    }
+
+    /// [`Kernels::rms_norm`] of `xs[j]` by `norms[j]` into the columns from
+    /// `at[j]` of `out`, both in one launch.
+    pub fn rms_norm_pair(
+        &self,
+        xs: [&DeviceBuffer<f32>; 2],
+        norms: [RmsNorm; 2],
+        out: &mut GemvInput,
+        at: [usize; 2],
+        rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let args = [
+            norm_args(xs[0], norms[0], out, at[0], rows)?,
+            norm_args(xs[1], norms[1], out, at[1], rows)?,
+        ];
+        let config = LaunchConfig {
+            grid: [rows as u32, 2, 1],
+            block: [ROW_THREADS, 1, 1],
+            shared_bytes: 0,
+        };
+        // SAFETY: matches `NormPairArgs`; each norm reads `rows * len`
+        // inputs and `len` weights and writes inside `rows` outputs, all
+        // checked.
+        unsafe { launch_struct(&self.rms_norm2_q8, config, stream, &args) }
     }
 
     /// Queues `out = x`, unnormalized, for the first `rows` rows of `x`.
@@ -283,6 +318,28 @@ impl Kernels {
         unsafe {
             self.add_f32
                 .launch(config, stream, &mut [arg(&dst), arg(&src), arg(&n)])
+        }
+    }
+
+    /// Queues `out = a + b` over the first `len` values.
+    pub fn sum(
+        &self,
+        out: &mut DeviceBuffer<f32>,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        out.check_holds(len, "sum")?;
+        a.check_holds(len, "addend")?;
+        b.check_holds(len, "addend")?;
+        let (o, x, y, n) = (out.device_ptr(), a.device_ptr(), b.device_ptr(), len as u32);
+        let config = LaunchConfig::linear(n.div_ceil(ADD_THREADS), ADD_THREADS);
+        // SAFETY: matches `sum_f32(float*, const float*, const float*,
+        // unsigned)`; every buffer holds `len` values, as checked.
+        unsafe {
+            self.sum_f32
+                .launch(config, stream, &mut [arg(&o), arg(&x), arg(&y), arg(&n)])
         }
     }
 

@@ -7,7 +7,7 @@
 use std::rc::Rc;
 
 use kinetic_cuda::{
-    Batch, DeviceBuffer, DeviceMatrix, GemvInput, Graph, RmsNorm, DEPTH_MAX_STATES,
+    Batch, DeviceBuffer, DeviceMatrix, GemvInput, Graph, RmsNorm, Stream, DEPTH_MAX_STATES,
 };
 
 use super::experts::{CudaExperts, ExpertWork, Offload};
@@ -67,7 +67,8 @@ pub(super) struct NetBuffers {
     inputs: [DeviceBuffer<f32>; 3],
     messages: [DeviceBuffer<f32>; 4],
     normed: GemvInput,
-    control: ControlBuffers,
+    /// The second for a control run beside the first's.
+    control: [ControlBuffers; 2],
     rel: RelBuffers,
     /// Per batch length, the parts of a step over that many tokens,
     /// recorded once.
@@ -243,7 +244,10 @@ impl CudaNetwork {
             inputs: [rows_of()?, rows_of()?, rows_of()?],
             messages: [rows_of()?, rows_of()?, rows_of()?, rows_of()?],
             normed: GemvInput::batch(&gpu.ctx, d, rows)?,
-            control: ControlBuffers::new(gpu, d, rank, rows)?,
+            control: [
+                ControlBuffers::new(gpu, d, rank, rows)?,
+                ControlBuffers::new(gpu, d, rank, rows)?,
+            ],
 
             rel: relative(&layers[0]).buffers(gpu, rows)?,
             graphs: Vec::new(),
@@ -346,16 +350,16 @@ impl CudaNetwork {
         let b = &mut *run.b;
         let first = match part.checked_sub(1).map(|p| routed[p]) {
             Some(i) => {
-                let Step::Layer { slot, .. } = self.steps[i] else {
+                let Step::Layer { layer, slot, .. } = self.steps[i] else {
                     unreachable!("a routed step is a layer")
                 };
+                self.experts[layer].gather(layer, gpu, &mut b.y, run.experts, offload, n)?;
                 let LayerState::Relative(state) = &mut run.states[slot] else {
                     unreachable!("network slots attend by relative distance")
                 };
                 let w = relative(&layers[slot]);
                 w.ffn_conv(gpu, &b.y, state, run.batch, &mut b.attn)?;
-                b.cur.copy_from_device(0, &b.ffn_in, 0..len, stream)?;
-                k.add(&mut b.cur, &b.attn, len, stream)?;
+                k.sum(&mut b.cur, &b.ffn_in, &b.attn, len, stream)?;
                 i + 1
             }
             None => {
@@ -467,9 +471,17 @@ impl CudaNetwork {
                     inputs.iter_mut().take(if three { 3 } else { 1 }).collect();
                 k.depth_mix(&states, query, &mut outs, d, n, stream)?;
                 if let Some((_, cs)) = controls {
+                    // The second input's control runs beside the others.
+                    gpu.fork()?;
+                    let [main, beside] = control;
                     for (j, x) in outs.into_iter().enumerate() {
-                        self.control(gpu, &cs[j], x, &messages[j], control, n)?;
+                        let (b, on) = match j {
+                            1 => (&mut *beside, &gpu.side),
+                            _ => (&mut *main, &gpu.stream),
+                        };
+                        cs[j].apply(gpu, &self.ones, x, &messages[j], b, n, on)?;
                     }
+                    gpu.join()?;
                 }
                 match three {
                     true => [&inputs[0], &inputs[1], &inputs[2]],
@@ -477,41 +489,27 @@ impl CudaNetwork {
                 }
             }
         };
-        w.forward(gpu, rel, inputs, state, batch, attn)?;
-
         // The first layer of a block starts from the attention output alone
         // and hands its input to the blocks later layers mix.
         if self.starts[run.layer] {
+            w.forward(gpu, rel, inputs, state, batch, ffn_in)?;
             blocks[depth.blocks].copy_from_device(0, cur, 0..len, stream)?;
             depth.blocks += 1;
-            ffn_in.copy_from_device(0, attn, 0..len, stream)?;
         } else {
-            ffn_in.copy_from_device(0, cur, 0..len, stream)?;
-            k.add(ffn_in, attn, len, stream)?;
+            w.forward(gpu, rel, inputs, state, batch, attn)?;
+            k.sum(ffn_in, cur, attn, len, stream)?;
         }
         let mut states: Vec<&DeviceBuffer<f32>> = blocks[..depth.blocks].iter().collect();
         states.push(ffn_in);
         k.depth_mix(&states, &wiring.ffn_query, &mut [&mut *h], d, n, stream)?;
         if let Some((_, cs)) = controls {
-            self.control(gpu, &cs[3], h, &messages[3], control, n)?;
+            cs[3].apply(gpu, &self.ones, h, &messages[3], &mut control[0], n, stream)?;
         }
         let norm = RmsNorm {
             weight: &self.ffn_norms[run.layer],
             eps: self.eps,
         };
         k.rms_norm(h, norm, normed, 0, n, stream)
-    }
-
-    fn control(
-        &self,
-        gpu: &Gpu,
-        c: &CudaControl,
-        x: &mut DeviceBuffer<f32>,
-        message: &DeviceBuffer<f32>,
-        b: &mut ControlBuffers,
-        n: usize,
-    ) -> kinetic_cuda::Result<()> {
-        c.apply(gpu, &self.ones, x, message, b, n)
     }
 }
 
@@ -525,8 +523,10 @@ impl CudaControl {
         })
     }
 
-    /// `Control::apply` on the device: `x` takes in `message` through this
-    /// low-rank gate; `ones` holds a weight of one per value of a row.
+    /// `Control::apply` on the device, queued on `stream`: `x` takes in
+    /// `message` through this low-rank gate; `ones` holds a weight of one
+    /// per value of a row.
+    #[allow(clippy::too_many_arguments)]
     fn apply(
         &self,
         gpu: &Gpu,
@@ -535,15 +535,15 @@ impl CudaControl {
         message: &DeviceBuffer<f32>,
         b: &mut ControlBuffers,
         n: usize,
+        stream: &Stream,
     ) -> kinetic_cuda::Result<()> {
-        let (k, stream) = (&gpu.kernels, &gpu.stream);
+        let k = &gpu.kernels;
         let (c, d) = (self, ones.len());
         let norm = RmsNorm {
             weight: ones,
             eps: DEPTH_EPS,
         };
-        k.rms_norm(x, norm, &mut b.joined, 0, n, stream)?;
-        k.rms_norm(message, norm, &mut b.joined, d, n, stream)?;
+        k.rms_norm_pair([x, message], [norm; 2], &mut b.joined, [0, d], n, stream)?;
         k.gemv_rows(&c.down, c.down.rows(), &b.joined, 0..n, &mut b.code, stream)?;
         k.input_rows(&b.code, &mut b.code_in, n, stream)?;
         k.gemv_rows(&c.gain, d, &b.code_in, 0..n, &mut b.gain, stream)?;
@@ -555,7 +555,6 @@ impl CudaControl {
 impl NetBuffers {
     /// Device bytes held.
     pub fn size_bytes(&self) -> usize {
-        let c = &self.control;
         let f32s = [
             &self.cur,
             &self.prelude,
@@ -563,18 +562,19 @@ impl NetBuffers {
             &self.h,
             &self.y,
             &self.attn,
-            &c.code,
-            &c.gain,
-            &c.forget,
         ]
         .into_iter()
         .chain(&self.blocks)
         .chain(&self.bank)
         .chain(&self.inputs)
         .chain(&self.messages);
-        let inputs = [&self.normed, &c.joined, &c.code_in];
         4 * f32s.map(DeviceBuffer::len).sum::<usize>()
-            + inputs.iter().map(|i| gemv_bytes(i)).sum::<usize>()
+            + gemv_bytes(&self.normed)
+            + self
+                .control
+                .iter()
+                .map(ControlBuffers::size_bytes)
+                .sum::<usize>()
             + self.rel.size_bytes()
     }
 }
@@ -608,6 +608,12 @@ fn relative(l: &CudaLayer) -> &RelLayer {
 }
 
 impl ControlBuffers {
+    fn size_bytes(&self) -> usize {
+        4 * (self.code.len() + self.gain.len() + self.forget.len())
+            + gemv_bytes(&self.joined)
+            + gemv_bytes(&self.code_in)
+    }
+
     fn new(gpu: &Gpu, d: usize, rank: usize, rows: usize) -> kinetic_cuda::Result<ControlBuffers> {
         let f32s = |len: usize| DeviceBuffer::<f32>::new(&gpu.ctx, rows * len);
         Ok(ControlBuffers {
@@ -636,6 +642,6 @@ pub(super) fn control_on(
     let ones = gpu.vector(&vec![1.0; d])?;
     let mut xs = gpu.vector(x)?;
     let m = gpu.vector(message)?;
-    control.apply(gpu, &ones, &mut xs, &m, &mut b, n)?;
+    control.apply(gpu, &ones, &mut xs, &m, &mut b, n, &gpu.stream)?;
     xs.to_vec()
 }

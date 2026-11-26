@@ -6,14 +6,20 @@ use std::ptr;
 use std::rc::Rc;
 
 use crate::context::Context;
+use crate::driver::CuDevicePtr;
 use crate::error::{Error, Result};
 use crate::memory::{DeviceBuffer, DeviceCopy};
 use crate::stream::Stream;
+
+/// CU_MEMHOSTALLOC_DEVICEMAP: kernels may read and write the memory.
+const DEVICE_MAP: u32 = 2;
 
 /// Page-locked host memory, which the device reads and writes directly, so
 /// copies to and from it run asynchronously alongside other work.
 pub struct PinnedBuffer<T: DeviceCopy> {
     ptr: *mut T,
+    /// The address kernels reach the memory at.
+    mapped: CuDevicePtr,
     len: usize,
     ctx: Rc<Context>,
     _elements: PhantomData<T>,
@@ -27,18 +33,23 @@ impl<T: DeviceCopy> PinnedBuffer<T> {
             .ok_or_else(|| Error::Shape(format!("{len} elements overflow the address space")))?;
         let api = ctx.enter()?;
         let mut raw: *mut c_void = ptr::null_mut();
+        let mut mapped = 0;
         if bytes > 0 {
-            // SAFETY: `raw` is a valid out-pointer; flags 0 asks for plain
-            // page-locked memory.
+            // SAFETY: `raw` is a valid out-pointer.
             api.check("cuMemHostAlloc", unsafe {
-                (api.mem_host_alloc)(&mut raw, bytes, 0)
+                (api.mem_host_alloc)(&mut raw, bytes, DEVICE_MAP)
             })?;
             // SAFETY: the allocation holds `bytes` bytes, and zero bytes are a
             // valid `T`.
             unsafe { ptr::write_bytes(raw.cast::<u8>(), 0, bytes) };
+            // SAFETY: `raw` was mapped above; flags must be 0.
+            api.check("cuMemHostGetDevicePointer", unsafe {
+                (api.mem_host_get_device_pointer)(&mut mapped, raw, 0)
+            })?;
         }
         Ok(PinnedBuffer {
             ptr: raw.cast(),
+            mapped,
             len,
             ctx: ctx.clone(),
             _elements: PhantomData,
@@ -47,6 +58,11 @@ impl<T: DeviceCopy> PinnedBuffer<T> {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// The device address of element `at`, for kernels.
+    pub(crate) fn mapped_at(&self, at: usize) -> u64 {
+        self.mapped + (at * size_of::<T>()) as u64
     }
 
     pub fn is_empty(&self) -> bool {

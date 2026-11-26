@@ -143,7 +143,8 @@ impl CudaExperts {
         n: usize,
     ) -> kinetic_cuda::Result<()> {
         self.send(l, gpu, h, work, off, n)?;
-        self.finish(l, gpu, h, y, work, off, n)
+        self.finish(l, gpu, h, y, work, off, n)?;
+        self.gather(l, gpu, y, work, off, n)
     }
 
     /// The part of [`CudaExperts::mix`] before the host reads the routing,
@@ -170,12 +171,14 @@ impl CudaExperts {
         // SAFETY: the host reads the buffer only after `work.ready`, which
         // [`CudaExperts::finish`] records next.
         unsafe {
-            work.down.download(0, &work.gates, 0..n * g, stream)?;
-            work.down.download(n * g, h, 0..n * d, stream)
+            k.to_host(&mut work.down, 0, &work.gates, 0..n * g, stream)?;
+            k.to_host(&mut work.down, n * g, h, 0..n * d, stream)
         }
     }
 
-    /// The rest of [`CudaExperts::mix`] after [`CudaExperts::send`].
+    /// The part of [`CudaExperts::mix`] after [`CudaExperts::send`] that
+    /// reads the routing: the experts run, and the host's outputs queued
+    /// to be copied over.
     #[allow(clippy::too_many_arguments)]
     pub fn finish(
         &self,
@@ -231,9 +234,28 @@ impl CudaExperts {
                     .upload(0..len, &mut work.out, assigned.device * d, stream)?
             };
         }
-        // SAFETY: every row index points at a device or host output written
-        // above, inside the room for a full batch of assignments.
-        unsafe { self.combine(gpu, work, y, n, d, picks_per) }
+        Ok(())
+    }
+
+    /// The rest of [`CudaExperts::mix`] after [`CudaExperts::finish`], which
+    /// a graph can record: the picks' outputs weighted into `y`. Nothing
+    /// with every expert on the device, whose finish does it.
+    pub fn gather(
+        &self,
+        l: usize,
+        gpu: &Gpu,
+        y: &mut DeviceBuffer<f32>,
+        work: &ExpertWork,
+        off: &Offload,
+        n: usize,
+    ) -> kinetic_cuda::Result<()> {
+        if off.is_resident() {
+            return Ok(());
+        }
+        let moe = &off.moes[l];
+        // SAFETY: finish pointed every row index at a device or host output,
+        // inside the room for a full batch of assignments.
+        unsafe { self.combine(gpu, work, y, n, moe.router.cols, moe.n_used) }
     }
 
     /// [`CudaExperts::mix`] with every expert on the device: the routing,
