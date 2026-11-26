@@ -529,10 +529,13 @@ impl<'m> CudaModel<'m> {
         moes: Vec<Moe<'m>>,
         cache: Option<usize>,
     ) -> Result<Offload<'m>, LoadError> {
+        let (before, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
         let mut state = self.new_dense_state().map_err(cuda_error)?;
         state.work.experts = Some(self.expert_work(&moes).map_err(cuda_error)?);
         state.work.pass = Some(PassRows::new(&self.gpu, self.n_embd).map_err(cuda_error)?);
-        let state_bytes = state.work.size_bytes();
+        // many small buffers take more than their bytes
+        let (after, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
+        let state_bytes = state.work.size_bytes().max(before.saturating_sub(after));
         drop(state);
         let (free, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
         let mut budget = free.saturating_sub(state_bytes + self.gpu.reserve);

@@ -7,18 +7,18 @@ use std::fmt;
 use super::cache::SlotLayout;
 
 /// Device memory the planner leaves free on a device of `total` bytes:
-/// the larger of [`MIN_RESERVE`] and a tenth of the device. The desktop
+/// the larger of [`MIN_RESERVE`] and a twentieth of the device. The desktop
 /// and other programs take and return memory while a model runs, and on
 /// Windows an allocation past the dedicated memory does not fail but lands
 /// in system memory, reached over PCIe, which makes every kernel that
 /// touches it many times slower. A margin that stays free keeps everything
 /// in dedicated memory.
 pub fn device_reserve(total: usize) -> usize {
-    MIN_RESERVE.max(total / 10)
+    MIN_RESERVE.max(total / 20)
 }
 
 /// The least [`device_reserve`] keeps free.
-pub const MIN_RESERVE: usize = 600 << 20;
+pub const MIN_RESERVE: usize = 300 << 20;
 
 /// The placement chosen at load time.
 #[derive(Clone, Debug)]
