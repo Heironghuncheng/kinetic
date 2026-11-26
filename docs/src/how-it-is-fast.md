@@ -62,6 +62,15 @@ pass, with each row seeing only its own path (as in SpecInfer, Miao et al.,
 that miss outright, drafting pauses for longer and longer, so text that
 cannot be guessed costs almost nothing extra.
 
+A pass over more rows is not free everywhere: layers or experts that run on
+the CPU, and the work of rolling a pass back, make each row cost something.
+So RAD-1 times its own steps by how many rows they run, on this model as it
+is placed, and keeps track of how far drafts have lately come true, judging
+every draft once the tokens it guessed are known. A draft is checked only up
+to the length that gives the most tokens per second expected, and not at
+all when a plain step gives as many, so drafting does not make decoding
+slower, on one GPU or split between the GPU and the CPU.
+
 ### Why the output does not change
 
 Verification chooses each token exactly as plain decoding would: from the

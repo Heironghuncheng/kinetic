@@ -45,8 +45,6 @@ us what broke and sent pull requests.
   `"chat_template_kwargs": {"enable_thinking": false}` until 0.2.
 - Unsloth UD quants (IQ4_XS, IQ3_XXS, IQ2_XS, IQ2_XXS) run on the CPU only
   ([#1](https://github.com/Veloresearch/kinetic/issues/1)).
-- Speculative decoding can be slower than plain decoding on a model split between the GPU
-  and the CPU.
 - Windows and Linux on x86-64 only, NVIDIA GPUs from Turing (RTX 20) on, one GPU per model.
 - `-hf` is refused with a hint to use `kinetic pull`.
 - A crash report on the AMD RX 9070 under Linux, and older AMD integrated GPUs with 64-wide
@@ -62,7 +60,6 @@ is main as it was last night, untested: `install.sh --nightly` or `install.ps1 -
 - Benchmark numbers for a first edit and a repeated edit, reported separately.
 - Tool calls with thinking on come back as tool calls.
 - Unsloth UD quants on NVIDIA GPUs.
-- Speculative decoding that is never slower than plain decoding on split models.
 - macOS on Apple Silicon, on the CPU and on the GPU through Metal.
 - Older NVIDIA GPUs (Pascal, Volta), and several GPUs for one model with `--gpus`.
 - Faster follow-ups in a conversation.
