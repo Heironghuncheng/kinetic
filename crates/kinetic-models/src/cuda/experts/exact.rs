@@ -298,7 +298,8 @@ pub(super) fn run_experts(moe: &Moe, h: &[f32], jobs: &[Job]) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    /// Every grouped type's vector form gives the scalar form's bits.
+    /// Every grouped type's vector form gives the scalar form's bits, for
+    /// one input and for several.
     #[test]
     fn vector_grouped_dots_match_the_scalar_ones() {
         use TensorType::*;
@@ -309,14 +310,18 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let cols = 512;
-        for ty in [IQ4NL, NVFP4, Q8_0, Q2_0, IQ2S, IQ1S] {
+        for (ty, inputs) in [IQ4NL, NVFP4, Q8_0, Q2_0, IQ2S, IQ1S]
+            .into_iter()
+            .flat_map(|ty| [(ty, 1), (ty, 3)])
+        {
             let Some(fast) = dots_fn(ty) else {
                 eprintln!("skipped: no AVX2");
                 return;
             };
+            // an odd count of 64-value blocks where the type allows
+            let cols = if ty.block_len() == 256 { 512 } else { 576 };
             for _ in 0..20 {
-                let xs: Vec<(Vec<i8>, Vec<f32>)> = (0..3)
+                let xs: Vec<(Vec<i8>, Vec<f32>)> = (0..inputs)
                     .map(|_| {
                         let x: Vec<f32> = (0..cols)
                             .map(|_| (next() % 2001) as f32 / 400.0 - 2.5)

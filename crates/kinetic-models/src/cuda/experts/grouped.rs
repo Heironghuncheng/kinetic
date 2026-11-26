@@ -4,6 +4,8 @@
 //! scaled sums are added one after another as the scalar form adds them, so
 //! every result keeps its bits.
 
+mod single;
+
 use std::arch::x86_64::*;
 
 use half::f16;
@@ -22,9 +24,9 @@ pub const MOST: usize = 8;
 pub type Dots = fn(&[u8], &[Input], &mut [f32]);
 
 /// The AVX2 products of rows of a grouped type, if this CPU has AVX2 and
-/// the type has them.
+/// F16C and the type has them.
 pub fn dots_fn(ty: TensorType) -> Option<Dots> {
-    if !is_x86_feature_detected!("avx2") {
+    if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("f16c") {
         return None;
     }
     // SAFETY (each closure): AVX2 was just detected.
@@ -119,6 +121,10 @@ unsafe fn load16(bytes: &[u8]) -> __m128i {
 
 #[target_feature(enable = "avx2")]
 unsafe fn iq4_nl(row: &[u8], xs: &[Input], out: &mut [f32]) {
+    if let [x] = xs {
+        out[0] = unsafe { single::iq4_nl(row, *x) };
+        return;
+    }
     let t = unsafe { load16(IQ4NL_VALUES.map(|v| v as u8).as_slice()) };
     let mut acc = [0.0f32; MOST];
     for (b, w) in row.chunks_exact(18).enumerate() {
@@ -149,6 +155,10 @@ unsafe fn q8_0(row: &[u8], xs: &[Input], out: &mut [f32]) {
 
 #[target_feature(enable = "avx2")]
 unsafe fn nvfp4(row: &[u8], xs: &[Input], out: &mut [f32]) {
+    if let [x] = xs {
+        out[0] = unsafe { single::nvfp4(row, *x) };
+        return;
+    }
     let t = unsafe { load16(MXFP4_VALUES.map(|v| v as u8).as_slice()) };
     let mut acc = [0.0f32; MOST];
     for (b, w) in row.chunks_exact(36).enumerate() {
@@ -202,6 +212,10 @@ unsafe fn q2_0(row: &[u8], xs: &[Input], out: &mut [f32]) {
 
 #[target_feature(enable = "avx2")]
 unsafe fn iq2_s(row: &[u8], xs: &[Input], out: &mut [f32]) {
+    if let [x] = xs {
+        out[0] = unsafe { single::iq2_s(row, *x) };
+        return;
+    }
     let mut acc = [0.0f32; MOST];
     for (b, w) in row.chunks_exact(82).enumerate() {
         let d = half(w);
