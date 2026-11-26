@@ -204,8 +204,9 @@ fn dots_fn(_: TensorType) -> Option<Dots> {
 }
 
 /// Each of `ms`, alike in shape, applied as the device computes it to the
-/// input row `input(s)` of every job slot `s` of each expert in `experts`:
-/// `slots` rows of the matrices' height. A parallel task computes some rows
+/// input row `input(s)` of every job slot `s` of each expert in `experts`,
+/// and the products of each expert merged into one by `merge`: `slots` rows
+/// of the matrices' height. A parallel task computes and merges some rows
 /// of one expert for all of its slots, so each weight row is read once.
 fn products<const N: usize>(
     ms: [&Experts; N],
@@ -213,18 +214,19 @@ fn products<const N: usize>(
     x: &Inputs,
     input: impl Fn(usize) -> usize + Sync,
     slots: usize,
-) -> [Vec<f32>; N] {
+    merge: impl Fn(usize, [Vec<f32>; N]) -> Vec<f32> + Sync,
+) -> Vec<f32> {
     let rows = ms[0].rows;
     let tasks: Vec<(usize, usize)> = (0..experts.len())
         .flat_map(|k| (0..rows).step_by(ROWS_PER_TASK).map(move |r| (k, r)))
         .collect();
     let kinds = ms.map(|m| (device_type(m.ty), dots_fn(device_type(m.ty))));
-    let done: Vec<[Vec<f32>; N]> = pool::map(tasks.len(), |t| {
+    let done: Vec<Vec<f32>> = pool::map(tasks.len(), |t| {
         let (k, r0) = tasks[t];
         let (e, picks) = &experts[k];
         let inputs: Vec<usize> = picks.iter().map(|&s| input(s)).collect();
         let mut i = 0;
-        ms.map(|m| {
+        let outs = ms.map(|m| {
             let (ty, fast) = kinds[i];
             i += 1;
             let mut out = Vec::with_capacity(ROWS_PER_TASK * picks.len());
@@ -232,20 +234,19 @@ fn products<const N: usize>(
                 x.dots(ty, &row(m, *e, r), &inputs, fast, &mut out);
             }
             out
-        })
+        });
+        merge(*e, outs)
     });
-    std::array::from_fn(|i| {
-        let mut y = vec![0.0; slots * rows];
-        for (&(k, r0), out) in tasks.iter().zip(&done) {
-            let picks = &experts[k].1;
-            for (r, values) in out[i].chunks_exact(picks.len()).enumerate() {
-                for (&s, &v) in picks.iter().zip(values) {
-                    y[s * rows + r0 + r] = v;
-                }
+    let mut y = vec![0.0; slots * rows];
+    for (&(k, r0), out) in tasks.iter().zip(&done) {
+        let picks = &experts[k].1;
+        for (r, values) in out.chunks_exact(picks.len()).enumerate() {
+            for (&s, &v) in picks.iter().zip(values) {
+                y[s * rows + r0 + r] = v;
             }
         }
-        y
-    })
+    }
+    y
 }
 
 /// Whether [`Moe::run_experts`] already computes what the device does:
@@ -268,30 +269,33 @@ pub(super) fn run_experts(moe: &Moe, h: &[f32], jobs: &[Job]) -> Vec<f32> {
             None => experts.push((j.expert as usize, vec![s])),
         }
     }
-    let scale = |i: usize, y: &mut [f32]| {
-        if let Some(s) = &moe.scales[i] {
-            for (row, j) in y.chunks_exact_mut(y.len() / jobs.len()).zip(jobs) {
-                row.iter_mut().for_each(|v| *v *= s[j.expert as usize]);
-            }
-        }
+    let scaled = |i: usize, e: usize, v: f32| match &moe.scales[i] {
+        Some(s) => v * s[e],
+        None => v,
     };
     let x = Inputs::new(device_type(moe.gate.ty), h, d);
-    let [mut act, mut up] = products(
+    let act = products(
         [&moe.gate, &moe.up],
         &experts,
         &x,
         |s| jobs[s].row as usize,
         jobs.len(),
+        |e, [gate, up]| {
+            gate.iter()
+                .zip(&up)
+                .map(|(&g, &u)| moe.glu.apply(scaled(0, e, g), scaled(1, e, u)))
+                .collect()
+        },
     );
-    scale(0, &mut act);
-    scale(1, &mut up);
-    act.iter_mut()
-        .zip(&up)
-        .for_each(|(g, &u)| *g = moe.glu.apply(*g, u));
     let x = Inputs::new(device_type(moe.down.ty), &act, f);
-    let [mut out] = products([&moe.down], &experts, &x, |s| s, jobs.len());
-    scale(2, &mut out);
-    out
+    products(
+        [&moe.down],
+        &experts,
+        &x,
+        |s| s,
+        jobs.len(),
+        |e, [out]| out.into_iter().map(|v| scaled(2, e, v)).collect(),
+    )
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
