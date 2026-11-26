@@ -53,6 +53,7 @@ mod gemv;
 mod graph;
 mod kernels;
 mod layout;
+mod mapped;
 mod memory;
 mod module;
 mod moe;
