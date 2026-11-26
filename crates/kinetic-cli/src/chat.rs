@@ -252,7 +252,7 @@ fn conversation(
                 saved.sample(&mut request.sampling);
                 request.max_tokens = saved.get("--n-predict").and_then(|n| n.parse().ok());
                 think = saved.get("--reasoning") != Some("off");
-                "Settings saved; sampling and reasoning apply to the next answers, the rest from the next start.".to_owned()
+                "Sampling and reasoning from Settings apply to the next answers, the rest from the next start.".to_owned()
             }
             "/help" => help(),
             // not in /help on purpose
