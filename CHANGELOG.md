@@ -56,6 +56,8 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   projector.
 - LFM2.5 mixture of experts (`lfm2moe`), experimental, on the CPU and CUDA,
   with experts kept in system memory when they do not fit the GPU.
+- Microsoft Phi-3 Mini 4K Instruct (`phi3`) on the CPU, tested with
+  Microsoft's Q4_K_M GGUF. The 128K variant is not supported.
 
 ### Devices
 

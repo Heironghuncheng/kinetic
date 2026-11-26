@@ -25,6 +25,7 @@
 mod bpe;
 mod byte_level;
 mod pretokenize;
+mod profile;
 mod special;
 mod spm;
 mod stream;
@@ -38,6 +39,7 @@ use kinetic_gguf::Gguf;
 
 use bpe::Scratch;
 use pretokenize::Pattern;
+use profile::Profile;
 use special::{Segment, Specials};
 use spm::Spm;
 pub use stream::StreamDecoder;
@@ -70,6 +72,7 @@ impl std::error::Error for Error {}
 /// A tokenizer loaded from GGUF metadata.
 pub struct Tokenizer {
     model: Model,
+    profile: &'static Profile,
     bos: Option<u32>,
     eos: Option<u32>,
     add_bos: bool,
@@ -93,6 +96,7 @@ enum Model {
 impl Tokenizer {
     /// Builds the tokenizer described by the `tokenizer.ggml.*` keys.
     pub fn from_gguf(gguf: &Gguf) -> Result<Tokenizer, Error> {
+        let profile = profile::for_architecture(gguf.architecture());
         let (model, default_add_bos, default_ids) = match string(gguf, "tokenizer.ggml.model")? {
             "gpt2" => {
                 let pre = string(gguf, "tokenizer.ggml.pre")?;
@@ -118,8 +122,16 @@ impl Tokenizer {
                 (model, default_add_bos, (None, None))
             }
             // Files written before the ids were stored use these.
-            "llama" => (Model::Spm(Spm::load(gguf)?), true, (Some(1), Some(2))),
-            "gemma4" => (Model::Spm(Spm::load_with_merges(gguf)?), true, (None, None)),
+            "llama" => (
+                Model::Spm(Spm::load(gguf, profile)?),
+                true,
+                (Some(1), Some(2)),
+            ),
+            "gemma4" => (
+                Model::Spm(Spm::load_with_merges(gguf, profile)?),
+                true,
+                (None, None),
+            ),
             "bert" => (Model::Wpm(Wpm::load(gguf)?), true, (Some(101), None)),
             other => return Err(Error::Unsupported(format!("tokenizer model {other:?}"))),
         };
@@ -168,6 +180,7 @@ impl Tokenizer {
 
         Ok(Tokenizer {
             model,
+            profile,
             bos,
             eos,
             add_bos,
@@ -253,6 +266,22 @@ impl Tokenizer {
     /// The end-of-sequence token, if the model has one.
     pub fn eos(&self) -> Option<u32> {
         self.eos
+    }
+
+    /// The model's EOS and vocabulary-specific stop markers that encode to
+    /// one token after removing BOS.
+    pub fn stop_tokens(&self) -> Vec<u32> {
+        let mut stops: Vec<_> = self.eos.into_iter().collect();
+        for marker in self.profile.extra_stops {
+            let mut ids = self.encode(marker, true);
+            ids.retain(|&id| Some(id) != self.bos);
+            if let [id] = ids[..] {
+                if !stops.contains(&id) {
+                    stops.push(id);
+                }
+            }
+        }
+        stops
     }
 }
 

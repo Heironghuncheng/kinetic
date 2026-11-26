@@ -196,10 +196,8 @@ impl<'a> Engine<'a> {
         };
         let (bos, eos) = (text(tokenizer.bos()), text(tokenizer.eos()));
 
-        let mut stop_tokens: Vec<u32> = tokenizer.eos().into_iter().collect();
-        // Phi-3 can emit </s> even though the GGUF names a different EOS.
-        let legacy_end = (gguf.architecture() == Some("phi3")).then_some("</s>");
-        for marker in END_OF_TURN.iter().copied().chain(legacy_end) {
+        let mut stop_tokens = tokenizer.stop_tokens();
+        for &marker in END_OF_TURN {
             let ids = tokenizer.encode(marker, true);
             let ids: Vec<u32> = ids
                 .into_iter()
