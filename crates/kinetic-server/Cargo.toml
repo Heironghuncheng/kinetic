@@ -20,10 +20,10 @@ kinetic-models = { path = "../kinetic-models" }
 kinetic-tokenizer = { path = "../kinetic-tokenizer" }
 kinetic-vision = { path = "../kinetic-vision" }
 kinetic-vulkan = { path = "../kinetic-vulkan", optional = true }
-minijinja = { version = "2.24.0", features = ["fuel", "json", "loop_controls"] }
+minijinja = { version = "2.24.0", features = ["fuel", "json", "loop_controls", "preserve_order"] }
 minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = { version = "1.0.149", features = ["preserve_order"] }
 
 [dev-dependencies]
 ureq = { version = "2.12.1", default-features = false, features = ["json"] }

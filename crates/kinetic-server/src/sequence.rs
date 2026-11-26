@@ -130,13 +130,13 @@ pub fn rewind_to(tokens: &[u32], base: usize, prompt: &[u32], chunk: usize) -> O
     if prompt.len() <= base || !prompt.starts_with(&tokens[..base]) {
         return None;
     }
-    let common = tokens
-        .iter()
-        .zip(prompt)
-        .take_while(|(a, b)| a == b)
-        .count();
-    let keep = common.min(prompt.len() - 1);
+    let keep = common_prefix(tokens, prompt).min(prompt.len() - 1);
     Some(base + (keep - base) / chunk * chunk)
+}
+
+/// How many leading tokens `a` and `b` share.
+pub fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(a, b)| a == b).count()
 }
 
 /// Generates after `seq`, whose next token the decoder has chosen, handing

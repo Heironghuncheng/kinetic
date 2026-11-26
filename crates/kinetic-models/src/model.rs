@@ -661,16 +661,18 @@ impl Model<'_> {
     /// `state` to: `len` itself when every layer cuts back in place,
     /// otherwise the latest mark at or before it, or zero.
     pub fn reach(&self, state: &State, len: usize) -> usize {
-        let len = len.min(state.pos);
-        let in_place = self
-            .layers
-            .iter()
-            .all(|l| l.mixer.truncates_in_place(state.pos));
-        if len == state.pos || in_place {
+        self.reach_marks(state.pos, &state.marks, len)
+    }
+
+    /// [`Model::reach`] for a state on any device that has run `pos`
+    /// tokens and holds `marks`.
+    pub(crate) fn reach_marks(&self, pos: usize, marks: &[Mark], len: usize) -> usize {
+        let len = len.min(pos);
+        let in_place = self.layers.iter().all(|l| l.mixer.truncates_in_place(pos));
+        if len == pos || in_place {
             return len;
         }
-        state
-            .marks
+        marks
             .iter()
             .map(|m| m.pos)
             .filter(|&p| p <= len)
