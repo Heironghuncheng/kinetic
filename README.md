@@ -37,8 +37,8 @@ speed-up ever changes the answer.
   <img src="assets/coverage/progress-0.1.1-4-of-12-light.svg" alt="Next update 0.1.1: 33%, 4 of 12 done." width="100%">
 </picture>
 
-**0.2 is the release where Kinetic runs every popular model llama.cpp runs.** Until then we
-ship smaller 0.1.x releases, and both bars move with the commits that move them.
+Until 0.2 we ship small 0.1.x updates often, each with fixes and new models. The bar shows how
+far the next one is, and it moves with the commits that move it.
 
 ### Next: 0.1.1
 
@@ -57,6 +57,8 @@ ship smaller 0.1.x releases, and both bars move with the commits that move them.
 - [ ] Tool calls from OpenCode with LFM3
 
 ### Road to 0.2
+
+**0.2 is the release where Kinetic runs every popular model llama.cpp runs.** The map shows where we are.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/coverage/coverage-dark.svg">
