@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub use header::{shard, Header};
+pub use header::{model_stem, shard, Header};
 pub use roots::{kinetic_dir, state_dir};
 
 use crate::Result;

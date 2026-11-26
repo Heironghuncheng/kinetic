@@ -134,16 +134,20 @@ fn plan(cols: usize, rows: usize) -> Plan {
     // a row on top, one under the wordmark, one under the tiles, the
     // focused tile's line and the keys
     let avail = rows.saturating_sub(5);
-    let heights: &[usize] = match grid {
+    // a bigger wordmark first, then taller tiles, then the plainest
+    let tiles: &[usize] = match grid {
         Some(_) => &TILE_ROWS,
         None => &[1],
     };
+    let (roomy, plain) = tiles.split_at(tiles.len() - 1);
     let marks = [Wordmark::Large, Wordmark::Small, Wordmark::Text];
-    let (wordmark, tile_rows) = heights
+    let mut tried = marks
         .iter()
-        .flat_map(|&t| marks.iter().map(move |&m| (m, t)))
+        .flat_map(|&m| roomy.iter().map(move |&t| (m, t)))
+        .chain(marks.iter().map(|&m| (m, plain[0])));
+    let (wordmark, tile_rows) = tried
         .find(|&(m, t)| m.size().0 + 2 <= cols && m.size().1 + grid_lines(t) <= avail)
-        .unwrap_or((Wordmark::Text, heights[heights.len() - 1]));
+        .unwrap_or((Wordmark::Text, plain[0]));
     let left = avail.saturating_sub(wordmark.size().1 + grid_lines(tile_rows));
     Plan {
         wordmark,
@@ -284,6 +288,7 @@ fn layout(
     colors: Colors,
     badge: Option<&str>,
     tick: u64,
+    asking: bool,
 ) -> Vec<Line> {
     let plan = plan(cols, rows);
     let mut canvas = Canvas::new(cols, rows, colors, tick);
@@ -323,11 +328,36 @@ fn layout(
     y += 1;
     let what = Line::new(Ink::Dim, shorten(TILES[focus].2, cols.saturating_sub(2)));
     canvas.put(y, centre(&what), &what, None);
-    let keys = Line::new(Ink::Dim, shorten("←↑↓→ move   Enter open   q quit", cols));
+    let keys = Line::new(
+        Ink::Dim,
+        shorten("←↑↓→ move   Enter open   Esc or q quit", cols),
+    );
     canvas.put(rows.saturating_sub(1), centre(&keys), &keys, None);
     if let Some(badge) = badge {
         let badge = Line::new(Ink::Accent, shorten(badge, cols.saturating_sub(2)));
         canvas.put(0, cols.saturating_sub(badge.width() + 2), &badge, None);
+    }
+    if asking {
+        let width = 32.min(cols);
+        let inner = width.saturating_sub(2);
+        let top = rows.saturating_sub(7) / 2;
+        let x = cols.saturating_sub(width) / 2;
+        let text = ["", "Quit Kinetic?", "", "Enter quit    Esc stay", ""];
+        let edge =
+            |l: char, r: char| Line::new(Ink::Accent, format!("{l}{}{r}", "─".repeat(inner)));
+        canvas.put(top, x, &edge('╭', '╮'), Some(TILE_BG));
+        for (i, t) in text.into_iter().enumerate() {
+            let pad = inner.saturating_sub(t.chars().count()) / 2;
+            let ink = if i == 1 { Ink::Bright } else { Ink::Dim };
+            let mut line = Line::new(Ink::Accent, "│");
+            line.push(
+                ink,
+                format!("{:<1$}", format!("{}{t}", " ".repeat(pad)), inner),
+            );
+            line.push(Ink::Accent, "│");
+            canvas.put(top + 1 + i, x, &line, Some(TILE_BG));
+        }
+        canvas.put(top + 6, x, &edge('╰', '╯'), Some(TILE_BG));
     }
     canvas.lines()
 }
@@ -336,10 +366,11 @@ fn layout(
 /// when the user quits.
 pub fn show(term: &mut Term, focus: &mut usize, badge: Option<&str>) -> io::Result<Tile> {
     let mut tick = 0;
+    let mut asking = false;
     loop {
         let (cols, rows) = term.size();
         let colors = term.colors;
-        term.draw(&layout(cols, rows, *focus, colors, badge, tick))?;
+        term.draw(&layout(cols, rows, *focus, colors, badge, tick, asking))?;
         let per = plan(cols, rows).grid.map_or(1, |(per, _)| per);
         // the stars twinkle only where there is a scene
         let wait = match colors {
@@ -351,8 +382,17 @@ pub fn show(term: &mut Term, focus: &mut usize, badge: Option<&str>) -> io::Resu
             continue;
         };
         let last = TILES.len() - 1;
+        if asking {
+            match key {
+                Key::Enter | Key::CtrlC | Key::Char('q' | 'Q' | 'y' | 'Y') => return Err(quit()),
+                Key::Resize => {}
+                _ => asking = false,
+            }
+            continue;
+        }
         match key {
-            Key::CtrlC | Key::Esc | Key::Char('q' | 'Q') => return Err(quit()),
+            Key::CtrlC | Key::Char('q' | 'Q') => return Err(quit()),
+            Key::Esc => asking = true,
             Key::Enter | Key::Char(' ') => return Ok(TILES[*focus].0),
             Key::Left => *focus = focus.saturating_sub(1),
             Key::Right | Key::Tab => *focus = (*focus + 1).min(last),
@@ -385,7 +425,15 @@ mod tests {
     fn every_size_fills_the_window_and_shows_every_tile() {
         for colors in [Colors::True, Colors::Sixteen, Colors::None] {
             for (cols, rows) in SIZES {
-                let lines = layout(cols, rows, 1, colors, Some("Kinetic 0.1.2 is out"), 0);
+                let lines = layout(
+                    cols,
+                    rows,
+                    1,
+                    colors,
+                    Some("Kinetic 0.1.2 is out"),
+                    0,
+                    false,
+                );
                 assert_eq!(lines.len(), rows, "{cols}x{rows}");
                 for l in &lines {
                     assert_eq!(l.width(), cols, "{cols}x{rows}");
@@ -400,6 +448,13 @@ mod tests {
                 }
                 assert!(text.contains("Enter open"), "{cols}x{rows}");
                 assert!(text.contains("0.1.2 is out"), "{cols}x{rows}");
+                let asked = layout(cols, rows, 1, colors, None, 0, true);
+                let asked: String = asked
+                    .iter()
+                    .flat_map(|l| &l.0)
+                    .map(|s| s.text.as_str())
+                    .collect();
+                assert!(asked.contains("Quit Kinetic?"), "{cols}x{rows}");
             }
         }
     }
@@ -411,7 +466,7 @@ mod tests {
         let (per, width) = p.grid.unwrap();
         let left = (cols - per * width - GUTTER * (per - 1)) / 2;
         let top = p.top + p.wordmark.size().1 + 1;
-        let lines = layout(cols, rows, 0, Colors::True, None, 0);
+        let lines = layout(cols, rows, 0, Colors::True, None, 0, false);
         for line in &lines[top..top + p.tile_rows] {
             let mut x = 0;
             for span in &line.0 {
@@ -426,11 +481,43 @@ mod tests {
     }
 
     #[test]
+    fn each_tile_draws_its_icon_once() {
+        let cells = |l: &Line| -> Vec<(char, Ink)> {
+            l.0.iter()
+                .flat_map(|s| s.text.chars().map(move |c| (c, s.ink)))
+                .collect()
+        };
+        for (cols, rows) in SIZES {
+            let screen: Vec<_> = layout(cols, rows, 0, Colors::True, None, 0, false)
+                .iter()
+                .map(cells)
+                .collect();
+            let shown = usize::from(plan(cols, rows).tile_rows >= 9);
+            for (i, icon) in ICONS.iter().enumerate() {
+                for r in 0..ICON.1 / 2 {
+                    let row = cells(&art::icon_row(icon, r, i == 0));
+                    let found: usize = screen
+                        .iter()
+                        .map(|l| {
+                            l.windows(row.len())
+                                .filter(|w| *w == row.as_slice())
+                                .count()
+                        })
+                        .sum();
+                    assert_eq!(found, shown, "{cols}x{rows} tile {i} row {r}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_layout_steps_down_as_the_window_shrinks() {
         assert_eq!(plan(300, 80).wordmark, Wordmark::Large);
         assert_eq!(plan(300, 80).grid, Some((3, TILE_MAX)));
         assert_eq!(plan(300, 80).tile_rows, 10);
         assert_eq!(plan(80, 24).grid.map(|g| g.0), Some(3));
+        assert_eq!(plan(100, 30).wordmark, Wordmark::Small);
+        assert_eq!(plan(100, 30).tile_rows, 9);
         assert_eq!(plan(60, 40).grid.map(|g| g.0), Some(2));
         assert_eq!(plan(40, 12).grid, None);
     }

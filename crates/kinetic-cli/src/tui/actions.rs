@@ -68,7 +68,10 @@ pub fn choose(
     loop {
         let (cols, rows) = term.size();
         let on = match devices[*device] {
-            "auto" => format!("{} ({})", model.fit.text(), device_name("auto")),
+            "auto" => match model.fit.text().as_str() {
+                "" => device_name("auto").to_owned(),
+                on => format!("{on} ({})", device_name("auto")),
+            },
             d => device_name(d).to_owned(),
         };
         let mut runs = Line::new(Ink::Dim, "  Runs on   ");

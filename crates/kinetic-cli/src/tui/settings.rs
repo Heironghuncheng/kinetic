@@ -216,14 +216,14 @@ pub fn show(term: &mut Term, here: &Here) -> io::Result<()> {
             Ink::Plain,
             format!("  kinetic chat MODEL {}", flags.join(" ")),
         ));
-        let keys = "↑↓ move   ←→ change   Enter switch   Backspace default   Esc back";
+        let keys = "↑↓ move   ←→ change   Enter switch   Backspace default   Esc back   q quit";
         term.draw(&frame(head, body, &note, keys, height))?;
         let key = term.key()?;
         let row = &rows[at];
         let before = settings.clone();
         match key {
-            Key::CtrlC => return Err(quit()),
-            Key::Esc | Key::Char('q' | 'Q') => return Ok(()),
+            Key::CtrlC | Key::Char('q' | 'Q') => return Err(quit()),
+            Key::Esc => return Ok(()),
             Key::Up => at = at.saturating_sub(1),
             Key::Down => at = (at + 1).min(rows.len() - 1),
             Key::Home => at = 0,

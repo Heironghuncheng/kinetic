@@ -50,17 +50,17 @@ const API: [&str; 12] = [
 ];
 const BENCH: [&str; 12] = [
     "........................",
-    ".......llllllllll.......",
-    "....pppllllllllllooo....",
-    "..ppppp..........ooooo..",
-    ".pppp..........ww..oooo.",
-    "pppp.........www....oooo",
+    ".....plllllllllllll.....",
+    "...ppppl........llooo...",
+    "..ppp............w.ooo..",
+    ".ppp...........ww...ooo.",
+    "ppp..........ww......ooo",
     "ppp.......wwww.......ooo",
+    "ppp..................ooo",
+    ".ppp................ooo.",
+    "..ppp..............ooo..",
+    "...ppp............ooo...",
     "........................",
-    "...................oooo.",
-    "..............llll.oooo.",
-    ".........llll.llll.oooo.",
-    "....pppp.llll.llll.oooo.",
 ];
 const DOCTOR: [&str; 12] = [
     "...oooooo......oooooo...",

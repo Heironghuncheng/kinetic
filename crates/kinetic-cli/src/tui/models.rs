@@ -14,8 +14,6 @@ use crate::library::{self, Local};
 use crate::system::{self, Gpu, Machine};
 
 const GIB: f64 = (1u64 << 30) as f64;
-/// Slowest decode, in tokens per second, that still reads comfortably.
-const READABLE: f64 = 8.0;
 
 /// A model worth downloading.
 struct Suggestion {
@@ -103,6 +101,19 @@ impl Here {
         devices
     }
 
+    /// Where `kinetic fit` places a model, when that is sure: on a GPU the
+    /// model fits, its dense part on the GPU and its experts on the CPU,
+    /// or the CPU of a computer with no GPU. Nothing when the engine may
+    /// split it some other way.
+    fn place(&self, runs: Runs) -> Option<&'static str> {
+        match runs.0 {
+            "GPU" => Some("GPU"),
+            "GPU, experts on CPU" => Some("GPU + CPU"),
+            "CPU" if self.gpus.is_empty() => Some("CPU"),
+            _ => None,
+        }
+    }
+
     pub fn model(&self, l: Local) -> Model {
         let fit = match &l.header {
             Err(_) => Fit::Unsupported("unreadable".into()),
@@ -111,11 +122,14 @@ impl Here {
                 Fit::Unsupported(why.strip_prefix("no, ").unwrap_or(&h.arch).to_owned())
             }
             Ok(_) if crate::is_embedding_model(&l.path).unwrap_or(false) => Fit::Embeddings,
-            Ok(h) if h.size > self.machine.ram_available + self.gpu_memory() => Fit::TooBig,
-            Ok(_) => self
-                .speeds
-                .file(&l.path)
-                .map_or(Fit::Unsupported("unreadable".into()), Fit::Runs),
+            Ok(_) => match self.speeds.file(&l.path) {
+                Ok(runs) => Fit::Runs(self.place(runs)),
+                Err(_) => Fit::Unsupported("unreadable".into()),
+            },
+        };
+        let extras = match l.projector {
+            Some(_) => vec!["vision"],
+            None => Vec::new(),
         };
         Model {
             size: l.header.as_ref().map_or(0, |h| h.size),
@@ -124,17 +138,27 @@ impl Here {
             fit,
             target: Target::Disk(l.path),
             last: false,
+            extras,
         }
     }
 
     /// Every model found and the suggestions not here yet, in the order
     /// [`order`] gives, `last` first.
     pub fn models(&self, last: Option<&Path>) -> Vec<Model> {
-        let mut models: Vec<Model> = library::discover()
+        let (drafters, found): (Vec<Local>, Vec<Local>) = library::discover()
             .into_iter()
             .filter(|l| !l.header.as_ref().is_ok_and(|h| h.is_projector()))
-            .map(|l| self.model(l))
-            .collect();
+            .partition(is_drafter);
+        let mut models: Vec<Model> = found.into_iter().map(|l| self.model(l)).collect();
+        for d in &drafters {
+            let base = drafts_for(&library::model_stem(&d.path));
+            let model = models
+                .iter_mut()
+                .find(|m| letters(&m.name).contains(&letters(&base)));
+            if let Some(m) = model {
+                m.extras.push("drafter");
+            }
+        }
         let gpu = self.gpu_memory();
         let ram = self.machine.ram_available;
         let fresh: Vec<Model> = SUGGESTIONS
@@ -150,9 +174,10 @@ impl Here {
                 ),
                 size: s.size,
                 store: "download",
-                fit: Fit::Runs(self.speeds.dense(s.size)),
+                fit: Fit::Runs(self.place(self.speeds.dense(s.size))),
                 target: Target::Hub(s.spec),
                 last: false,
+                extras: Vec::new(),
             })
             .collect();
         models.extend(fresh);
@@ -170,11 +195,46 @@ pub enum Target {
     Hub(&'static str),
 }
 
+/// A drafter, a prediction block or another file that only runs beside
+/// a model.
+fn is_drafter(l: &Local) -> bool {
+    let stem = library::model_stem(&l.path).to_lowercase();
+    let arch = l.header.as_ref().map_or("", |h| h.arch.as_str());
+    ["dspark-", "dflash-", "mtp-", "draft-"]
+        .iter()
+        .any(|p| stem.starts_with(p))
+        || arch.contains("dflash")
+        || arch.ends_with("-assistant")
+}
+
+/// The model name in a drafter's file name: `dspark-Inkling-2-Mini-Q8_0`
+/// drafts for `Inkling-2-Mini`.
+fn drafts_for(stem: &str) -> String {
+    let rest = stem.split_once('-').map_or(stem, |(_, r)| r);
+    let quant = |p: &str| {
+        let p = p.to_lowercase();
+        ["q", "iq", "f16", "bf16", "f32"]
+            .iter()
+            .any(|q| p.starts_with(q))
+    };
+    match rest.rsplit_once('-') {
+        Some((head, last)) if quant(last) => head.to_owned(),
+        _ => rest.to_owned(),
+    }
+}
+
+/// Lowercase letters and digits only, for matching names loosely.
+fn letters(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Fit {
-    /// Where it runs and its decode speed range.
-    Runs(Runs),
-    TooBig,
+    /// Runs here, and where when that is sure.
+    Runs(Option<&'static str>),
     Embeddings,
     Unsupported(String),
 }
@@ -182,9 +242,7 @@ pub enum Fit {
 impl Fit {
     pub fn text(&self) -> String {
         match self {
-            Fit::Runs((on, Some((lo, hi)))) => format!("{on}, {lo:.0}-{hi:.0} tokens/s"),
-            Fit::Runs((on, None)) => (*on).to_owned(),
-            Fit::TooBig => "too big for this computer".into(),
+            Fit::Runs(on) => on.unwrap_or_default().to_owned(),
             Fit::Embeddings => "makes embeddings, not answers".into(),
             Fit::Unsupported(why) => format!("not supported yet: {why}"),
         }
@@ -192,15 +250,6 @@ impl Fit {
 
     pub fn usable(&self) -> bool {
         matches!(self, Fit::Runs(_))
-    }
-
-    fn rank(&self) -> u8 {
-        match self {
-            Fit::Runs((_, Some((lo, hi)))) if (lo + hi) / 2.0 < READABLE => 2,
-            Fit::Runs(_) => 1,
-            Fit::TooBig => 4,
-            Fit::Embeddings | Fit::Unsupported(_) => 5,
-        }
     }
 }
 
@@ -212,6 +261,8 @@ pub struct Model {
     pub target: Target,
     /// The model picked last time.
     pub last: bool,
+    /// What was found with it, such as its vision projector.
+    pub extras: Vec<&'static str>,
 }
 
 impl Model {
@@ -222,9 +273,15 @@ impl Model {
     fn item(&self) -> Item {
         let mut fit = self.fit.text();
         if self.last {
-            fit += "   last used";
+            fit = format!("{fit}   last used").trim_start().to_owned();
         }
-        let cells = vec![self.name.clone(), self.size_text(), self.store.into(), fit];
+        let with: String = self.extras.iter().map(|e| format!(" + {e}")).collect();
+        let cells = vec![
+            format!("{}{with}", self.name),
+            self.size_text(),
+            self.store.into(),
+            fit,
+        ];
         let ink = match self.fit.usable() {
             true => Ink::Plain,
             false => Ink::Dim,
@@ -233,14 +290,15 @@ impl Model {
     }
 }
 
-/// The last model first, then those that run at a readable speed, largest
-/// first, then slower ones, downloads, and those that do not run here.
+/// The last model first, then those that run here, largest first, then
+/// downloads, then those that do not run.
 pub fn order(models: &mut [Model]) {
     models.sort_by_key(|m| {
-        let rank = match (&m.target, m.last) {
-            (_, true) => 0,
-            (Target::Hub(_), _) => 3,
-            _ => m.fit.rank(),
+        let rank = match (&m.target, m.last, m.fit.usable()) {
+            (_, true, _) => 0,
+            (Target::Hub(_), ..) => 2,
+            (_, _, true) => 1,
+            _ => 3,
         };
         (rank, Reverse(m.size))
     });
@@ -328,37 +386,37 @@ mod tests {
                 false => Target::Disk(PathBuf::from(name)),
             },
             last: false,
+            extras: Vec::new(),
         }
     }
 
     #[test]
-    fn the_last_model_leads_then_what_runs_well_largest_first() {
-        let fast = |lo| Fit::Runs(("GPU", Some((lo, lo + 10.0))));
+    fn the_last_model_leads_then_what_runs_largest_first() {
+        let runs = || Fit::Runs(Some("GPU"));
         let mut models = vec![
-            model("slow", 9, fast(1.0), false),
+            model("small", 1, runs(), false),
             model("odd", 5, Fit::Unsupported("bert".into()), false),
-            model("small", 1, fast(90.0), false),
-            model("hub", 3, fast(50.0), true),
-            model("big", 4, fast(30.0), false),
-            model("huge", 99, Fit::TooBig, false),
-            model("used", 2, fast(60.0), false),
+            model("hub", 3, runs(), true),
+            model("big", 4, Fit::Runs(None), false),
+            model("used", 2, runs(), false),
         ];
-        models[6].last = true;
+        models[4].last = true;
         order(&mut models);
         let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["used", "big", "small", "slow", "hub", "huge", "odd"]
-        );
+        assert_eq!(names, ["used", "big", "small", "hub", "odd"]);
     }
 
     #[test]
-    fn fit_reads_as_a_place_and_a_speed() {
-        assert_eq!(
-            Fit::Runs(("CPU", Some((9.4, 15.6)))).text(),
-            "CPU, 9-16 tokens/s"
-        );
-        assert_eq!(Fit::Runs(("GPU", None)).text(), "GPU");
-        assert!(!Fit::TooBig.usable());
+    fn drafters_name_the_model_they_draft_for() {
+        assert_eq!(drafts_for("dspark-Inkling-2-Mini-Q8_0"), "Inkling-2-Mini");
+        assert_eq!(drafts_for("mtp-Qwen3.8-35B-A3B-Q8_0"), "Qwen3.8-35B-A3B");
+        assert!(letters("Inkling-2-Mini-UD-IQ3_XXS").contains(&letters("Inkling-2-Mini")));
+    }
+
+    #[test]
+    fn a_place_shows_only_when_it_is_known() {
+        assert_eq!(Fit::Runs(Some("GPU + CPU")).text(), "GPU + CPU");
+        assert_eq!(Fit::Runs(None).text(), "");
+        assert!(!Fit::Embeddings.usable());
     }
 }
