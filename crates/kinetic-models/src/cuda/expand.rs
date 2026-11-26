@@ -78,10 +78,14 @@ impl Expanded {
         types.sort();
         types.dedup();
         let extra: isize = all.iter().map(|(_, e)| e).sum();
+        let mib = extra.unsigned_abs() as f64 / (1 << 20) as f64;
+        let size = match extra {
+            0.. => format!("{mib:.0} MiB more"),
+            _ => format!("{mib:.0} MiB less"),
+        };
         Some(format!(
-            "kinetic: CUDA has no kernel for {} weights; they run expanded to {EXPANDED}, which takes {:.0} MiB more than the file",
+            "kinetic: CUDA has no kernel for {} weights; they run expanded to {EXPANDED}, which takes {size} than the file",
             types.join(", "),
-            extra as f64 / (1 << 20) as f64
         ))
     }
 }
