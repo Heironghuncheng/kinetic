@@ -69,11 +69,12 @@ impl Offload<'_> {
             .count() as u64;
 
         let bytes = self.layouts[l].bytes();
-        // A copy into the cache still under way is waited for only when the
-        // host would take longer than a copy.
+        // A copy into the cache still under way is waited for only by an
+        // expert of many tokens, when the host would take longer than a copy.
         let waiting = used.iter().any(|&e| {
             self.cache.slot(l, e).is_some_and(|slot| {
                 self.cache.is_pending(l, slot)
+                    && tokens_of[e] >= COPY_FROM
                     && self.costs.host(bytes, tokens_of[e]) > self.costs.copy(bytes)
             })
         });
