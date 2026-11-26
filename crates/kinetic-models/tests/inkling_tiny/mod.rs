@@ -8,7 +8,7 @@ use kinetic_gguf::{Gguf, TensorInfo, TensorOut, TensorSource, TensorType, Value}
 /// A file held in memory.
 pub struct Memory {
     pub header: Gguf,
-    bytes: Vec<u8>,
+    pub bytes: Vec<u8>,
 }
 
 impl TensorSource for Memory {

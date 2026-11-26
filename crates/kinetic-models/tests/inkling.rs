@@ -14,7 +14,9 @@ mod inkling_tiny;
 
 use kinetic_gguf::{GgufFile, TensorType, Value};
 
-use inkling_tiny::{model, unrolled_of, Memory, LOOP, N_PHYS, REFERENCE};
+use inkling_tiny::{model, unrolled_of, weights, write, Memory, Tensor, LOOP, N_PHYS, REFERENCE};
+
+const D: u64 = REFERENCE.d;
 
 fn files() -> Vec<PathBuf> {
     let path =
@@ -148,7 +150,7 @@ fn taps_add_layer_inputs_and_change_nothing_else() {
         f.hidden.extend(last.hidden);
         (f.logits, f.hidden)
     };
-    let (looped, unrolled) = (tiny_model(), unrolled_model());
+    let (looped, unrolled) = (model(&REFERENCE), unrolled_model());
     let (logits, hidden) = run(&looped, Vec::new());
     let taps = vec![0, 4, 6, 3];
     let (tapped_logits, tapped) = run(&looped, taps.clone());
@@ -163,7 +165,7 @@ fn taps_add_layer_inputs_and_change_nothing_else() {
         (tapped_logits, tapped.clone())
     );
 
-    let weights = tiny_weights();
+    let weights = weights(&REFERENCE);
     let table = |name: &str| &weights.iter().find(|w| w.0 == name).unwrap().2;
     let (embd, norm) = (table("token_embd.weight"), table("token_embd_norm.weight"));
     for (r, &t) in tokens.iter().enumerate() {
@@ -285,8 +287,23 @@ fn tiny_drafter_keys() -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// `weights` as f32 tensors of a file.
+fn f32s(weights: &[(String, Vec<u64>, Vec<f32>)]) -> Vec<Tensor> {
+    weights
+        .iter()
+        .map(|(name, dims, values)| {
+            let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            (name.clone(), dims.clone(), TensorType::F32, bytes)
+        })
+        .collect()
+}
+
 fn tiny_drafter() -> Memory {
-    write("dflash", tiny_drafter_keys(), &tiny_drafter_weights())
+    write(
+        "dflash",
+        tiny_drafter_keys(),
+        &f32s(&tiny_drafter_weights()),
+    )
 }
 
 #[test]
@@ -298,7 +315,7 @@ fn the_drafter_loads_through_the_guard() {
 
     let mut weights = tiny_drafter_weights();
     weights.push(("blk.0.attn_k_ctx.bias".into(), vec![4], vec![0.0; 4]));
-    let extra = write("dflash", tiny_drafter_keys(), &weights);
+    let extra = write("dflash", tiny_drafter_keys(), &f32s(&weights));
     let Err(e) = kinetic_models::Dspark::load(&extra) else {
         panic!("a drafter with an unread tensor loaded")
     };
@@ -362,7 +379,7 @@ fn speculative_greedy_with_the_drafter_is_plain_greedy() {
         CompanionDrafter, Decoder, DsparkCompanion, Greedy, Lookup, Policy,
     };
 
-    let (target, drafter) = (tiny_model(), tiny_drafter());
+    let (target, drafter) = (model(&REFERENCE), tiny_drafter());
     let prompt = [3, 7, 1, 9, 3, 7];
     let n = 40;
     let plain = {
@@ -414,7 +431,7 @@ fn the_companion_beside_a_model_is_found_and_checked() {
     let folder = std::env::temp_dir().join(format!("kinetic-companion-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&folder);
     std::fs::create_dir_all(&folder).unwrap();
-    let target = tiny_model();
+    let target = model(&REFERENCE);
     let model = folder.join("tiny.gguf");
     std::fs::write(&model, &target.bytes).unwrap();
     let find =
@@ -429,7 +446,11 @@ fn the_companion_beside_a_model_is_found_and_checked() {
     keys.retain(|(k, _)| *k != "embedding_length");
     keys.push(("embedding_length", Value::U32(16)));
     let wide = folder.join("wide.gguf");
-    std::fs::write(&wide, &write("dflash", keys, &tiny_drafter_weights()).bytes).unwrap();
+    std::fs::write(
+        &wide,
+        &write("dflash", keys, &f32s(&tiny_drafter_weights())).bytes,
+    )
+    .unwrap();
     let e = find(Some(&wide)).unwrap_err();
     assert!(
         e.0.contains("is not a drafter for this inkling2_loop model"),
@@ -446,13 +467,13 @@ fn a_draft_matches_the_reference() {
     let d = D as usize;
     let tokens = [3u32, 7, 1, 9, 3, 7];
     let anchor = 2u32;
-    let target = tiny_model();
+    let target = model(&REFERENCE);
     let mut model = kinetic_models::load(&target).unwrap();
     let features = tiny_features(&mut model, &tokens);
     let drafter = tiny_drafter();
     let dspark = kinetic_models::Dspark::load(&drafter).unwrap();
 
-    let tw = tiny_weights();
+    let tw = weights(&REFERENCE);
     let dw = tiny_drafter_weights();
     let from = |weights: &[(String, Vec<u64>, Vec<f32>)], name: &str| -> Vec<f64> {
         let t = weights.iter().find(|t| t.0 == name).unwrap();
