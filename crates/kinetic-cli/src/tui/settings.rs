@@ -192,7 +192,7 @@ pub fn show(term: &mut Term, here: &Here) -> io::Result<()> {
     let mut at = 0;
     let mut note = String::new();
     loop {
-        let (cols, height) = term.size();
+        let (cols, height) = super::inner(term.size());
         let ink = Ink::Plain;
         let mut list = List::new(
             rows.iter()
@@ -217,7 +217,7 @@ pub fn show(term: &mut Term, here: &Here) -> io::Result<()> {
             format!("  kinetic chat MODEL {}", flags.join(" ")),
         ));
         let keys = "↑↓ move   ←→ change   Enter switch   Backspace default   Esc back   q quit";
-        term.draw(&frame(head, body, &note, keys, height))?;
+        term.draw(&frame(term, head, body, &note, keys))?;
         let key = term.key()?;
         let row = &rows[at];
         let before = settings.clone();

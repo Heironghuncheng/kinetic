@@ -94,7 +94,7 @@ pub fn browse(term: &mut Term) -> io::Result<Option<PathBuf>> {
             .as_ref()
             .map_or("This computer".to_owned(), |d| d.display().to_string());
         let next = loop {
-            let (cols, rows) = term.size();
+            let (cols, rows) = super::inner(term.size());
             let filter = match list.filter.is_empty() {
                 true => Line::new(Ink::Dim, "  Type to filter"),
                 false => Line::new(Ink::Plain, format!("  Filter: {}", list.filter)),
@@ -111,7 +111,7 @@ pub fn browse(term: &mut Term) -> io::Result<Option<PathBuf>> {
                 body.push(Line::new(Ink::Dim, "    No folders or .gguf files here."));
             }
             let keys = "↑↓ move   Enter open   ← up a folder   type to filter   Esc back";
-            term.draw(&frame(head, body, "", keys, rows))?;
+            term.draw(&frame(term, head, body, "", keys))?;
             let key = term.key()?;
             if list.handle(key) {
                 continue;

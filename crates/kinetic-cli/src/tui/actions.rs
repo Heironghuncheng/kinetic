@@ -66,7 +66,7 @@ pub fn choose(
         Target::Hub(spec) => format!("downloads from Hugging Face first: {spec}"),
     };
     loop {
-        let (cols, rows) = term.size();
+        let (cols, rows) = super::inner(term.size());
         let on = match devices[*device] {
             "auto" => match model.fit.text().as_str() {
                 "" => device_name("auto").to_owned(),
@@ -96,7 +96,7 @@ pub fn choose(
         ];
         let body = list.lines(rows.saturating_sub(head.len() + 3), cols);
         let keys = "↑↓ move   Enter start   d device   Esc back   q quit";
-        term.draw(&frame(head, body, "", keys, rows))?;
+        term.draw(&frame(term, head, body, "", keys))?;
         match term.key()? {
             Key::CtrlC | Key::Char('q' | 'Q') => return Err(quit()),
             Key::Esc => return Ok(None),

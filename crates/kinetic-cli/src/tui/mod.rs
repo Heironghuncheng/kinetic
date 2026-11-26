@@ -4,6 +4,7 @@
 
 pub mod actions;
 mod art;
+mod canvas;
 pub mod commands;
 mod folder;
 pub mod home;
@@ -35,15 +36,60 @@ pub fn is_quit(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::Interrupted
 }
 
-/// `head` and `body` from the top, then `note` and the line of keys on the
-/// last two rows of a window `rows` high.
-fn frame(head: Vec<Line>, body: Vec<Line>, note: &str, keys: &str, rows: usize) -> Vec<Line> {
-    let room = rows.saturating_sub(2);
-    let mut lines: Vec<Line> = head.into_iter().chain(body).take(room).collect();
-    lines.resize_with(room, Line::default);
+/// Columns and rows a screen's text has inside its panel, in a window
+/// `cols` by `rows`.
+fn inner((cols, rows): (usize, usize)) -> (usize, usize) {
+    (panel_width(cols).saturating_sub(6), rows.saturating_sub(5))
+}
+
+fn panel_width(cols: usize) -> usize {
+    cols.saturating_sub(4).min(120)
+}
+
+/// `head` and `body` from the top of a framed panel over the night scene,
+/// then `note`, and the line of keys on the window's last row.
+fn frame(term: &Term, head: Vec<Line>, body: Vec<Line>, note: &str, keys: &str) -> Vec<Line> {
+    let (cols, rows) = term.size();
+    let (text, height) = inner((cols, rows));
+    let mut lines: Vec<Line> = head
+        .into_iter()
+        .chain(body)
+        .take(height.saturating_sub(1))
+        .collect();
+    lines.resize_with(height.saturating_sub(1), Line::default);
     lines.push(Line::new(Ink::Accent, format!("  {note}")));
-    lines.push(Line::new(Ink::Dim, format!("  {keys}")));
-    lines
+    let width = panel_width(cols);
+    let left = cols.saturating_sub(width) / 2;
+    let edge = |l: char, r: char| {
+        Line::new(
+            Ink::Muted,
+            format!("{l}{}{r}", "─".repeat(width.saturating_sub(2))),
+        )
+    };
+    let mut canvas = canvas::Canvas::new(cols, rows, term.colors(), 0);
+    canvas.put(1, left, &edge('╭', '╮'), Some(canvas::TILE_BG));
+    for (i, line) in lines.iter().enumerate() {
+        let mut row = Line::new(Ink::Muted, "│ ");
+        row.0.extend(line.cut(text + 2).0);
+        let pad = width.saturating_sub(row.width() + 1);
+        row.push(Ink::Plain, " ".repeat(pad));
+        row.push(Ink::Muted, "│");
+        canvas.put(2 + i, left, &row, Some(canvas::TILE_BG));
+    }
+    canvas.put(
+        2 + lines.len(),
+        left,
+        &edge('╰', '╯'),
+        Some(canvas::TILE_BG),
+    );
+    let keys = Line::new(Ink::Dim, list::shorten(keys, cols));
+    canvas.put(
+        rows.saturating_sub(1),
+        cols.saturating_sub(keys.width()) / 2,
+        &keys,
+        None,
+    );
+    canvas.lines()
 }
 
 /// A list of `rows` under `title` to pick one from with the arrows or by
@@ -56,7 +102,7 @@ pub fn choose(title: &str, rows: Vec<Vec<String>>) -> crate::Result<Option<usize
             .collect(),
     );
     loop {
-        let (cols, height) = term.size();
+        let (cols, height) = inner(term.size());
         let filter = match list.filter.is_empty() {
             true => Line::new(Ink::Dim, "  Type to filter"),
             false => Line::new(Ink::Plain, format!("  Filter: {}", list.filter)),
@@ -69,7 +115,7 @@ pub fn choose(title: &str, rows: Vec<Vec<String>>) -> crate::Result<Option<usize
         ];
         let body = list.lines(height.saturating_sub(head.len() + 3), cols);
         let keys = "↑↓ move   Enter pick   type to filter   Esc back";
-        term.draw(&frame(head, body, "", keys, height))?;
+        term.draw(&frame(&term, head, body, "", keys))?;
         let key = term.key()?;
         if list.handle(key) {
             continue;

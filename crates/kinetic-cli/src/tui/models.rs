@@ -325,7 +325,7 @@ pub fn pick(term: &mut Term, here: &Here, title: &str) -> io::Result<Option<Mode
     let mut note = String::new();
     let described = here.describe();
     loop {
-        let (cols, rows) = term.size();
+        let (cols, rows) = super::inner(term.size());
         let filter = match list.filter.is_empty() {
             true => Line::new(Ink::Dim, "  Type to filter"),
             false => Line::new(Ink::Plain, format!("  Filter: {}", list.filter)),
@@ -339,7 +339,7 @@ pub fn pick(term: &mut Term, here: &Here, title: &str) -> io::Result<Option<Mode
         ];
         let body = list.lines(rows.saturating_sub(head.len() + 3), cols);
         let keys = "↑↓ move   Enter pick   type to filter   Esc back";
-        term.draw(&frame(head, body, &note, keys, rows))?;
+        term.draw(&frame(term, head, body, &note, keys))?;
         let key = term.key()?;
         if key != Key::Resize {
             note.clear();

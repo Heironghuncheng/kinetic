@@ -82,6 +82,22 @@ impl Line {
         self
     }
 
+    /// The line cut to at most `width` columns.
+    pub fn cut(&self, width: usize) -> Line {
+        let mut line = Line::default();
+        let mut used = 0;
+        for span in &self.0 {
+            for c in span.text.chars() {
+                used += c.width().unwrap_or(0);
+                if used > width {
+                    return line;
+                }
+                line.push_on(span.ink, c, span.bg);
+            }
+        }
+        line
+    }
+
     pub fn width(&self) -> usize {
         self.0
             .iter()

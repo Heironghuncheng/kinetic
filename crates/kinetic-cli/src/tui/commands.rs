@@ -126,7 +126,7 @@ pub fn pick(term: &mut Term, here: &Here) -> io::Result<Option<Vec<String>>> {
             .collect(),
     );
     loop {
-        let (cols, rows) = term.size();
+        let (cols, rows) = super::inner(term.size());
         let head = vec![
             Line::new(Ink::Bright, "  Every command"),
             Line::new(
@@ -137,7 +137,7 @@ pub fn pick(term: &mut Term, here: &Here) -> io::Result<Option<Vec<String>>> {
         ];
         let body = list.lines(rows.saturating_sub(head.len() + 3), cols);
         let keys = "↑↓ move   Enter open   type to filter   Esc back";
-        term.draw(&frame(head, body, "", keys, rows))?;
+        term.draw(&frame(term, head, body, "", keys))?;
         let key = term.key()?;
         if list.handle(key) {
             continue;
@@ -171,7 +171,7 @@ fn form(term: &mut Term, here: &Here, cmd: &clap::Command) -> io::Result<Option<
     let mut at = 0;
     let mut note = String::new();
     loop {
-        let (cols, rows) = term.size();
+        let (cols, rows) = super::inner(term.size());
         let run = 0;
         let mut items = vec![Item::new(
             vec![format!("Run kinetic {name}"), String::new(), String::new()],
@@ -205,7 +205,7 @@ fn form(term: &mut Term, here: &Here, cmd: &clap::Command) -> io::Result<Option<
         body.push(Line::new(Ink::Dim, "  Runs as:"));
         body.push(Line::new(Ink::Plain, format!("  {line}")));
         let keys = "↑↓ move   ←→ change   type a value   Enter run or pick   Esc back";
-        term.draw(&frame(head, body, &note, keys, rows))?;
+        term.draw(&frame(term, head, body, &note, keys))?;
         let key = term.key()?;
         if key != Key::Resize {
             note.clear();
