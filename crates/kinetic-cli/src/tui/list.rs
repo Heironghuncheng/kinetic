@@ -177,9 +177,41 @@ pub fn shorten(text: &str, width: usize) -> String {
     format!("{start}…{end}")
 }
 
+/// `text` in lines of at most `width` characters, broken between words;
+/// a word longer than a line is shortened rather than cut off.
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let word = shorten(word, width);
+        match lines.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
+                line.push(' ');
+                line.push_str(&word);
+            }
+            _ => lines.push(word),
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_wraps_between_words() {
+        let text = "no GPU this build can use, so models run on the processor";
+        let lines = wrap(text, 30);
+        assert_eq!(
+            lines,
+            [
+                "no GPU this build can use, so",
+                "models run on the processor"
+            ]
+        );
+        assert!(wrap(text, 200).len() == 1);
+        assert_eq!(wrap("abcdefgh", 5), ["ab…gh"]);
+    }
 
     #[test]
     fn long_names_lose_their_middle() {

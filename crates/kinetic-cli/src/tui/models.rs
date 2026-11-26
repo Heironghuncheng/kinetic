@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::keys::Key;
-use super::list::{Item, List};
+use super::list::{wrap, Item, List};
 use super::paint::{Ink, Line};
 use super::{folder, frame, quit, Term};
 use crate::fit::{Runs, Speeds};
@@ -65,8 +65,8 @@ impl Here {
         self.gpus.iter().map(free).max().unwrap_or(0)
     }
 
-    /// One line: the processor, the memory and the GPU.
-    pub fn describe(&self) -> String {
+    /// The processor and the memory, then the GPU.
+    pub fn describe(&self) -> [String; 2] {
         let gib = |b: u64| b as f64 / GIB;
         let m = &self.machine;
         let gpu = match self.gpus.iter().max_by_key(|g| g.memory_total) {
@@ -84,11 +84,10 @@ impl Here {
             f if f < 0.1 => "almost none available now".to_owned(),
             f => format!("{f:.1} GiB available now"),
         };
-        format!(
-            "{}, {:.0} GiB memory ({free}), {gpu}",
-            m.cpu,
-            gib(m.ram_total)
-        )
+        [
+            format!("{}, {:.0} GiB memory ({free})", m.cpu, gib(m.ram_total)),
+            gpu,
+        ]
     }
 
     /// The `--device` values worth offering here, automatic first.
@@ -350,13 +349,16 @@ pub fn pick(term: &mut Term, here: &Here, title: &str) -> io::Result<Option<Mode
             true => Line::new(Ink::Dim, "  Type to filter"),
             false => Line::new(Ink::Plain, format!("  Filter: {}", list.filter)),
         };
-        let head = vec![
-            Line::new(Ink::Bright, format!("  {title}")),
-            Line::new(Ink::Dim, format!("  {described}")),
-            Line::default(),
-            filter,
-            Line::default(),
-        ];
+        let head = vec![Line::new(Ink::Bright, format!("  {title}"))];
+        let mut head: Vec<Line> = head
+            .into_iter()
+            .chain(described.iter().flat_map(|part| {
+                wrap(part, cols.saturating_sub(2))
+                    .into_iter()
+                    .map(|l| Line::new(Ink::Dim, format!("  {l}")))
+            }))
+            .collect();
+        head.extend([Line::default(), filter, Line::default()]);
         let body = list.lines(rows.saturating_sub(head.len() + 3), cols);
         let keys = "↑↓ move   Enter pick   type to filter   Esc back";
         term.draw(&frame(term, head, body, &note, keys))?;
