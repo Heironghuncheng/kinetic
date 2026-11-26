@@ -111,7 +111,9 @@ impl<M: Target, D: Drafter<M> + ?Sized> Drafter<M> for Box<D> {
 /// to a new sequence.
 pub struct Decoder<D> {
     pub drafter: D,
-    /// Most tokens proposed per step; zero never drafts.
+    /// Most tokens proposed per step; zero never drafts. The default fills
+    /// a pass of sixteen rows, the most a GPU verifies at once; how many of
+    /// them are verified is up to [`Decoder::costs`].
     pub max_draft: usize,
     /// Most steps drafting pauses for after repeated misses; zero never
     /// pauses, which suits drafters whose guesses are cheap and usually right.
@@ -149,7 +151,7 @@ impl<D> Decoder<D> {
     pub fn new(drafter: D) -> Self {
         Decoder {
             drafter,
-            max_draft: 8,
+            max_draft: 15,
             max_pause: 16,
             row_cost: ROW_COST,
             costs: Costs::default(),
