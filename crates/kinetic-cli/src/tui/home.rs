@@ -146,8 +146,8 @@ fn plan(cols: usize, rows: usize) -> Plan {
         None => TILES.len(),
     };
     // a row on top, one under the wordmark, one under the tiles, the
-    // button for every command, the focused tile's line and the keys
-    let avail = rows.saturating_sub(6);
+    // button for every command and the bar of keys
+    let avail = rows.saturating_sub(5);
     // a bigger wordmark first, then taller tiles, then the plainest
     let tiles: &[usize] = match grid {
         Some(_) => &TILE_ROWS,
@@ -268,15 +268,20 @@ fn layout(
         false => Line::new(Ink::Plain, more),
     };
     canvas.put(y, centre(&button), &button, Some(TILE_BG));
-    y += 1;
+    // the focused tile's line goes with the keys, away from the button
     let what = TILES.get(focus).map_or(MORE.1, |t| t.2);
-    let what = Line::new(Ink::Dim, shorten(what, cols.saturating_sub(2)));
-    canvas.put(y, centre(&what), &what, None);
-    let keys = Line::new(
-        Ink::Dim,
-        shorten("←↑↓→ move   Enter open   Esc or q quit", cols),
-    );
-    canvas.put(rows.saturating_sub(1), centre(&keys), &keys, None);
+    let keys = "←↑↓→ move   Enter open   Esc or q quit";
+    let mut bar = Line::new(Ink::Plain, what);
+    bar.push(Ink::Dim, format!("     {keys}"));
+    if bar.width() + 2 > cols {
+        // on its own row only with a row between it and the button
+        if y + 1 < rows.saturating_sub(2) {
+            let what = Line::new(Ink::Plain, shorten(what, cols.saturating_sub(2)));
+            canvas.put(rows.saturating_sub(2), centre(&what), &what, None);
+        }
+        bar = Line::new(Ink::Dim, shorten(keys, cols));
+    }
+    canvas.put(rows.saturating_sub(1), centre(&bar), &bar, None);
     if let Some(badge) = badge {
         let badge = Line::new(Ink::Accent, shorten(badge, cols.saturating_sub(2)));
         canvas.put(0, cols.saturating_sub(badge.width() + 2), &badge, None);
