@@ -74,13 +74,20 @@ impl Here {
                 Some(free) => format!("{} ({:.1} GiB free)", g.name, gib(free)),
                 None => format!("{} ({:.1} GiB)", g.name, gib(g.memory_total)),
             },
-            None => "no GPU, so models run on the processor".into(),
+            // a build without CUDA and Vulkan sees no GPU, whatever is there
+            None if cfg!(any(feature = "cuda", feature = "vulkan")) => {
+                "no GPU this build can use, so models run on the processor".into()
+            }
+            None => "this build runs models on the processor".into(),
+        };
+        let free = match gib(m.ram_available) {
+            f if f < 0.1 => "almost none available now".to_owned(),
+            f => format!("{f:.1} GiB available now"),
         };
         format!(
-            "{}, {:.0} GiB memory ({:.1} GiB free), {gpu}",
+            "{}, {:.0} GiB memory ({free}), {gpu}",
             m.cpu,
-            gib(m.ram_total),
-            gib(m.ram_available)
+            gib(m.ram_total)
         )
     }
 
@@ -266,6 +273,19 @@ pub struct Model {
 }
 
 impl Model {
+    /// The app a model came from, by the name people know it by; nothing
+    /// for Kinetic's own folder and plain folders.
+    pub fn from(&self) -> &'static str {
+        match self.store {
+            "ollama" => "Ollama",
+            "lm studio" => "LM Studio",
+            "hugging face" => "Hugging Face",
+            "llama.cpp" => "llama.cpp",
+            "download" => "to download",
+            _ => "",
+        }
+    }
+
     pub fn size_text(&self) -> String {
         format!("{:.2} GiB", self.size as f64 / GIB)
     }
@@ -279,7 +299,7 @@ impl Model {
         let cells = vec![
             format!("{}{with}", self.name),
             self.size_text(),
-            self.store.into(),
+            self.from().into(),
             fit,
         ];
         let ink = match self.fit.usable() {

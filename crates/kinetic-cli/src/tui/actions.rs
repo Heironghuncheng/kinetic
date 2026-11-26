@@ -86,7 +86,10 @@ pub fn choose(
             ),
             Line::new(
                 Ink::Dim,
-                format!("  {}, {}, {place}", model.size_text(), model.store),
+                match model.from() {
+                    "" => format!("  {}, {place}", model.size_text()),
+                    from => format!("  {}, {from}, {place}", model.size_text()),
+                },
             ),
             Line::default(),
             runs,
