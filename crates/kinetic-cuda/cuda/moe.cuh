@@ -322,7 +322,7 @@ struct MoeParams {
     const uint8_t* arena;
     unsigned long long slot_bytes;
     // Per group: its slot, first assignment and number of assignments (at
-    // most MOE_GROUP), consecutive.
+    // most MOE_GROUP, or MOE_WIDE for `moe_wide`), consecutive.
     const uint4* groups;
     // Per assignment, the input row it reads; null when assignment `a`
     // reads row `a`.
@@ -771,7 +771,7 @@ struct AssignParams {
     const unsigned* experts;
     // The cache slot of every expert of the layer.
     const unsigned* slots;
-    // Out: groups of up to MOE_GROUP assignments, the rest of `max_groups`
+    // Out: groups of up to `size` assignments, the rest of `max_groups`
     // empty; per assignment its input row; per pick its assignment.
     uint4* groups;
     unsigned* inputs;
@@ -780,10 +780,12 @@ struct AssignParams {
     unsigned k;
     unsigned n_exp;
     unsigned max_groups;
+    // Most assignments per group.
+    unsigned size;
 };
 
 // Gives every pick an assignment, the picks of each expert together in
-// pick order and in groups of up to MOE_GROUP, for `moe_rows`. One block;
+// pick order and in groups of up to `size`, for `moe_rows` or `moe_wide`. One block;
 // shared memory holds the picks and three words per expert.
 extern "C" __global__ void moe_assign(AssignParams p) {
     extern __shared__ unsigned assign_shared[];
@@ -806,7 +808,7 @@ extern "C" __global__ void moe_assign(AssignParams p) {
             first[e] = a;
             group[e] = n;
             a += count[e];
-            n += (count[e] + MOE_GROUP - 1) / MOE_GROUP;
+            n += (count[e] + p.size - 1) / p.size;
         }
         total = n;
     }
@@ -818,8 +820,8 @@ extern "C" __global__ void moe_assign(AssignParams p) {
             const unsigned a = first[e] + j;
             p.inputs[a] = s / p.k;
             p.rows[s] = a;
-            if (j % MOE_GROUP == 0)
-                p.groups[group[e] + j / MOE_GROUP] = make_uint4(p.slots[e], a, min(MOE_GROUP, count[e] - j), 0);
+            if (j % p.size == 0)
+                p.groups[group[e] + j / p.size] = make_uint4(p.slots[e], a, min(p.size, count[e] - j), 0);
             ++j;
         }
     }

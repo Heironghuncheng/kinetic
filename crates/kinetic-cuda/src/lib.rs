@@ -81,7 +81,8 @@ pub use memory::{DeviceBuffer, DeviceCopy};
 pub use module::{Function, LaunchConfig, Module};
 pub use moe::{
     expert_block, ExpertArena, ExpertGroup, ExpertMix, ExpertProduct, ExpertTables, GateLogits,
-    Q8kRows, Routing, ASSIGN_MAX_PICKS, EXPERT_GROUP, EXPERT_TYPES, Q8K_BLOCK, ROUTE_MAX_EXPERTS,
+    Q8kRows, Routing, ASSIGN_MAX_PICKS, EXPERT_GROUP, EXPERT_TYPES, EXPERT_WIDE, Q8K_BLOCK,
+    ROUTE_MAX_EXPERTS,
 };
 pub use norm::{AddNorm, RmsNorm};
 pub use pinned::PinnedBuffer;

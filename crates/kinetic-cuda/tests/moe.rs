@@ -8,7 +8,8 @@ use half::f16;
 use kinetic_cuda::expert_block;
 use kinetic_cuda::{
     Context, Device, DeviceBuffer, Error, ExpertArena, ExpertGroup, ExpertMix, ExpertProduct,
-    ExpertTables, GateLogits, Kernels, Q8kRows, Stream, EXPERT_GROUP, EXPERT_TYPES, Q8K_BLOCK,
+    ExpertTables, GateLogits, Kernels, Q8kRows, Stream, EXPERT_GROUP, EXPERT_TYPES, EXPERT_WIDE,
+    Q8K_BLOCK,
 };
 use kinetic_quant::{dequantize, TensorType};
 
@@ -263,6 +264,122 @@ fn gated_and_plain_products_match_the_reference() {
                 }
             }
         }
+    }
+}
+
+/// Groups of `size` over assignments that `counts` give each slot in turn.
+fn groups_of(counts: &[usize], size: usize) -> Vec<u32> {
+    let mut words = Vec::new();
+    let mut first = 0;
+    for (slot, &count) in counts.iter().enumerate() {
+        for at in (0..count).step_by(size) {
+            let group = ExpertGroup {
+                slot: slot as u32,
+                first: (first + at) as u32,
+                count: size.min(count - at) as u32,
+            };
+            words.extend(group.words());
+        }
+        first += count;
+    }
+    words
+}
+
+/// Wide groups, on tensor cores, give every row the bits narrow groups give
+/// it, for groups of every length up to the widest and rows that do not
+/// fill a block.
+#[test]
+fn wide_groups_keep_the_bits_of_narrow_ones() {
+    let Some(g) = gpu() else { return };
+    let tables = ExpertTables::new(&g.ctx).unwrap();
+    let counts = [1, 7, 8, 9, 33, 64, 2 * EXPERT_WIDE + 5];
+    let (rows, tokens) = (72, 50);
+    let assignments: usize = counts.iter().sum();
+    let mut rng = Lcg(9);
+    let mut tested = 0;
+    for ty in EXPERT_TYPES
+        .into_iter()
+        .filter(|&ty| g.kernels.moe_wide(ty))
+    {
+        tested += 1;
+        let block = expert_block(ty);
+        // 1152 columns end in a half step of the wide kernels.
+        let cols = match 1152 % ty.block_len().max(block) {
+            0 => 1152,
+            _ => 1280,
+        };
+        let matrix = rows * cols / ty.block_len() * ty.block_bytes();
+        let slot_bytes = 2 * matrix + 12;
+        let host: Vec<u8> = (0..counts.len())
+            .flat_map(|_| {
+                let mut slot = random_matrix(ty, rows, cols, &mut rng);
+                slot.extend(random_matrix(ty, rows, cols, &mut rng));
+                for _ in 0..3 {
+                    slot.extend((0.5 + rng.f32().abs()).to_le_bytes());
+                }
+                slot
+            })
+            .collect();
+        let arena_data = DeviceBuffer::from_slice(&g.ctx, &host).unwrap();
+        let arena = ExpertArena {
+            data: &arena_data,
+            slot_bytes,
+        };
+        let x: Vec<f32> = (0..tokens * cols).map(|_| rng.f32() * 2.0).collect();
+        let (qs, ds) = quantized(&g, &x, cols, block);
+        let inputs: Vec<u32> = (0..assignments)
+            .map(|_| rng.next() % tokens as u32)
+            .collect();
+        let inputs = DeviceBuffer::from_slice(&g.ctx, &inputs).unwrap();
+        let narrow = DeviceBuffer::from_slice(&g.ctx, &groups_of(&counts, EXPERT_GROUP)).unwrap();
+        let wide = DeviceBuffer::from_slice(&g.ctx, &groups_of(&counts, EXPERT_WIDE)).unwrap();
+        let cases = [
+            (false, None, Some((2 * matrix, 2))),
+            (true, None, None),
+            (true, Some((4.0, 25.0)), Some((2 * matrix, 0))),
+        ];
+        for (gated, situ, scales) in cases {
+            let run = |groups: &DeviceBuffer<u32>, most: usize| {
+                let product = ExpertProduct {
+                    ty,
+                    groups,
+                    first_group: 0,
+                    n_groups: groups.len() / 4,
+                    assignments,
+                    inputs: Some(&inputs),
+                    first: 0,
+                    second: gated.then_some(matrix),
+                    rows,
+                    cols,
+                    situ,
+                    scales,
+                    most,
+                };
+                let mut y = DeviceBuffer::<f32>::new(&g.ctx, assignments * rows).unwrap();
+                let x = Q8kRows { qs: &qs, ds: &ds };
+                // SAFETY: the groups cover the assignments, whose slots and
+                // inputs lie inside the arena and the input rows.
+                unsafe {
+                    g.kernels
+                        .moe_product(&product, arena, &tables, &x, &mut y, &g.stream)
+                        .unwrap()
+                };
+                g.stream.synchronize().unwrap();
+                y.to_vec().unwrap()
+            };
+            let (want, got) = (run(&narrow, EXPERT_GROUP), run(&wide, EXPERT_WIDE));
+            for (i, (w, v)) in want.iter().zip(&got).enumerate() {
+                assert!(
+                    w.to_bits() == v.to_bits() && w.is_finite(),
+                    "{ty} gated {gated} {situ:?} assignment {} row {}: {v} vs {w}",
+                    i / rows,
+                    i % rows
+                );
+            }
+        }
+    }
+    if tested == 0 {
+        eprintln!("skipped: no tensor cores");
     }
 }
 

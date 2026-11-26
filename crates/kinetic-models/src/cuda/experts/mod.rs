@@ -30,7 +30,7 @@ mod work;
 
 use kinetic_cuda::{
     expert_block, DeviceBuffer, DeviceMatrix, ExpertArena, ExpertMix, ExpertProduct, GateLogits,
-    GemvInput, Kernels, Q8kRows, Routing, Stream, EXPERT_GROUP, Q8K_BLOCK,
+    GemvInput, Kernels, Q8kRows, Routing, Stream, EXPERT_GROUP, EXPERT_WIDE, Q8K_BLOCK,
 };
 use kinetic_quant::{Matrix, TensorType};
 
@@ -194,6 +194,7 @@ impl CudaExperts {
         let moe = &off.moes[l];
         let (d, n_exp, picks_per) = (moe.router.cols, self.n_experts, moe.n_used);
         let (gating, weight_scale) = (moe.gating.clone(), moe.weight_scale);
+        let size = group_size(&gpu.kernels, moe, n);
         let g = self.gates.rows();
         work.ready.record(stream)?;
         off.wait(&work.ready)?;
@@ -209,13 +210,13 @@ impl CudaExperts {
             })
             .collect();
         let place = off.route(l, &picks, gpu)?;
-        let assigned = work.assign(&picks, &place, stream)?;
+        let assigned = work.assign(&picks, &place, size, stream)?;
         // Cached groups come first, then transit groups.
         let parts = [
             (off.arena(l), 0, assigned.cached),
             (off.transit_arena(), assigned.cached, assigned.transit),
         ];
-        self.queue_device(l, gpu, work, off, (assigned.device, n), &parts)?;
+        self.queue_device(l, gpu, work, off, (assigned.device, n.min(size)), &parts)?;
         if self.predicts {
             off.admit_predicted(l + 1, &predict(&gates, &gating, n_exp, picks_per, g));
         }
@@ -267,6 +268,7 @@ impl CudaExperts {
         };
         k.moe_route(&routing, &mut work.experts, &mut work.weights, stream)?;
         let slots = &off.resident.as_ref().expect("resident experts")[l];
+        let size = group_size(k, moe, n);
         k.moe_assign(
             &work.experts,
             a,
@@ -274,11 +276,12 @@ impl CudaExperts {
             slots,
             &mut work.groups,
             a,
+            size,
             &mut work.inputs,
             &mut work.rows,
             stream,
         )?;
-        self.queue_device(l, gpu, work, off, (a, n), &[(off.arena(l), 0, a)])?;
+        self.queue_device(l, gpu, work, off, (a, n.min(size)), &[(off.arena(l), 0, a)])?;
         if l == 0 {
             off.stats.tokens += n as u64;
         }
@@ -322,17 +325,17 @@ impl CudaExperts {
         unsafe { gpu.kernels.moe_combine(&mix, y, &gpu.stream) }
     }
 
-    /// Queues the device's `assignments` of a batch of `tokens`: gate and up
-    /// products, their activation quantized again, and the down products
-    /// into `work.out`, each part's groups, from its first, reading that
-    /// part's arena.
+    /// Queues the device's `assignments`, in groups of at most `most`: gate
+    /// and up products, their activation quantized again, and the down
+    /// products into `work.out`, each part's groups, from its first, reading
+    /// that part's arena.
     fn queue_device(
         &self,
         l: usize,
         gpu: &Gpu,
         work: &mut ExpertWork,
         off: &Offload,
-        (assignments, tokens): (usize, usize),
+        (assignments, most): (usize, usize),
         parts: &[(ExpertArena, usize, usize)],
     ) -> kinetic_cuda::Result<()> {
         if assignments == 0 {
@@ -361,7 +364,7 @@ impl CudaExperts {
                 layout.gate + layout.up + layout.down,
                 if gated { 0 } else { 2 },
             )),
-            most: tokens.min(EXPERT_GROUP),
+            most,
         };
         let hq = Q8kRows {
             qs: &work.hq,
@@ -395,6 +398,19 @@ impl CudaExperts {
             unsafe { k.moe_product(&p, arena, &off.tables, &act, &mut work.out, stream)? };
         }
         Ok(())
+    }
+}
+
+/// Assignments per group for a batch of `tokens` through `moe`'s experts:
+/// wide groups, run on tensor cores, once the batch is large enough to give
+/// experts many tokens each, if the device has forms for both types.
+fn group_size(k: &Kernels, moe: &Moe, tokens: usize) -> usize {
+    let wide = [moe.gate.ty, moe.down.ty]
+        .into_iter()
+        .all(|ty| k.moe_wide(form::device_type(ty)));
+    match wide && tokens >= EXPERT_WIDE {
+        true => EXPERT_WIDE,
+        false => EXPERT_GROUP,
     }
 }
 

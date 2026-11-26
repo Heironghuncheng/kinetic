@@ -54,10 +54,24 @@ pub fn expert_block(ty: TensorType) -> usize {
 /// Most assignments of one expert an [`ExpertGroup`] holds.
 pub const EXPERT_GROUP: usize = 8;
 
+/// Most assignments of a wide group, which the tensor-core forms of the
+/// expert products take; see [`Kernels::moe_wide`].
+pub const EXPERT_WIDE: usize = 64;
+
+/// Whether experts of type `ty` have a tensor-core form: all but the types
+/// with offsets.
+pub(crate) fn wide_form(ty: TensorType) -> bool {
+    EXPERT_TYPES.contains(&ty) && !matches!(ty, TensorType::Q2K | TensorType::Q4K | TensorType::Q5K)
+}
+
 /// Values per quantization block of expert inputs.
 pub const Q8K_BLOCK: usize = 256;
 
 const MOE_THREADS: u32 = 256;
+const WIDE_THREADS: u32 = 128;
+/// Rows one block of a wide product computes, plain and gated.
+const WIDE_ROWS: usize = 64;
+const WIDE_GATED_ROWS: usize = 32;
 /// Shared memory an expert kernel's block takes at most.
 const MOE_SHARED: usize = 48 << 10;
 /// Most rows one block of an expert kernel computes.
@@ -93,6 +107,7 @@ pub struct ExpertArena<'a> {
 }
 
 /// Up to [`EXPERT_GROUP`] consecutive assignments of the expert in `slot`,
+/// or [`EXPERT_WIDE`] for products whose `most` exceeds [`EXPERT_GROUP`],
 /// stored on the device as four `u32`: slot, first assignment, count and a
 /// zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +153,9 @@ pub struct ExpertProduct<'a> {
     /// Where each slot holds its expert's f32 scales of the gate, up and
     /// down products, and which of them the first matrix takes.
     pub scales: Option<(usize, usize)>,
-    /// Most assignments any group holds, at most [`EXPERT_GROUP`].
+    /// Most assignments any group holds, at most [`EXPERT_WIDE`]; above
+    /// [`EXPERT_GROUP`] the product runs on tensor cores, which the type
+    /// must have a form for (see [`Kernels::moe_wide`]).
     pub most: usize,
 }
 
@@ -238,6 +255,7 @@ struct AssignParams {
     k: u32,
     n_exp: u32,
     max_groups: u32,
+    size: u32,
 }
 
 #[repr(C)]
@@ -254,6 +272,16 @@ struct CombineParams {
 }
 
 impl Kernels {
+    /// Whether products with experts of type `ty` can take wide groups:
+    /// the type has a tensor-core form and the device tensor cores. Their
+    /// outputs have the same bits as those of narrow groups.
+    pub fn moe_wide(&self, ty: TensorType) -> bool {
+        EXPERT_TYPES
+            .iter()
+            .position(|&t| t == ty)
+            .is_some_and(|i| self.moe_wide_down[i].is_some())
+    }
+
     /// Queues choosing each token's experts: the softmax (or sigmoid) of its
     /// logits, then the `picks` with the largest probability plus bias,
     /// largest first and the lowest index among equals, into `experts`, with
@@ -301,8 +329,8 @@ impl Kernels {
 
     /// Queues giving each of the `picks` picks in `experts`, `k` per token,
     /// an assignment: the picks of each expert together, in pick order, in
-    /// [`ExpertGroup`]s of up to [`EXPERT_GROUP`] whose slot `slots` gives
-    /// per expert, the rest of `max_groups` groups empty. Writes the input
+    /// [`ExpertGroup`]s of up to `size` whose slot `slots` gives per
+    /// expert, the rest of `max_groups` groups empty. Writes the input
     /// row of every assignment to `inputs` and the assignment of every pick
     /// to `rows`. Picks of experts not below `n_exp` get no assignment.
     #[allow(clippy::too_many_arguments)]
@@ -314,12 +342,14 @@ impl Kernels {
         slots: &DeviceBuffer<u32>,
         groups: &mut DeviceBuffer<u32>,
         max_groups: usize,
+        size: usize,
         inputs: &mut DeviceBuffer<u32>,
         rows: &mut DeviceBuffer<u32>,
         stream: &Stream,
     ) -> Result<()> {
         let n_exp = slots.len();
         if picks > ASSIGN_MAX_PICKS
+            || !(1..=EXPERT_WIDE).contains(&size)
             || n_exp > ROUTE_MAX_EXPERTS
             || k == 0
             || !picks.is_multiple_of(k)
@@ -346,6 +376,7 @@ impl Kernels {
             k: k as u32,
             n_exp: n_exp as u32,
             max_groups: max_groups as u32,
+            size: size as u32,
         };
         let config = LaunchConfig {
             grid: [1, 1, 1],
@@ -443,6 +474,12 @@ impl Kernels {
         if p.n_groups == 0 {
             return Ok(());
         }
+        if p.most > EXPERT_WIDE {
+            return Err(Error::Shape(format!(
+                "expert groups of {} assignments",
+                p.most
+            )));
+        }
         let block = expert_block(p.ty);
         if !p.cols.is_multiple_of(block.max(p.ty.block_len())) {
             return Err(Error::Shape(format!(
@@ -479,6 +516,21 @@ impl Kernels {
             most: 0,
             tile: 0,
         };
+        if p.most > EXPERT_GROUP {
+            let (functions, rows) = match p.second {
+                Some(_) => (&self.moe_wide_gate_up, WIDE_GATED_ROWS),
+                None => (&self.moe_wide_down, WIDE_ROWS),
+            };
+            let kernel = functions[index].as_ref().ok_or(Error::Unsupported(p.ty))?;
+            let config = LaunchConfig {
+                grid: [p.rows.div_ceil(rows) as u32, p.n_groups as u32, 1],
+                block: [WIDE_THREADS, 1, 1],
+                shared_bytes: 0,
+            };
+            // SAFETY: matches `MoeParams`; buffer sizes were checked above
+            // and the caller vouches for the groups, slots and input rows.
+            return unsafe { launch_struct(kernel, config, stream, &params) };
+        }
         let most = p.most.clamp(1, EXPERT_GROUP);
         let staged = (most * p.cols).next_multiple_of(16) + 4 * most * p.cols / block;
         // the terms each row adds per assignment: two per block, or one per

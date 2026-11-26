@@ -289,6 +289,7 @@ fn device_routing_picks_what_the_host_picks() {
         &slots,
         &mut groups,
         a,
+        EXPERT_GROUP,
         &mut inputs,
         &mut rows,
         stream,

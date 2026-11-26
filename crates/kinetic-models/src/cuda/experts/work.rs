@@ -1,6 +1,4 @@
-use kinetic_cuda::{
-    DeviceBuffer, Event, ExpertGroup, PinnedBuffer, Stream, EXPERT_GROUP, MAX_BATCH,
-};
+use kinetic_cuda::{DeviceBuffer, Event, ExpertGroup, PinnedBuffer, Stream, MAX_BATCH};
 
 use super::place::Place;
 use super::Gpu;
@@ -116,12 +114,13 @@ impl ExpertWork {
     }
 
     /// Assigns every pick, [`ExpertWork::picks`] per token, to a device
-    /// group or a host job as `place` says, and uploads the groups, inputs
-    /// and per-pick rows and weights.
+    /// group of at most `size` or a host job as `place` says, and uploads
+    /// the groups, inputs and per-pick rows and weights.
     pub(super) fn assign(
         &mut self,
         picks: &[Pick],
         place: &[Place],
+        size: usize,
         stream: &Stream,
     ) -> kinetic_cuda::Result<Assigned> {
         let k = self.picks;
@@ -143,17 +142,14 @@ impl ExpertWork {
                 None => list.push((slot, vec![s])),
             }
         }
-        let n_cached: usize = cached
-            .iter()
-            .map(|(_, s)| s.len().div_ceil(EXPERT_GROUP))
-            .sum();
+        let n_cached: usize = cached.iter().map(|(_, s)| s.len().div_ceil(size)).sum();
         let n = picks.len();
         let route = self.route.as_mut_slice();
         let (groups_at, inputs_at, rows_at) = (0, 4 * n, 5 * n);
         let mut groups = 0;
         let mut a = 0;
         for (slot, list) in cached.iter().chain(&transit) {
-            for chunk in list.chunks(EXPERT_GROUP) {
+            for chunk in list.chunks(size) {
                 let group = ExpertGroup {
                     slot: *slot,
                     first: a as u32,

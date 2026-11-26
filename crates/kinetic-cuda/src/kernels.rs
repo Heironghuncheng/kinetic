@@ -8,7 +8,7 @@ use crate::gemm::gemm_functions;
 use crate::gemv::{GEMV_NAMES, MAX_BATCH, WEIGHT_TYPES};
 use crate::memory::DeviceBuffer;
 use crate::module::{Function, LaunchConfig, Module};
-use crate::moe::{EXPERT_TYPES, MOE_NAMES};
+use crate::moe::{wide_form, EXPERT_TYPES, MOE_NAMES};
 use crate::stream::Stream;
 
 /// Fatbin images start with a header the driver reads in 8-byte words.
@@ -83,6 +83,10 @@ pub struct Kernels {
     /// Routed-expert kernels by weight type; see `moe.rs`.
     pub(crate) moe_gate_up: [Function; EXPERT_TYPES.len()],
     pub(crate) moe_down: [Function; EXPERT_TYPES.len()],
+    /// The tensor-core forms for wide groups, of the types that have one,
+    /// on devices with tensor cores.
+    pub(crate) moe_wide_gate_up: [Option<Function>; EXPERT_TYPES.len()],
+    pub(crate) moe_wide_down: [Option<Function>; EXPERT_TYPES.len()],
     pub(crate) moe_combine: Function,
     pub(crate) moe_route: Function,
     pub(crate) moe_assign: Function,
@@ -163,6 +167,16 @@ impl Kernels {
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("a kernel per type")))
         };
+        let wide = |prefix: &str| -> Result<[Option<Function>; EXPERT_TYPES.len()]> {
+            let mut functions = [const { None }; EXPERT_TYPES.len()];
+            for (f, (ty, name)) in functions.iter_mut().zip(EXPERT_TYPES.iter().zip(MOE_NAMES)) {
+                if tensor_cores && wide_form(*ty) {
+                    let name = CString::new(format!("{prefix}_{name}")).expect("no NUL");
+                    *f = Some(module.function(&name)?);
+                }
+            }
+            Ok(functions)
+        };
         Ok(Kernels {
             gemv,
             gemv_mma,
@@ -213,6 +227,8 @@ impl Kernels {
             quantize_q8k: module.function(c"quantize_q8k")?,
             moe_gate_up: moe("moe_gate_up")?,
             moe_down: moe("moe_down")?,
+            moe_wide_gate_up: wide("moe_wide_gate_up")?,
+            moe_wide_down: wide("moe_wide_down")?,
             moe_combine: module.function(c"moe_combine")?,
             moe_route: module.function(c"moe_route")?,
             moe_assign: module.function(c"moe_assign")?,

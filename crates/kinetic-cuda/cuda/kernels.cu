@@ -23,6 +23,7 @@
 #include "gemv_mma.cuh"
 #include "gemv_q8_0.cuh"
 #include "moe.cuh"
+#include "moe_wide.cuh"
 #include "norm.cuh"
 #include "prism.cuh"
 #include "quantize.cuh"
