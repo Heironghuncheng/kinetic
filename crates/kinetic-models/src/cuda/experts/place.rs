@@ -97,7 +97,9 @@ impl Offload<'_> {
 
         let usage = &self.usage;
         let uses = |layer: usize, e: usize| usage[layer * n_exp + e];
-        let (mut host_time, mut copy_time) = (0.0, 0.0);
+        // Staging a copy and running an expert both take the host, one after
+        // the other, so an expert runs there only when that alone is cheaper.
+        let mut host_time = 0.0;
         let mut loads = Vec::new();
         let mut transit = 0;
         let mut admitted = 0;
@@ -106,7 +108,7 @@ impl Offload<'_> {
             let copy = self.costs.copy(bytes);
             let pending = self.cache.slot(l, e).is_some();
             let few = tokens_of[e] < COPY_FROM;
-            let target = if pending || few || copy_time + copy >= host_time + host {
+            let target = if pending || few || host < copy {
                 Place::Host
             } else if let Some(slot) = self.cache.admit(l, e, uses, uses(l, e), false) {
                 self.cache.protect(l, slot);
@@ -120,7 +122,6 @@ impl Offload<'_> {
             place[e] = target;
             if target != Place::Host {
                 loads.push((e, target));
-                copy_time += copy;
                 continue;
             }
             host_time += host;
