@@ -10,11 +10,11 @@ use kinetic_quant::{Matrix, TensorType};
 use rayon::prelude::*;
 
 use super::ACTIVATION_CHUNK;
-#[cfg(feature = "cuda")]
-pub(crate) use kernels::packed_dot;
 #[cfg(all(test, feature = "cuda"))]
 pub(crate) use kernels::scale_offsets;
-use kernels::Unpacked;
+pub(crate) use kernels::Unpacked;
+#[cfg(feature = "cuda")]
+pub(crate) use kernels::{dot as unpacked_dot, packed_dot, unpack};
 
 /// Equally shaped expert matrices stored one after another, as in a 3-D
 /// GGUF tensor.

@@ -20,6 +20,8 @@
 
 mod exact;
 mod form;
+#[cfg(target_arch = "x86_64")]
+mod grouped;
 mod offload;
 mod place;
 #[cfg(test)]

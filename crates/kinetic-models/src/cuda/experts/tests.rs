@@ -75,6 +75,10 @@ fn device_experts_equal_host_experts_bit_for_bit() {
         (TensorType::IQ2S, TensorType::IQ3S, situ, 256),
         (TensorType::IQ2S, TensorType::Q2_0, situ, 256),
         (TensorType::IQ1S, TensorType::NVFP4, Glu::Silu, 256),
+        (TensorType::IQ1S, TensorType::Q2_0, situ, 256),
+        (TensorType::IQ2XXS, TensorType::NVFP4, situ, 256),
+        (TensorType::IQ2XS, TensorType::Q2_0, situ, 256),
+        (TensorType::IQ3XXS, TensorType::IQ4NL, situ, 256),
     ] {
         let gate = random_experts(gate_ty, f, d, count, &mut seed);
         let up = random_experts(gate_ty, f, d, count, &mut seed);

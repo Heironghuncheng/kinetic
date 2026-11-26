@@ -5,6 +5,8 @@
 //! them. The host's own path for those types sums otherwise and stays as
 //! it is.
 
+use std::cell::RefCell;
+
 use half::f16;
 use kinetic_cpu::{pool, Q8K};
 use kinetic_cuda::{expert_block, Q8K_BLOCK};
@@ -13,7 +15,7 @@ use kinetic_quant::iq::IQ4NL_VALUES;
 use kinetic_quant::TensorType;
 
 use super::form::{device_type, row};
-use crate::blocks::{packed_dot, Experts, Job, Moe};
+use crate::blocks::{packed_dot, unpack, unpacked_dot, Experts, Job, Moe, Unpacked};
 
 /// Input values per quantization block of the grouped types.
 const BLOCK: usize = 32;
@@ -131,29 +133,119 @@ fn grouped_dot(ty: TensorType, row: &[u8], qs: &[i8], ds: &[f32]) -> f32 {
     }
     acc
 }
-/// `m`'s expert `e` applied to each of `xs` as the device computes it, one
-/// output row per input; each weight row is read once for all of them.
-fn products(m: &Experts, e: usize, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
-    let ty = device_type(m.ty);
-    let mut out = vec![vec![0.0; m.rows]; xs.len()];
-    if expert_block(ty) == Q8K_BLOCK {
-        let qs: Vec<Q8K> = xs.iter().map(|x| Q8K::quantize(x)).collect();
-        let w = m.expert(e);
-        for r in 0..m.rows {
-            for (o, q) in out.iter_mut().zip(&qs) {
-                o[r] = packed_dot(ty, w.row(r), q);
+/// Weight rows one parallel task computes for every job of one expert.
+const ROWS_PER_TASK: usize = 32;
+
+/// Rows of inputs quantized as the device quantizes them for one type.
+enum Inputs {
+    PerK(Vec<Q8K>),
+    Per32(Vec<(Vec<i8>, Vec<f32>)>),
+}
+
+impl Inputs {
+    /// The `width`-value rows of `x` quantized for weights of type `ty`.
+    fn new(ty: TensorType, x: &[f32], width: usize) -> Inputs {
+        let rows = x.len() / width;
+        let row = |i: usize| &x[i * width..][..width];
+        match expert_block(ty) {
+            Q8K_BLOCK => Inputs::PerK(pool::map(rows, |i| Q8K::quantize(row(i)))),
+            _ => Inputs::Per32(pool::map(rows, |i| quantize(row(i)))),
+        }
+    }
+
+    /// A weight row of type `ty` times each of the input rows `rows`, onto
+    /// `out`. A row read for several inputs is decoded once.
+    fn dots(
+        &self,
+        ty: TensorType,
+        row: &[u8],
+        rows: &[usize],
+        fast: Option<Dots>,
+        out: &mut Vec<f32>,
+    ) {
+        match self {
+            Inputs::PerK(q) if rows.len() == 1 => out.push(packed_dot(ty, row, &q[rows[0]])),
+            Inputs::PerK(q) => UNPACKED.with_borrow_mut(|unpacked| {
+                unpacked.resize(row.len() / ty.block_bytes(), Unpacked::default());
+                unpack(ty, row, unpacked);
+                out.extend(rows.iter().map(|&i| unpacked_dot(unpacked, &q[i])));
+            }),
+            Inputs::Per32(q) => match fast {
+                Some(dots) => {
+                    for rows in rows.chunks(MOST) {
+                        let xs: Vec<(&[i8], &[f32])> =
+                            rows.iter().map(|&i| (&q[i].0[..], &q[i].1[..])).collect();
+                        let start = out.len();
+                        out.resize(start + rows.len(), 0.0);
+                        dots(row, &xs, &mut out[start..]);
+                    }
+                }
+                None => out.extend(rows.iter().map(|&i| grouped_dot(ty, row, &q[i].0, &q[i].1))),
+            },
+        }
+    }
+}
+
+thread_local! {
+    /// The unpacked weight row each thread reuses.
+    static UNPACKED: RefCell<Vec<Unpacked>> = RefCell::default();
+}
+
+#[cfg(target_arch = "x86_64")]
+use super::grouped::{dots_fn, Dots, MOST};
+
+#[cfg(not(target_arch = "x86_64"))]
+type Dots = fn(&[u8], &[(&[i8], &[f32])], &mut [f32]);
+#[cfg(not(target_arch = "x86_64"))]
+const MOST: usize = 8;
+#[cfg(not(target_arch = "x86_64"))]
+fn dots_fn(_: TensorType) -> Option<Dots> {
+    None
+}
+
+/// Each of `ms`, alike in shape, applied as the device computes it to the
+/// input row `input(s)` of every job slot `s` of each expert in `experts`:
+/// `slots` rows of the matrices' height. A parallel task computes some rows
+/// of one expert for all of its slots, so each weight row is read once.
+fn products<const N: usize>(
+    ms: [&Experts; N],
+    experts: &[(usize, Vec<usize>)],
+    x: &Inputs,
+    input: impl Fn(usize) -> usize + Sync,
+    slots: usize,
+) -> [Vec<f32>; N] {
+    let rows = ms[0].rows;
+    let tasks: Vec<(usize, usize)> = (0..experts.len())
+        .flat_map(|k| (0..rows).step_by(ROWS_PER_TASK).map(move |r| (k, r)))
+        .collect();
+    let kinds = ms.map(|m| (device_type(m.ty), dots_fn(device_type(m.ty))));
+    let done: Vec<[Vec<f32>; N]> = pool::map(tasks.len(), |t| {
+        let (k, r0) = tasks[t];
+        let (e, picks) = &experts[k];
+        let inputs: Vec<usize> = picks.iter().map(|&s| input(s)).collect();
+        let mut i = 0;
+        ms.map(|m| {
+            let (ty, fast) = kinds[i];
+            i += 1;
+            let mut out = Vec::with_capacity(ROWS_PER_TASK * picks.len());
+            for r in r0..rows.min(r0 + ROWS_PER_TASK) {
+                x.dots(ty, &row(m, *e, r), &inputs, fast, &mut out);
+            }
+            out
+        })
+    });
+    std::array::from_fn(|i| {
+        let mut y = vec![0.0; slots * rows];
+        for (&(k, r0), out) in tasks.iter().zip(&done) {
+            let picks = &experts[k].1;
+            for (r, values) in out[i].chunks_exact(picks.len()).enumerate() {
+                for (&s, &v) in picks.iter().zip(values) {
+                    y[s * rows + r0 + r] = v;
+                }
             }
         }
-        return out;
-    }
-    let qs: Vec<(Vec<i8>, Vec<f32>)> = xs.iter().map(|x| quantize(x)).collect();
-    for r in 0..m.rows {
-        let row = row(m, e, r);
-        for (o, (q, d)) in out.iter_mut().zip(&qs) {
-            o[r] = grouped_dot(ty, &row, q, d);
-        }
-    }
-    out
+        y
+    })
 }
 
 /// Whether [`Moe::run_experts`] already computes what the device does:
@@ -165,10 +257,10 @@ pub(super) fn host_path_is_exact(moe: &Moe) -> bool {
 }
 
 /// [`Moe::run_experts`] with the device's arithmetic: one output row per
-/// job, in order. Each expert runs once for all of its jobs, so its weights
-/// are read once per call.
+/// job, in order. Each expert's weights are read once per call, by every
+/// thread a share of its rows.
 pub(super) fn run_experts(moe: &Moe, h: &[f32], jobs: &[Job]) -> Vec<f32> {
-    let d = moe.router.cols;
+    let (d, f) = (moe.router.cols, moe.gate.rows);
     let mut experts: Vec<(usize, Vec<usize>)> = Vec::new();
     for (s, j) in jobs.iter().enumerate() {
         match experts.iter_mut().find(|(e, _)| *e == j.expert as usize) {
@@ -176,40 +268,83 @@ pub(super) fn run_experts(moe: &Moe, h: &[f32], jobs: &[Job]) -> Vec<f32> {
             None => experts.push((j.expert as usize, vec![s])),
         }
     }
-    let scale = |i: usize, e: usize, rows: &mut [Vec<f32>]| {
+    let scale = |i: usize, y: &mut [f32]| {
         if let Some(s) = &moe.scales[i] {
-            rows.iter_mut().flatten().for_each(|v| *v *= s[e]);
+            for (row, j) in y.chunks_exact_mut(y.len() / jobs.len()).zip(jobs) {
+                row.iter_mut().for_each(|v| *v *= s[j.expert as usize]);
+            }
         }
     };
-    let done = pool::map(experts.len(), |k| {
-        let (e, slots) = (experts[k].0, &experts[k].1);
-        let xs: Vec<Vec<f32>> = slots
-            .iter()
-            .map(|&s| h[jobs[s].row as usize * d..][..d].to_vec())
-            .collect();
-        let mut gate = products(&moe.gate, e, &xs);
-        let mut up = products(&moe.up, e, &xs);
-        scale(0, e, &mut gate);
-        scale(1, e, &mut up);
-        let acts: Vec<Vec<f32>> = gate
-            .iter()
-            .zip(&up)
-            .map(|(g, u)| {
-                g.iter()
-                    .zip(u)
-                    .map(|(&g, &u)| moe.glu.apply(g, u))
-                    .collect()
-            })
-            .collect();
-        let mut down = products(&moe.down, e, &acts);
-        scale(2, e, &mut down);
-        down
-    });
-    let mut out = vec![0.0; jobs.len() * moe.down.rows];
-    for ((_, slots), rows) in experts.iter().zip(done) {
-        for (&s, row) in slots.iter().zip(rows) {
-            out[s * moe.down.rows..][..moe.down.rows].copy_from_slice(&row);
+    let x = Inputs::new(device_type(moe.gate.ty), h, d);
+    let [mut act, mut up] = products(
+        [&moe.gate, &moe.up],
+        &experts,
+        &x,
+        |s| jobs[s].row as usize,
+        jobs.len(),
+    );
+    scale(0, &mut act);
+    scale(1, &mut up);
+    act.iter_mut()
+        .zip(&up)
+        .for_each(|(g, &u)| *g = moe.glu.apply(*g, u));
+    let x = Inputs::new(device_type(moe.down.ty), &act, f);
+    let [mut out] = products([&moe.down], &experts, &x, |s| s, jobs.len());
+    scale(2, &mut out);
+    out
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    /// Every grouped type's vector form gives the scalar form's bits.
+    #[test]
+    fn vector_grouped_dots_match_the_scalar_ones() {
+        use TensorType::*;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let cols = 512;
+        for ty in [IQ4NL, NVFP4, Q8_0, Q2_0, IQ2S, IQ1S] {
+            let Some(fast) = dots_fn(ty) else {
+                eprintln!("skipped: no AVX2");
+                return;
+            };
+            for _ in 0..20 {
+                let xs: Vec<(Vec<i8>, Vec<f32>)> = (0..3)
+                    .map(|_| {
+                        let x: Vec<f32> = (0..cols)
+                            .map(|_| (next() % 2001) as f32 / 400.0 - 2.5)
+                            .collect();
+                        quantize(&x)
+                    })
+                    .collect();
+                let mut row: Vec<u8> = (0..cols / ty.block_len() * ty.block_bytes())
+                    .map(|_| next() as u8)
+                    .collect();
+                // finite scales: halves below 2 and E4M3 bytes below 0x7f
+                for block in row.chunks_exact_mut(ty.block_bytes()) {
+                    match ty {
+                        NVFP4 => block[..4].iter_mut().for_each(|b| *b &= 0x5f),
+                        _ => block[1] &= 0x3b,
+                    }
+                }
+                let want: Vec<u32> = xs
+                    .iter()
+                    .map(|(qs, ds)| grouped_dot(ty, &row, qs, ds).to_bits())
+                    .collect();
+                let inputs: Vec<(&[i8], &[f32])> =
+                    xs.iter().map(|(q, d)| (&q[..], &d[..])).collect();
+                let mut got = vec![0.0; xs.len()];
+                fast(&row, &inputs, &mut got);
+                let got: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(got, want, "{ty}");
+            }
         }
     }
-    out
 }
