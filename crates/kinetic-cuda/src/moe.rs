@@ -57,9 +57,11 @@ pub const EXPERT_GROUP: usize = 8;
 /// Values per quantization block of expert inputs.
 pub const Q8K_BLOCK: usize = 256;
 
-const MOE_WARPS: u32 = 4;
-/// Rows each warp of an expert kernel computes.
-const MOE_WARP_ROWS: u32 = 4;
+const MOE_THREADS: u32 = 256;
+/// Shared memory an expert kernel's block takes at most.
+const MOE_SHARED: usize = 48 << 10;
+/// Most rows one block of an expert kernel computes.
+const MOE_TILE: usize = 32;
 const COMBINE_THREADS: u32 = 256;
 const QUANTIZE_WARPS: u32 = 4;
 const ROUTE_WARPS: u32 = 4;
@@ -136,6 +138,8 @@ pub struct ExpertProduct<'a> {
     /// Where each slot holds its expert's f32 scales of the gate, up and
     /// down products, and which of them the first matrix takes.
     pub scales: Option<(usize, usize)>,
+    /// Most assignments any group holds, at most [`EXPERT_GROUP`].
+    pub most: usize,
 }
 
 /// Mixes expert outputs into each token's result; see [`Kernels::moe_combine`].
@@ -183,6 +187,8 @@ struct MoeParams {
     linear: f32,
     scales: u32,
     scale_index: u32,
+    most: u32,
+    tile: u32,
 }
 
 /// Most experts per layer [`Kernels::moe_route`] chooses from.
@@ -470,22 +476,35 @@ impl Kernels {
             linear: p.situ.map_or(0.0, |s| s.1),
             scales: p.scales.map_or(0, |s| s.0 as u32),
             scale_index: p.scales.map_or(0, |s| s.1 as u32),
+            most: 0,
+            tile: 0,
+        };
+        let most = p.most.clamp(1, EXPERT_GROUP);
+        let staged = (most * p.cols).next_multiple_of(16) + 4 * most * p.cols / block;
+        // the terms each row adds per assignment: two per block, or one per
+        // group of the grouped types
+        let terms = match (block, p.ty) {
+            (Q8K_BLOCK, _) => 2 * p.cols / Q8K_BLOCK,
+            (_, TensorType::NVFP4 | TensorType::IQ2S) => p.cols / 16,
+            _ => p.cols / 32,
+        };
+        let matrices = if p.second.is_some() { 2 } else { 1 };
+        let row = 4 * matrices * (terms * most + 1);
+        let tile = (MOE_SHARED.saturating_sub(staged) / row).clamp(1, MOE_TILE.min(p.rows));
+        let params = MoeParams {
+            most: most as u32,
+            tile: tile as u32,
+            ..params
         };
         let kernel = if p.second.is_some() {
             &self.moe_gate_up[index]
         } else {
             &self.moe_down[index]
         };
-        // the inputs and one scale per block for each of a group's assignments
-        let staged = EXPERT_GROUP * (p.cols + 4 * p.cols / block);
         let config = LaunchConfig {
-            grid: [
-                (p.rows as u32).div_ceil(MOE_WARPS * MOE_WARP_ROWS),
-                p.n_groups as u32,
-                1,
-            ],
-            block: [MOE_WARPS * 32, 1, 1],
-            shared_bytes: staged as u32,
+            grid: [p.rows.div_ceil(tile) as u32, p.n_groups as u32, 1],
+            block: [MOE_THREADS, 1, 1],
+            shared_bytes: (staged + tile * row) as u32,
         };
         // SAFETY: matches `MoeParams`; buffer sizes were checked above and
         // the caller vouches for the groups, slots and input rows.

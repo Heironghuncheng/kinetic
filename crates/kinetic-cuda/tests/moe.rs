@@ -8,7 +8,7 @@ use half::f16;
 use kinetic_cuda::expert_block;
 use kinetic_cuda::{
     Context, Device, DeviceBuffer, Error, ExpertArena, ExpertGroup, ExpertMix, ExpertProduct,
-    ExpertTables, GateLogits, Kernels, Q8kRows, Stream, EXPERT_TYPES, Q8K_BLOCK,
+    ExpertTables, GateLogits, Kernels, Q8kRows, Stream, EXPERT_GROUP, EXPERT_TYPES, Q8K_BLOCK,
 };
 use kinetic_quant::{dequantize, TensorType};
 
@@ -220,6 +220,7 @@ fn gated_and_plain_products_match_the_reference() {
                 cols,
                 situ,
                 scales: None,
+                most: EXPERT_GROUP,
             };
             let mut y = DeviceBuffer::<f32>::new(&g.ctx, assigned.len() * rows).unwrap();
             let x = Q8kRows { qs: &qs, ds: &ds };

@@ -30,7 +30,7 @@ mod work;
 
 use kinetic_cuda::{
     expert_block, DeviceBuffer, DeviceMatrix, ExpertArena, ExpertMix, ExpertProduct, GateLogits,
-    GemvInput, Kernels, Q8kRows, Routing, Stream, Q8K_BLOCK,
+    GemvInput, Kernels, Q8kRows, Routing, Stream, EXPERT_GROUP, Q8K_BLOCK,
 };
 use kinetic_quant::{Matrix, TensorType};
 
@@ -177,7 +177,7 @@ impl CudaExperts {
             (off.arena(l), 0, assigned.cached),
             (off.transit_arena(), assigned.cached, assigned.transit),
         ];
-        self.queue_device(l, gpu, work, off, assigned.device, &parts)?;
+        self.queue_device(l, gpu, work, off, (assigned.device, n), &parts)?;
 
         let predicted = if self.predicts {
             predict(&gates, &gating, n_exp, picks_per, g)
@@ -245,7 +245,7 @@ impl CudaExperts {
             &mut work.rows,
             stream,
         )?;
-        self.queue_device(l, gpu, work, off, a, &[(off.arena(l), 0, a)])?;
+        self.queue_device(l, gpu, work, off, (a, n), &[(off.arena(l), 0, a)])?;
         if l == 0 {
             off.stats.tokens += n as u64;
         }
@@ -289,16 +289,17 @@ impl CudaExperts {
         unsafe { gpu.kernels.moe_combine(&mix, y, &gpu.stream) }
     }
 
-    /// Queues the device's `assignments`: gate and up products, their
-    /// activation quantized again, and the down products into `work.out`,
-    /// each part's groups, from its first, reading that part's arena.
+    /// Queues the device's `assignments` of a batch of `tokens`: gate and up
+    /// products, their activation quantized again, and the down products
+    /// into `work.out`, each part's groups, from its first, reading that
+    /// part's arena.
     fn queue_device(
         &self,
         l: usize,
         gpu: &Gpu,
         work: &mut ExpertWork,
         off: &Offload,
-        assignments: usize,
+        (assignments, tokens): (usize, usize),
         parts: &[(ExpertArena, usize, usize)],
     ) -> kinetic_cuda::Result<()> {
         if assignments == 0 {
@@ -327,6 +328,7 @@ impl CudaExperts {
                 layout.gate + layout.up + layout.down,
                 if gated { 0 } else { 2 },
             )),
+            most: tokens.min(EXPERT_GROUP),
         };
         let hq = Q8kRows {
             qs: &work.hq,

@@ -178,6 +178,7 @@ fn device_experts_equal_host_experts_bit_for_bit() {
                 Glu::Gelu => unreachable!("not among these cases"),
             },
             scales: scales.map(|at| (at, if second.is_some() { 0 } else { 2 })),
+            most: 3,
         };
         // SAFETY: the groups cover the four assignments, whose slots hold
         // the experts at these offsets and whose inputs are rows of `h`.

@@ -17,8 +17,7 @@
 constexpr unsigned QK_IQ = 256;
 // Most assignments of one expert a block multiplies at once.
 constexpr unsigned MOE_GROUP = 8;
-constexpr unsigned MOE_WARPS = 4;
-constexpr unsigned MOE_THREADS = MOE_WARPS * WARP;
+constexpr unsigned MOE_THREADS = 256;
 
 // Byte offsets of the codebooks in the table buffer, read through the
 // cache: a few KiB that every warp looks up at random.
@@ -350,6 +349,9 @@ struct MoeParams {
     // start, or 0 without; the first matrix's is number `scale_index`.
     unsigned scales;
     unsigned scale_index;
+    // Most assignments in a group, and rows per block.
+    unsigned most;
+    unsigned tile;
 };
 
 // silu(g) u, or SITU: beta tanh(g / beta) sigmoid(g) times u, itself
@@ -373,65 +375,122 @@ __device__ __forceinline__ float moe_output(const MoeParams& p, const uint8_t* s
     return GATED ? moe_glu(p, first, second) : first;
 }
 
-// Each warp computes rows of every assignment in its group, reading each
-// weight once for all of them. With `GATED`, y = glu(gate x, up x),
-// otherwise y = first x; y holds one row of `rows` values per assignment.
-template <class F, bool GATED>
-__device__ void moe_rows(const MoeParams& p) {
-    extern __shared__ int8_t shared[];
-    const uint4 g = p.groups[blockIdx.y];
-    const unsigned count = g.z, blocks = p.cols / QK_IQ;
-    // Groups past those a batch's routing filled are empty.
-    if (count == 0) return;
-    int8_t* xs = shared;
-    float* ds = reinterpret_cast<float*>(xs + MOE_GROUP * p.cols);
-    const uint8_t* table = p.tables + F::TABLE;
-    for (unsigned t = 0; t < count; ++t) {
-        const unsigned a = g.y + t;
-        const size_t row = p.inputs ? p.inputs[a] : a;
-        for (unsigned i = threadIdx.x; i < p.cols / 4; i += blockDim.x)
-            reinterpret_cast<int*>(xs + t * p.cols)[i] =
-                reinterpret_cast<const int*>(p.xq + row * p.cols)[i];
-        for (unsigned i = threadIdx.x; i < blocks; i += blockDim.x)
-            ds[t * blocks + i] = p.xd[row * blocks + i];
-    }
-    __syncthreads();
+// Each product takes two steps. First each thread takes 32 values of a
+// row of one matrix and turns their exact integer sums with every
+// assignment's input into the terms of their blocks or groups, each times
+// its two scales, in shared memory; then one thread per row and assignment
+// adds a row's terms in order, as the host does. A block computes
+// `p.tile` rows of the expert its group names.
 
-    const unsigned lane = threadIdx.x % WARP;
+// Stages the inputs of the group's assignments, each with one input scale
+// per `per` values read every `stride` floats of `p.xd`, and returns where
+// the terms go in shared memory.
+__device__ __forceinline__ float* moe_stage(const MoeParams& p, uint4 g, unsigned per, unsigned stride,
+                                            int8_t*& xs, float*& ds) {
+    extern __shared__ int8_t shared[];
+    const unsigned blocks = p.cols / per;
+    xs = shared;
+    ds = reinterpret_cast<float*>(xs + (p.most * p.cols + 15) / 16 * 16);
+    for (unsigned t = 0; t < g.z; ++t) {
+        const size_t row = p.inputs ? p.inputs[g.y + t] : g.y + t;
+        for (unsigned i = threadIdx.x; i < p.cols / 4; i += blockDim.x)
+            reinterpret_cast<int*>(xs + t * p.cols)[i] = reinterpret_cast<const int*>(p.xq + row * p.cols)[i];
+        for (unsigned i = threadIdx.x; i < blocks; i += blockDim.x) ds[t * blocks + i] = p.xd[stride * (row * blocks + i)];
+    }
+    return ds + p.most * blocks;
+}
+
+// The second step: per matrix and row, `terms` holds `units` terms of
+// `kinds` kinds for each assignment, rows `row_floats` apart; a term of the
+// second kind is subtracted.
+template <bool GATED>
+__device__ __forceinline__ void moe_sum_rows(const MoeParams& p, uint4 g, const float* terms, unsigned units,
+                                             unsigned kinds, unsigned row_floats, unsigned row0, unsigned tile) {
     const uint8_t* slot = p.arena + p.slot_bytes * g.x;
-    const size_t row_bytes = static_cast<size_t>(blocks) * F::BYTES;
-    const unsigned warps = gridDim.x * MOE_WARPS;
-    for (unsigned r = blockIdx.x * MOE_WARPS + threadIdx.x / WARP; r < p.rows; r += warps) {
-        float acc[2][MOE_GROUP] = {};
+    for (unsigned i = threadIdx.x; i < tile * g.z; i += blockDim.x) {
+        const unsigned r = i / g.z, t = i % g.z;
+        float acc[2] = {0.0f, 0.0f};
 #pragma unroll
         for (unsigned m = 0; m < (GATED ? 2 : 1); ++m) {
-            const uint8_t* w = slot + (m == 0 ? p.first : p.second) + r * row_bytes;
-            for (unsigned b = 0; b < blocks; ++b) {
-                const uint8_t* blk = w + b * F::BYTES;
-                const Lane8 l = F::lane(blk, lane, table);
-                const float wd = F::scale(blk);
-                const float wmin = F::min_scale(blk);
+            const float* row = terms + (m * tile + r) * row_floats + t;
+            float a = 0.0f;
+            if (kinds == 2) {
+                for (unsigned u = 0; u < units; ++u)
+                    a = __fsub_rn(__fadd_rn(a, row[2 * u * p.most]), row[(2 * u + 1) * p.most]);
+            } else {
+#pragma unroll 8
+                for (unsigned u = 0; u < units; ++u) a = __fadd_rn(a, row[u * p.most]);
+            }
+            acc[m] = a;
+        }
+        p.y[static_cast<size_t>(g.y + t) * p.rows + row0 + r] = moe_output<GATED>(p, slot, acc[0], acc[1]);
+    }
+}
+
+// The rows of types read per 256 values: eight threads give one block's
+// sums.
+template <class F, bool GATED>
+__device__ void moe_rows(const MoeParams& p) {
+    const uint4 g = p.groups[blockIdx.y];
+    if (g.z == 0) return;
+    int8_t* xs;
+    float* ds;
+    float* terms = moe_stage(p, g, QK_IQ, 1, xs, ds);
+    const unsigned row0 = blockIdx.x * p.tile, tile = min(p.tile, p.rows - row0);
+    const unsigned blocks = p.cols / QK_IQ, chunks = p.cols / 32;
+    const unsigned row_floats = 2 * blocks * p.most + 1;
+    const uint8_t* slot = p.arena + p.slot_bytes * g.x;
+    const uint8_t* table = p.tables + F::TABLE;
+    const size_t row_bytes = static_cast<size_t>(blocks) * F::BYTES;
+    __syncthreads();
+    // Each warp takes rows, its lanes 32 values each; every lane takes each
+    // step, so that the eight lanes of a block can add up their sums.
+    const unsigned lane_id = threadIdx.x % WARP;
+    for (unsigned mr = threadIdx.x / WARP; mr < (GATED ? 2 : 1) * tile; mr += blockDim.x / WARP) {
+        const unsigned m = mr / tile, r = mr % tile;
+        const uint8_t* w = slot + (m == 0 ? p.first : p.second) + (row0 + r) * row_bytes;
+        float* row = terms + mr * row_floats;
+        for (unsigned c0 = 0; c0 < chunks; c0 += WARP) {
+            const unsigned c = c0 + lane_id, b = c / 8;
+            const bool live = c < chunks;
+            const uint8_t* blk = w + b * F::BYTES;
+            int sum[MOE_GROUP] = {}, offsets[MOE_GROUP] = {};
+            if (live) {
 #pragma unroll
-                for (unsigned t = 0; t < MOE_GROUP; ++t) {
-                    if (t >= count) break;
-                    const int* x = reinterpret_cast<const int*>(xs + t * p.cols + b * QK_IQ + 8 * lane);
-                    const float xd = ds[t * blocks + b];
-                    const int sum = warp_isum(l.mul * dp4a(l.w[1], x[1], dp4a(l.w[0], x[0], 0)));
-                    acc[m][t] = __fadd_rn(acc[m][t], __fmul_rn(__fmul_rn(wd, xd), static_cast<float>(sum)));
-                    if (F::MINS && wmin != 0.0f) {
-                        const int ones = 0x01010101;
-                        const int offsets = warp_isum(l.min * dp4a(ones, x[1], dp4a(ones, x[0], 0)));
-                        acc[m][t] = __fsub_rn(acc[m][t],
-                                              __fmul_rn(__fmul_rn(wmin, xd), static_cast<float>(offsets)));
+                for (unsigned k = 0; k < 4; ++k) {
+                    const unsigned lane = 4 * (c % 8) + k;
+                    const Lane8 l = F::lane(blk, lane, table);
+#pragma unroll
+                    for (unsigned t = 0; t < MOE_GROUP; ++t) {
+                        if (t >= g.z) break;
+                        const int* x = reinterpret_cast<const int*>(xs + t * p.cols + b * QK_IQ + 8 * lane);
+                        sum[t] += l.mul * dp4a(l.w[1], x[1], dp4a(l.w[0], x[0], 0));
+                        if (F::MINS) offsets[t] += l.min * dp4a(0x01010101, x[1], dp4a(0x01010101, x[0], 0));
                     }
                 }
             }
-        }
-        if (lane == 0) {
-            for (unsigned t = 0; t < count; ++t)
-                p.y[static_cast<size_t>(g.y + t) * p.rows + r] = moe_output<GATED>(p, slot, acc[0][t], acc[1][t]);
+#pragma unroll
+            for (unsigned t = 0; t < MOE_GROUP; ++t) {
+                if (t >= g.z) break;
+#pragma unroll
+                for (unsigned o = 1; o < 8; o *= 2) {
+                    sum[t] += __shfl_xor_sync(FULL_MASK, sum[t], o);
+                    if (F::MINS) offsets[t] += __shfl_xor_sync(FULL_MASK, offsets[t], o);
+                }
+            }
+            if (!live || c % 8 != 0) continue;
+            const float wd = F::scale(blk), wmin = F::min_scale(blk);
+            float* out = row + 2 * b * p.most;
+            for (unsigned t = 0; t < g.z; ++t) {
+                const float xd = ds[t * blocks + b];
+                out[t] = __fmul_rn(__fmul_rn(wd, xd), static_cast<float>(sum[t]));
+                out[p.most + t] =
+                    F::MINS && wmin != 0.0f ? __fmul_rn(__fmul_rn(wmin, xd), static_cast<float>(offsets[t])) : 0.0f;
+            }
         }
     }
+    __syncthreads();
+    moe_sum_rows<GATED>(p, g, terms, blocks, 2, row_floats, row0, tile);
 }
 
 // The half-value scale of an NVFP4 group from its unsigned E4M3 byte, as
@@ -556,67 +615,55 @@ struct Q2Zero {
     }
 };
 
-// `moe_rows` for those types: the lanes of a group give its exact integer
-// sum, and the groups of a row are added in order, each times its scale
-// and its input block's.
+// `moe_rows` for those types: a thread's 32 values are one group or two,
+// each with its own term.
 template <class F, bool GATED>
 __device__ void moe_rows_grouped(const MoeParams& p) {
-    extern __shared__ int8_t shared[];
     const uint4 g = p.groups[blockIdx.y];
-    const unsigned count = g.z, blocks = p.cols / 32;
-    if (count == 0) return;
-    int8_t* xs = shared;
-    float* ds = reinterpret_cast<float*>(xs + MOE_GROUP * p.cols);
-    for (unsigned t = 0; t < count; ++t) {
-        const unsigned a = g.y + t;
-        const size_t row = p.inputs ? p.inputs[a] : a;
-        for (unsigned i = threadIdx.x; i < p.cols / 4; i += blockDim.x)
-            reinterpret_cast<int*>(xs + t * p.cols)[i] = reinterpret_cast<const int*>(p.xq + row * p.cols)[i];
-        for (unsigned i = threadIdx.x; i < blocks; i += blockDim.x)
-            ds[t * blocks + i] = p.xd[2 * (row * blocks + i)];
-    }
-    __syncthreads();
-
-    constexpr unsigned LANES = F::GROUP / 8;
-    const unsigned lane = threadIdx.x % WARP;
+    if (g.z == 0) return;
+    int8_t* xs;
+    float* ds;
+    float* terms = moe_stage(p, g, 32, 2, xs, ds);
+    constexpr unsigned PER = 32 / F::GROUP;
+    const unsigned row0 = blockIdx.x * p.tile, tile = min(p.tile, p.rows - row0);
+    const unsigned chunks = p.cols / 32, units = PER * chunks;
+    const unsigned row_floats = units * p.most + 1;
     const uint8_t* slot = p.arena + p.slot_bytes * g.x;
     const size_t row_bytes = static_cast<size_t>(p.cols / F::BLOCK) * F::BYTES;
-    const unsigned warps = gridDim.x * MOE_WARPS;
-    for (unsigned r = blockIdx.x * MOE_WARPS + threadIdx.x / WARP; r < p.rows; r += warps) {
-        float acc[2][MOE_GROUP] = {};
+    __syncthreads();
+    // Each warp takes rows, its lanes 32 values each.
+    for (unsigned mr = threadIdx.x / WARP; mr < (GATED ? 2 : 1) * tile; mr += blockDim.x / WARP) {
+        const unsigned m = mr / tile, r = mr % tile;
+        const uint8_t* w = slot + (m == 0 ? p.first : p.second) + (row0 + r) * row_bytes;
+        float* row = terms + mr * row_floats;
+        for (unsigned c = threadIdx.x % WARP; c < chunks; c += WARP) {
+            int sum[PER][MOE_GROUP] = {};
+            float wd[PER];
 #pragma unroll
-        for (unsigned m = 0; m < (GATED ? 2 : 1); ++m) {
-            const uint8_t* w = slot + (m == 0 ? p.first : p.second) + r * row_bytes;
-            for (unsigned v0 = 0; v0 < p.cols; v0 += 8 * WARP) {
-                const unsigned v = v0 + 8 * lane;
-                const bool live = v < p.cols;
-                int wq[2] = {0, 0};
-                const float wd = live ? F::lane(w, v, p.tables, wq) : 0.0f;
+            for (unsigned k = 0; k < 4; ++k) {
+                const unsigned v = 32 * c + 8 * k, u = k * PER / 4;
+                int wq[2];
+                wd[u] = F::lane(w, v, p.tables, wq);
 #pragma unroll
                 for (unsigned t = 0; t < MOE_GROUP; ++t) {
-                    if (t >= count) break;
-                    int sum = 0;
-                    if (live) {
-                        const int* x = reinterpret_cast<const int*>(xs + t * p.cols + v);
-                        sum = dp4a(wq[1], x[1], dp4a(wq[0], x[0], 0));
-                    }
-#pragma unroll
-                    for (unsigned o = 1; o < LANES; o *= 2) sum += __shfl_xor_sync(FULL_MASK, sum, o);
-                    const float term = live ? __fmul_rn(__fmul_rn(wd, ds[t * blocks + v / 32]), static_cast<float>(sum)) : 0.0f;
-#pragma unroll
-                    for (unsigned j = 0; j < WARP / LANES; ++j) {
-                        const float s = __shfl_sync(FULL_MASK, term, LANES * j);
-                        if (v0 + j * F::GROUP < p.cols) acc[m][t] = __fadd_rn(acc[m][t], s);
-                    }
+                    if (t >= g.z) break;
+                    const int* x = reinterpret_cast<const int*>(xs + t * p.cols + v);
+                    sum[u][t] += dp4a(wq[1], x[1], dp4a(wq[0], x[0], 0));
                 }
             }
-        }
-        if (lane == 0) {
-            for (unsigned t = 0; t < count; ++t)
-                p.y[static_cast<size_t>(g.y + t) * p.rows + r] = moe_output<GATED>(p, slot, acc[0][t], acc[1][t]);
+            float* out = row + PER * c * p.most;
+            for (unsigned t = 0; t < g.z; ++t) {
+                const float xd = ds[t * chunks + c];
+#pragma unroll
+                for (unsigned u = 0; u < PER; ++u)
+                    out[u * p.most + t] = __fmul_rn(__fmul_rn(wd[u], xd), static_cast<float>(sum[u][t]));
+            }
         }
     }
+    __syncthreads();
+    moe_sum_rows<GATED>(p, g, terms, units, 1, row_floats, row0, tile);
 }
+
 #define MOE_KERNELS(name, F, ROWS)                                                           \
     extern "C" __global__ void __launch_bounds__(MOE_THREADS) moe_gate_up_##name(MoeParams p) { \
         ROWS<F, true>(p);                                                                    \
