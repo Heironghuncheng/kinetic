@@ -34,7 +34,7 @@ speed-up ever changes the answer.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/coverage/progress-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="assets/coverage/progress-light.svg">
-  <img src="assets/coverage/progress-light.svg" alt="Next update 0.1.1: 33%, 4 of 12 done. Road to 0.2: 73% of the GGUF models people download run." width="100%">
+  <img src="assets/coverage/progress-light.svg" alt="Next update 0.1.1: 33%, 4 of 12 done." width="100%">
 </picture>
 
 **0.2 is the release where Kinetic runs every popular model llama.cpp runs.** Until then we
