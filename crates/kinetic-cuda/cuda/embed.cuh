@@ -28,6 +28,8 @@ enum WeightType : unsigned {
     W_TQ2_0,
     W_Q4_0,
     W_PQ2_0,
+    W_IQ3_XXS,
+    W_IQ4_XS,
 };
 
 __device__ __forceinline__ float k4_dequant(const uint8_t* p, unsigned e, unsigned q) {
@@ -90,6 +92,10 @@ __device__ float dequant(unsigned type, const uint8_t* w, size_t total, size_t r
             return iq3_s_element(w, total, row * (cols / 256) + e / 256, e % 256);
         case W_IQ2_S:
             return iq2_s_element(w, total, row * (cols / 256) + e / 256, e % 256);
+        case W_IQ3_XXS:
+            return iq3_xxs_element(w, total, row * (cols / 256) + e / 256, e % 256);
+        case W_IQ4_XS:
+            return iq4_xs_element(w, total, row * (cols / 256) + e / 256, e % 256);
         case W_IQ1_S:
             return iq1_s_element(w, total, row * (cols / 256) + e / 256, e % 256);
         case W_IQ1_M:

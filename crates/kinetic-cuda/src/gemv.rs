@@ -28,7 +28,7 @@ const Q8_BLOCK: usize = 32;
 const QUANTIZE_THREADS: u32 = 256;
 
 /// The weight types with kernels, in the order the device code numbers them.
-pub(crate) const WEIGHT_TYPES: [TensorType; 21] = [
+pub(crate) const WEIGHT_TYPES: [TensorType; 23] = [
     TensorType::F32,
     TensorType::F16,
     TensorType::Q8_0,
@@ -50,6 +50,8 @@ pub(crate) const WEIGHT_TYPES: [TensorType; 21] = [
     TensorType::TQ2_0,
     TensorType::Q4_0,
     TensorType::PQ2_0,
+    TensorType::IQ3XXS,
+    TensorType::IQ4XS,
 ];
 
 /// Kernel name prefixes, by index into `WEIGHT_TYPES`.
@@ -75,6 +77,8 @@ pub(crate) const GEMV_NAMES: [&str; WEIGHT_TYPES.len()] = [
     "gemv_tq2_0",
     "gemv_q4_0",
     "gemv_pq2_0",
+    "gemv_iq3_xxs",
+    "gemv_iq4_xs",
 ];
 
 /// Rows each warp of a GEMV of `n` inputs computes; must match
@@ -112,7 +116,9 @@ fn gemv_layout(ty: TensorType) -> Option<(usize, bool)> {
         | TensorType::IQ1S
         | TensorType::IQ1M
         | TensorType::TQ1_0
-        | TensorType::TQ2_0 => (256, false),
+        | TensorType::TQ2_0
+        | TensorType::IQ3XXS
+        | TensorType::IQ4XS => (256, false),
         TensorType::PQ2_0 => (128, false),
         _ => return None,
     })

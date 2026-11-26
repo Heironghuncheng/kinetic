@@ -51,11 +51,6 @@ extern "C" __global__ void quantize_q8k(const float* x, int8_t* qs, float* ds, u
     if (lane == 0) ds[b] = d;
 }
 
-// Eight sign bits from a 7-bit index; the eighth keeps the count even.
-__device__ __forceinline__ unsigned iq_signs(unsigned i) {
-    return i | ((__popc(i) & 1u) << 7);
-}
-
 // Four magnitudes in `v` negated where the low four bits of `signs` say.
 __device__ __forceinline__ int signed4(unsigned v, unsigned signs) {
     const unsigned m = ((signs & 1u) ? 0xffu : 0u) | ((signs & 2u) ? 0xff00u : 0u) |
