@@ -23,9 +23,14 @@ use crate::render::Markdown;
 use crate::{sampling_command, GenArgs, Result};
 
 // name, what it takes, what it does; /help and the hints both read this
-const COMMANDS: [(&str, &str, &str); 16] = [
+const COMMANDS: [(&str, &str, &str); 17] = [
     ("/clear", "", "start a new conversation"),
     ("/model", "", "switch to another model"),
+    (
+        "/settings",
+        "",
+        "change sampling and reasoning for the next answers",
+    ),
     (
         "/receipt",
         " [FILE]",
@@ -55,7 +60,8 @@ fn help() -> String {
         .iter()
         .map(|(name, args, what)| format!("{:<15}{what}\n", format!("{name}{args}")))
         .collect();
-    text += "Type / and Tab to complete a command. End a line with \\ to go on writing\n";
+    text += "/ and Enter lists the commands to pick from; / and Tab completes them.\n";
+    text += "End a line with \\ to go on writing\n";
     text += "on the next one. Ctrl+C stops an answer.";
     text
 }
@@ -193,9 +199,26 @@ fn conversation(
             1 => format!("[1 image] {PROMPT}"),
             n => format!("[{n} images] {PROMPT}"),
         };
-        let Some(text) = read(&mut editor, &style, typing, &prompt)? else {
+        let Some(mut text) = read(&mut editor, &style, typing, &prompt)? else {
             break;
         };
+        if text.trim() == "/" {
+            let rows = COMMANDS
+                .iter()
+                .map(|(name, args, what)| vec![format!("{name}{args}"), (*what).to_owned()])
+                .collect();
+            let Some(i) = crate::tui::choose("Commands", rows)? else {
+                continue;
+            };
+            let (name, args, _) = COMMANDS[i];
+            text = match args {
+                "" => name.to_owned(),
+                _ => match editor.readline_with_initial(PROMPT, (&format!("{name} "), "")) {
+                    Ok(line) => line,
+                    Err(_) => continue,
+                },
+            };
+        }
         let dropped = attach::dropped_path(&text).filter(|_| sees);
         let note = match text.trim() {
             "" => continue,
@@ -223,6 +246,14 @@ fn conversation(
                 Some(path) => return Ok(Some(path)),
                 None => format!("Still {}.", engine.name()),
             },
+            "/settings" => {
+                crate::tui::settings()?;
+                let saved = crate::config::Settings::load();
+                saved.sample(&mut request.sampling);
+                request.max_tokens = saved.get("--n-predict").and_then(|n| n.parse().ok());
+                think = saved.get("--reasoning") != Some("off");
+                "Settings saved; sampling and reasoning apply to the next answers, the rest from the next start.".to_owned()
+            }
             "/help" => help(),
             // not in /help on purpose
             "/vroom" => "E = ½mv². The model fixes m, so Kinetic works on v.".to_owned(),

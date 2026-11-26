@@ -211,6 +211,8 @@ words are processed. Ctrl+C stops an answer, and the conversation goes on.
 |---|---|
 | `/clear` | starts a new conversation |
 | `/model` | opens the model list and switches to the model picked |
+| `/settings` | opens Settings; sampling, the most tokens per answer and reasoning apply to the next answers |
+| `/` | lists the commands to pick from with the arrows |
 | `/system TEXT` | sets the system prompt and starts over; `/system` alone clears it |
 | `/think` | turns the model's reasoning on or off (off at start); reasoning is shown dimmed |
 | `/temp X`, `/top-p X`, `/top-k N`, `/min-p X` | change sampling for the next answers |

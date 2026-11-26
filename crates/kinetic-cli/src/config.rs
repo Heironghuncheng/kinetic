@@ -67,6 +67,26 @@ impl Settings {
         }
     }
 
+    /// Puts the saved sampling settings into `s`.
+    pub fn sample(&self, s: &mut kinetic_server::Sampling) {
+        let get = |flag| self.get(flag).and_then(|v| v.parse::<f32>().ok());
+        if let Some(v) = get("--temp") {
+            s.temperature = v;
+        }
+        if let Some(v) = get("--top-p") {
+            s.top_p = v;
+        }
+        if let Some(v) = self.get("--top-k").and_then(|v| v.parse().ok()) {
+            s.top_k = v;
+        }
+        if let Some(v) = get("--min-p") {
+            s.min_p = v;
+        }
+        if let Some(v) = get("--repeat-penalty") {
+            s.repeat_penalty = v;
+        }
+    }
+
     fn parse(text: &str) -> Settings {
         let mut s = Settings::default();
         for line in text.lines() {

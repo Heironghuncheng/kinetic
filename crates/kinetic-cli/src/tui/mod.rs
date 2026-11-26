@@ -45,6 +45,51 @@ fn frame(head: Vec<Line>, body: Vec<Line>, note: &str, keys: &str, rows: usize) 
     lines
 }
 
+/// A list of `rows` under `title` to pick one from with the arrows or by
+/// typing; its place, or `None` when the user leaves.
+pub fn choose(title: &str, rows: Vec<Vec<String>>) -> crate::Result<Option<usize>> {
+    let mut term = Term::enter()?;
+    let mut list = list::List::new(
+        rows.into_iter()
+            .map(|cells| list::Item::new(cells, Ink::Plain))
+            .collect(),
+    );
+    loop {
+        let (cols, height) = term.size();
+        let filter = match list.filter.is_empty() {
+            true => Line::new(Ink::Dim, "  Type to filter"),
+            false => Line::new(Ink::Plain, format!("  Filter: {}", list.filter)),
+        };
+        let head = vec![
+            Line::new(Ink::Bright, format!("  {title}")),
+            Line::default(),
+            filter,
+            Line::default(),
+        ];
+        let body = list.lines(height.saturating_sub(head.len() + 3), cols);
+        let keys = "↑↓ move   Enter pick   type to filter   Esc back";
+        term.draw(&frame(head, body, "", keys, height))?;
+        let key = term.key()?;
+        if list.handle(key) {
+            continue;
+        }
+        match key {
+            keys::Key::Esc | keys::Key::CtrlC => return Ok(None),
+            keys::Key::Enter => return Ok(list.selected()),
+            _ => {}
+        }
+    }
+}
+
+/// The Settings screen over a chat; a quit there only closes it.
+pub fn settings() -> crate::Result<()> {
+    let here = Here::check();
+    match settings::show(&mut Term::enter()?, &here) {
+        Err(e) if is_quit(&e) => Ok(()),
+        done => Ok(done?),
+    }
+}
+
 /// The model list for a command that was given none: the file picked,
 /// downloaded first if it is not here; `None` when the user leaves.
 pub fn pick_model(title: &str) -> crate::Result<Option<PathBuf>> {
