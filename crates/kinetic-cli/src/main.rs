@@ -584,7 +584,11 @@ impl GenArgs {
 fn main() -> ExitCode {
     update::tidy();
     if std::env::args().len() == 1 {
+        // a double click opens the home screen, then a terminal to type in
         if console::double_clicked() {
+            if let Err(e) = start::run() {
+                report(&*e);
+            }
             return console::open_terminal();
         }
         if interactive() {
