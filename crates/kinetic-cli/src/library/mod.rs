@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub use header::{shard, Header};
-pub use roots::kinetic_dir;
+pub use roots::{kinetic_dir, state_dir};
 
 use crate::Result;
 
@@ -27,7 +27,7 @@ pub enum Store {
 }
 
 impl Store {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Store::Kinetic => "kinetic",
             Store::Ollama => "ollama",
@@ -253,6 +253,28 @@ fn close_matches(models: &[Local], query: &str) -> Vec<String> {
     names.dedup();
     names.truncate(5);
     names
+}
+
+/// The models whose names resemble `query`, closest first: names that hold
+/// its words, then names a few letters off; at most five, each name once.
+pub fn resembling(models: &[Local], query: &str) -> Vec<usize> {
+    let mut holding: Vec<(usize, usize)> = (0..models.len())
+        .filter_map(|i| Some((crate::fuzzy::score(query, &models[i].name)?, i)))
+        .filter(|&(gaps, _)| gaps <= query.len())
+        .collect();
+    holding.sort();
+    let close = close_matches(models, query);
+    let off = close
+        .iter()
+        .filter_map(|name| models.iter().position(|m| &m.name == name));
+    let mut seen = HashSet::new();
+    holding
+        .into_iter()
+        .map(|(_, i)| i)
+        .chain(off)
+        .filter(|&i| seen.insert(models[i].name.to_lowercase()))
+        .take(5)
+        .collect()
 }
 
 /// `kinetic models`: the table of models found.
