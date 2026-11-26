@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use kinetic_cuda::{
     AttentionShape, Batch, ConvState, DeviceBuffer, DeviceMatrix, GemvInput, KvCache, RelIo,
-    RelShape, RelWeights, RmsNorm, MAX_BATCH,
+    RelShape, RelWeights, RmsNorm, Stream, MAX_BATCH,
 };
 
 use super::network::gemv_bytes;
@@ -217,39 +217,42 @@ impl RelLayer {
         batch: &Batch,
         out: &mut DeviceBuffer<f32>,
     ) -> kinetic_cuda::Result<()> {
-        let (k, stream) = (&gpu.kernels, &gpu.stream);
+        let (k, stream, side) = (&gpu.kernels, &gpu.stream, &gpu.side);
         let n = batch.len();
-        for (j, x) in inputs.into_iter().enumerate() {
-            let norm = RmsNorm {
-                weight: &self.norms[j],
-                eps: self.shape.eps,
-            };
-            k.rms_norm(x, norm, &mut b.normed[j], 0, n, stream)?;
-        }
-        let gemv = |w: &DeviceMatrix, x: &GemvInput, y: &mut DeviceBuffer<f32>| {
-            k.gemv_rows(w, w.rows(), x, 0..n, y, stream)
+        let norm = |j: usize| RmsNorm {
+            weight: &self.norms[j],
+            eps: self.shape.eps,
         };
-        let [x0, x1, x2] = &b.normed;
-        gemv(&self.q, x0, &mut b.q)?;
-        gemv(&self.rel, x0, &mut b.r)?;
-        gemv(&self.sink, x0, &mut b.sink)?;
-        gemv(&self.gate, x0, &mut b.gate)?;
-        gemv(&self.k, x1, &mut b.k)?;
-        gemv(&self.v, x2, &mut b.v)?;
+        let [x0, x1, x2] = &mut b.normed;
+        k.rms_norm(inputs[0], norm(0), x0, 0, n, stream)?;
+        // The keys and values run beside the query side's products.
+        gpu.fork()?;
+        k.rms_norm(inputs[1], norm(1), x1, 0, n, side)?;
+        k.rms_norm(inputs[2], norm(2), x2, 0, n, side)?;
+        let gemv = |w: &DeviceMatrix, x: &GemvInput, y: &mut DeviceBuffer<f32>, on: &Stream| {
+            k.gemv_rows(w, w.rows(), x, 0..n, y, on)
+        };
+        gemv(&self.k, x1, &mut b.k, side)?;
+        gemv(&self.v, x2, &mut b.v, side)?;
         let heads = self.shape.n_head_kv;
         let [kc, vc] = &mut b.convolved;
         let [kt, vt] = &mut b.taps;
         let dynamic = match &self.dynamic {
             Some([kd, vd]) => {
-                gemv(kd, x1, kt)?;
-                gemv(vd, x2, vt)?;
+                gemv(kd, x1, kt, side)?;
+                gemv(vd, x2, vt, side)?;
                 [Some((&*kt, heads)), Some((&*vt, heads))]
             }
             None => [None, None],
         };
         let [ks, vs, os, _] = &mut state.convs;
-        k.rel_conv(&self.convs[0], &b.k, dynamic[0], ks, kc, batch, stream)?;
-        k.rel_conv(&self.convs[1], &b.v, dynamic[1], vs, vc, batch, stream)?;
+        k.rel_conv(&self.convs[0], &b.k, dynamic[0], ks, kc, batch, side)?;
+        k.rel_conv(&self.convs[1], &b.v, dynamic[1], vs, vc, batch, side)?;
+        gemv(&self.q, x0, &mut b.q, stream)?;
+        gemv(&self.rel, x0, &mut b.r, stream)?;
+        gemv(&self.sink, x0, &mut b.sink, stream)?;
+        gemv(&self.gate, x0, &mut b.gate, stream)?;
+        gpu.join()?;
         let weights = RelWeights {
             q_scale: &self.q_scale,
             rel_scale: &self.rel_scale,
@@ -266,7 +269,7 @@ impl RelLayer {
             out: &mut b.out,
         };
         k.rel_attention(&self.shape, weights, io, &mut state.kv, batch, stream)?;
-        gemv(&self.o, &b.out, &mut b.y)?;
+        gemv(&self.o, &b.out, &mut b.y, stream)?;
         k.rel_conv(&self.convs[2], &b.y, None, os, out, batch, stream)
     }
 
