@@ -164,6 +164,45 @@ fn relative_attention_matches_the_host() {
     }
 }
 
+/// Attention over a context of thousands of tokens, past every part of
+/// every head's chunks, matches the host's at the last steps.
+#[test]
+fn relative_attention_matches_the_host_over_a_long_context() {
+    let Some(g) = gpu() else { return };
+    let (tokens, batch_rows) = (8200, 16);
+    let inputs = [
+        pattern(tokens * D, 3, 17, 0.25),
+        pattern(tokens * D, 5, 19, 0.2),
+        pattern(tokens * D, 7, 23, 0.15),
+    ];
+    let w = weights(2);
+    let a = attention(&w, 2, true);
+    let layer = RelLayer::upload(&g, &a).unwrap();
+    let mut host = a.new_state();
+    let mut state = layer.new_state(&g, tokens, batch_rows).unwrap();
+    let mut b = layer.buffers(&g, batch_rows).unwrap();
+    let mut batch = Batch::new(&g.ctx, batch_rows).unwrap();
+    let mut out = DeviceBuffer::<f32>::new(&g.ctx, batch_rows * D).unwrap();
+    let mut at = 0;
+    while at < tokens {
+        let n = batch_rows.min(tokens - at);
+        let rows = |x: &Vec<f32>| x[at * D..(at + n) * D].to_vec();
+        let x = [rows(&inputs[0]), rows(&inputs[1]), rows(&inputs[2])];
+        let want = a.forward([&x[0], &x[1], &x[2]], at, None, &mut host);
+        batch.set(at, &vec![0; n], &g.stream).unwrap();
+        let dx = x.each_ref().map(|x| upload(&g, x));
+        layer
+            .forward(&g, &mut b, dx.each_ref(), &mut state, &batch, &mut out)
+            .unwrap();
+        if at + n + 3 * batch_rows >= tokens {
+            g.stream.synchronize().unwrap();
+            let got = out.to_vec().unwrap()[..n * D].to_vec();
+            close(&format!("tokens {at}..{}", at + n), &got, &want, 2e-3);
+        }
+        at += n;
+    }
+}
+
 #[test]
 fn depth_mix_matches_the_host() {
     let Some(g) = gpu() else { return };

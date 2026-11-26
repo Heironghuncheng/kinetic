@@ -166,20 +166,23 @@ struct RelAttendArgs {
 };
 
 // Each warp keeps a running softmax over its keys of every chunk of the
-// block's part, the warps then merge in order. grid (REL_PARTS, n_head, n),
-// block 128.
+// block's part, the warps then merge in order. Two lanes score each of a
+// warp's sixteen keys of a chunk, half of the head each; the warp then
+// rescales once per chunk and its lanes add the weighted values of the
+// chunk's keys, a run of the head's values each. grid (REL_PARTS, n_head,
+// n), block 128.
 extern "C" __global__ void __launch_bounds__(REL_THREADS) rel_attend(RelAttendArgs a) {
+    constexpr unsigned KEYS = REL_CHUNK / REL_WARPS;
     __shared__ float rs[REL_MAX_REL];
+    __shared__ float qs[REL_LANE_VALUES * WARP];
     __shared__ float merged[REL_WARPS][2 + REL_LANE_VALUES * WARP];
     const unsigned part = blockIdx.x, h = blockIdx.y, t = blockIdx.z;
     const unsigned warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
-    const unsigned hd = a.head_dim, per = hd / WARP;
+    const unsigned hd = a.head_dim, per = hd / WARP, half = hd / 2;
     const unsigned pos = a.pos[0] + t;
     const unsigned lo = a.window && pos + 1 > a.window ? pos + 1 - a.window : 0;
     const size_t head = static_cast<size_t>(t) * a.n_head + h;
-    float q[REL_LANE_VALUES];
-#pragma unroll
-    for (unsigned i = 0; i < REL_LANE_VALUES; ++i) q[i] = i < per ? a.q[head * hd + lane + WARP * i] : 0.0f;
+    for (unsigned j = threadIdx.x; j < hd; j += blockDim.x) qs[j] = a.q[head * hd + j];
     if (threadIdx.x < a.n_rel) rs[threadIdx.x] = a.r[head * a.n_rel + threadIdx.x];
     __syncthreads();
 
@@ -188,30 +191,48 @@ extern "C" __global__ void __launch_bounds__(REL_THREADS) rel_attend(RelAttendAr
     float m = -CUDART_INF_F, l = 0.0f, o[REL_LANE_VALUES] = {};
     const unsigned first = lo / REL_CHUNK, last = pos / REL_CHUNK;
     for (unsigned c = first + (part + REL_PARTS - first % REL_PARTS) % REL_PARTS; c <= last; c += REL_PARTS) {
-        for (unsigned i = 0; i < REL_CHUNK / REL_WARPS; ++i) {
-            const unsigned p = c * REL_CHUNK + warp * (REL_CHUNK / REL_WARPS) + i;
-            if (p < lo || p > pos) continue;
-            const size_t at = static_cast<size_t>(p % a.slots) * kv_dim + kv_off;
-            float dot = 0.0f;
-#pragma unroll
-            for (unsigned j = 0; j < REL_LANE_VALUES; ++j)
-                if (j < per) dot = fmaf(q[j], __half2float(a.k_cache[at + lane + WARP * j]), dot);
-            dot = warp_sum(dot);
+        const unsigned base = c * REL_CHUNK + warp * KEYS;
+        const unsigned p = base + lane / 2;
+        const bool live = p >= lo && p <= pos;
+        float dot = 0.0f;
+        if (live) {
+            const __half* k = a.k_cache + static_cast<size_t>(p % a.slots) * kv_dim + kv_off + (lane % 2) * half;
+            const float* q = qs + (lane % 2) * half;
+            for (unsigned j = 0; j < half; ++j) dot = fmaf(q[j], __half2float(k[j]), dot);
+        }
+        dot += __shfl_xor_sync(FULL_MASK, dot, 1);
+        float s = -CUDART_INF_F;
+        if (live) {
             const unsigned dist = pos - p;
             float bias = 0.0f;
             if (dist < a.extent) {
                 const float* b = a.rel_bias + static_cast<size_t>(dist) * a.n_rel;
                 for (unsigned j = 0; j < a.n_rel; ++j) bias = fmaf(b[j], rs[j], bias);
             }
-            const float s = dot * a.scale + bias;
-            const float top = fmaxf(m, s);
-            const float keep = expf(m - top), e = expf(s - top);
-            l = l * keep + e;
+            s = dot * a.scale + bias;
+        }
+        float top = s;
+#pragma unroll
+        for (unsigned d = 2; d < WARP; d *= 2) top = fmaxf(top, __shfl_xor_sync(FULL_MASK, top, d));
+        top = fmaxf(m, top);
+        if (top == -CUDART_INF_F) continue;
+        const float keep = expf(m - top), e = live ? expf(s - top) : 0.0f;
+        float sum = lane % 2 == 0 ? e : 0.0f;
+#pragma unroll
+        for (unsigned d = WARP / 2; d > 0; d /= 2) sum += __shfl_xor_sync(FULL_MASK, sum, d);
+        l = l * keep + sum;
+#pragma unroll
+        for (unsigned j = 0; j < REL_LANE_VALUES; ++j) o[j] *= keep;
+#pragma unroll 4
+        for (unsigned i = 0; i < KEYS; ++i) {
+            const float w = __shfl_sync(FULL_MASK, e, 2 * i);
+            if (w == 0.0f) continue;
+            const __half* v = a.v_cache + static_cast<size_t>((base + i) % a.slots) * kv_dim + kv_off;
 #pragma unroll
             for (unsigned j = 0; j < REL_LANE_VALUES; ++j)
-                if (j < per) o[j] = o[j] * keep + e * __half2float(a.v_cache[at + lane + WARP * j]);
-            m = top;
+                if (j < per) o[j] = fmaf(w, __half2float(v[lane + WARP * j]), o[j]);
         }
+        m = top;
     }
     merged[warp][0] = m;
     merged[warp][1] = l;
