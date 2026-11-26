@@ -19,8 +19,12 @@ const WHITE: Rgb = (241, 239, 243);
 
 const BAYER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
+/// The sky is drawn from this, so every launch shows the same stars.
+const SKY_SEED: u64 = 0xc6de_b7d4_a952_5c78;
+
 fn hash(a: usize, b: usize) -> u32 {
-    let mut h = (a as u32).wrapping_mul(0x9e37_79b1) ^ (b as u32).wrapping_mul(0x85eb_ca77);
+    let seed = (SKY_SEED ^ (SKY_SEED >> 32)) as u32;
+    let mut h = seed ^ (a as u32).wrapping_mul(0x9e37_79b1) ^ (b as u32).wrapping_mul(0x85eb_ca77);
     h ^= h >> 15;
     h = h.wrapping_mul(0x2c1b_3c6d);
     h ^ (h >> 12)

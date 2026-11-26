@@ -13,11 +13,14 @@ use crate::render::screen;
 static SAVED: Mutex<Option<platform::Mode>> = Mutex::new(None);
 
 pub struct Term {
-    keys: VecDeque<Key>,
-    size: (usize, usize),
-    pub colors: Colors,
+    /// Columns and rows of the window.
+    view: (usize, usize),
+    /// Keys read and not yet handed out.
+    events: VecDeque<Key>,
     /// The rows on screen, as last written.
-    shown: Vec<String>,
+    lines: Vec<String>,
+    /// The colours the terminal shows.
+    output: Colors,
 }
 
 impl Term {
@@ -32,16 +35,20 @@ impl Term {
         });
         open()?;
         Ok(Term {
-            keys: VecDeque::new(),
-            size: size(),
-            colors: Colors::detect(),
-            shown: Vec::new(),
+            view: size(),
+            events: VecDeque::new(),
+            lines: Vec::new(),
+            output: Colors::detect(),
         })
     }
 
     /// Columns and rows of the window.
     pub fn size(&self) -> (usize, usize) {
-        self.size
+        self.view
+    }
+
+    pub fn colors(&self) -> Colors {
+        self.output
     }
 
     /// The next key, or [`Key::Resize`] when the window changed size.
@@ -57,20 +64,20 @@ impl Term {
     pub fn poll(&mut self, wait: Duration) -> io::Result<Option<Key>> {
         let until = Instant::now() + wait;
         loop {
-            if let Some(key) = self.keys.pop_front() {
+            if let Some(key) = self.events.pop_front() {
                 return Ok(Some(key));
             }
             let now = size();
-            if now != self.size {
-                self.size = now;
-                self.shown.clear();
+            if now != self.view {
+                self.view = now;
+                self.lines.clear();
                 return Ok(Some(Key::Resize));
             }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Ok(None);
             }
-            self.keys
+            self.events
                 .extend(platform::read(left.min(Duration::from_millis(100)))?);
         }
     }
@@ -78,27 +85,27 @@ impl Term {
     /// Puts `lines` on the screen from its top, cut to the window, writing
     /// only the rows that changed since the last call.
     pub fn draw(&mut self, lines: &[Line]) -> io::Result<()> {
-        let (cols, rows) = self.size;
+        let (cols, rows) = self.view;
         let fresh: Vec<String> = (0..rows)
             .map(|i| {
                 let line = lines
                     .get(i)
-                    .map_or_else(String::new, |l| l.render(cols, self.colors));
+                    .map_or_else(String::new, |l| l.render(cols, self.output));
                 line + "[K"
             })
             .collect();
         let mut out = String::new();
-        if self.shown.len() != fresh.len() {
-            out += &paint::start(Ink::Plain, None, self.colors);
+        if self.lines.len() != fresh.len() {
+            out += &paint::start(Ink::Plain, None, self.output);
             out += "[2J";
-            self.shown.clear();
+            self.lines.clear();
         }
         for (i, line) in fresh.iter().enumerate() {
-            if self.shown.get(i) != Some(line) {
+            if self.lines.get(i) != Some(line) {
                 out += &format!("[{};1H{line}", i + 1);
             }
         }
-        self.shown = fresh;
+        self.lines = fresh;
         if out.is_empty() {
             return Ok(());
         }
@@ -112,9 +119,9 @@ impl Term {
         restore();
         let t = f();
         open()?;
-        self.keys.clear();
-        self.shown.clear();
-        self.size = size();
+        self.events.clear();
+        self.lines.clear();
+        self.view = size();
         Ok(t)
     }
 }

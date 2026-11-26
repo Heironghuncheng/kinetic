@@ -1,5 +1,7 @@
-//! The home screen: the Kinetic wordmark, six tiles to move between with
-//! the arrows, and the night scene under them.
+//! View of the home screen `kinetic` opens alone in a terminal.
+//! Every tile opens a screen, and a button below them lists every command.
+//! Layout steps down to smaller wordmarks and tiles as the window shrinks.
+//! On terminals without colours the shapes stay and the colours go.
 
 use std::io;
 use std::time::Duration;
@@ -394,7 +396,7 @@ pub fn show(term: &mut Term, focus: &mut usize, badge: Option<&str>) -> io::Resu
     let mut asking = false;
     loop {
         let (cols, rows) = term.size();
-        let colors = term.colors;
+        let colors = term.colors();
         term.draw(&layout(cols, rows, *focus, colors, badge, tick, asking))?;
         let per = plan(cols, rows).grid.map_or(1, |(per, _)| per);
         // the stars twinkle only where there is a scene
