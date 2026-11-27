@@ -295,6 +295,10 @@ home screen in the terminal.
   [#1](https://github.com/Veloresearch/kinetic/issues/1)). On a GPU that is
   not NVIDIA's, the CUDA backend says that it needs one and that other GPUs
   run through Vulkan ([#38](https://github.com/Veloresearch/kinetic/pull/38)).
+- CUDA: the expert cache is planned around the sequence the load builds,
+  which the first request then takes, instead of leaving room for another
+  one, so the reserve the load prints is what stays free and
+  `kinetic bench -d 8192` runs on GPUs with 6 GB.
 
 ### Known issues
 
@@ -311,8 +315,6 @@ home screen in the terminal.
   none for them.
 - `--gpus` spreads dense models only; mixture-of-experts models and Gemma 4
   E2B/E4B stay on one GPU.
-- `kinetic bench -d 8192` on a GPU with 6 GB can stop with "no room on the
-  GPU for another sequence".
 
 Thanks to @brianporeilly, @jasonkneen, @yagaltd, @Heironghuncheng and
 @orphytype for their pull requests, and to everyone who reported what broke.

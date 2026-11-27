@@ -61,8 +61,9 @@ names like it (`kinetic chat lfm3` asks "Did you mean LFM3-1.7B-Q4_K_M?").
 
 The Settings screen sets, with Left and Right, the device and GPUs, the
 context size, threads, requests at once, temperature, top-p, top-k, min-p,
-repeat penalty, the most tokens per answer and reasoning, and switches each
-speed technology on or off. Each setting shows the flag it stands for, and
+repeat penalty, the most tokens per answer and reasoning, switches each
+speed technology on or off, and turns the daily check for a new release on
+with "Check for new releases once a day". Each setting shows the flag it stands for, and
 the screen shows the command a chat runs as. Backspace puts a setting back
 to its default.
 
@@ -521,15 +522,17 @@ removes. `--nightly` follows the nightly build of main instead.
 `KINETIC_RELEASES` points both at a mirror that serves `latest`,
 `tags/<tag>` and `download/<tag>/<file>`.
 
-The daily check for a new release is off by default; turn it on in
-Settings. Then, once a day at most, a command run at a terminal asks GitHub
+The daily check for a new release is off by default; turn it on with
+"Check for new releases once a day" in Settings, or with
+`KINETIC_UPDATE_CHECK=1`. Then, once a day at most, a command run at a terminal asks GitHub
 for the newest release, in the background, sending nothing about you or
 this computer.
 When it is newer, the next interactive command prints one line on stderr,
 `Kinetic 0.1.2 is out: run kinetic update`, and the home screen shows it in
 its corner, where `u` runs the update. Nothing is downloaded or replaced
 until you ask. Scripts, pipes and `--json` output never see the line, and
-`--no-update-check` or `KINETIC_NO_UPDATE_CHECK=1` turn the check off.
+`--no-update-check` or `KINETIC_NO_UPDATE_CHECK=1` keep the check off even
+when Settings or `KINETIC_UPDATE_CHECK` turn it on.
 
 ## doctor
 
