@@ -124,7 +124,7 @@ mod tests {
             let m = Matrix::new(ty, &blocks, 1, 16 * ty.block_len());
             let out = device_layout(&m);
             let mut counts = vec![0; size];
-            for &b in out.iter() {
+            for &b in &out[..blocks.len()] {
                 counts[b as usize] += 1;
             }
             assert!(counts.iter().all(|&c| c == 16), "{ty}");
