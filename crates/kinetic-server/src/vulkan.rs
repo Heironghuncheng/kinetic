@@ -58,8 +58,8 @@ impl<'a> VulkanBackend<'a> {
     /// Uploads `model` to the first Vulkan device that can run it, for
     /// sequences of up to `context` tokens, with prompt passes on its matrix
     /// units if `matrix` and it has them; see [`VulkanModel::matrix`].
-    /// Their states take more memory: where it runs short, the model runs
-    /// without them; see [`VulkanBackend::matrix_dropped`]. Fails when no
+    /// Their states take more memory: where it runs short, or a buffer is
+    /// larger than the device allows, the model runs without them; see [`VulkanBackend::matrix_dropped`]. Fails when no
     /// device is usable or the model needs something the Vulkan kernels
     /// lack.
     pub fn new(model: &'a Model<'a>, context: usize, matrix: bool) -> Result<Self, LoadError> {
@@ -73,7 +73,7 @@ impl<'a> VulkanBackend<'a> {
         };
         let (state, matrix_dropped) = match states(&gpu) {
             Ok(state) => (state, false),
-            Err(e) if e.out_of_memory() && gpu.matrix() => {
+            Err(e) if e.does_not_fit() && gpu.matrix() => {
                 gpu.without_matrix();
                 (states(&gpu).map_err(vulkan_error)?, true)
             }
@@ -117,8 +117,8 @@ impl<'a> VulkanBackend<'a> {
     }
 
     /// Whether prompt passes on the matrix units were asked for and the
-    /// device has them, but their states did not fit in its memory, so the
-    /// model runs without them.
+    /// device has them, but their states did not fit in its memory or its
+    /// buffer limit, so the model runs without them.
     pub fn matrix_dropped(&self) -> bool {
         self.matrix_dropped
     }

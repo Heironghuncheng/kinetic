@@ -1189,7 +1189,7 @@ fn vulkan_backend<'a>(
             if gpu.matrix_dropped() {
                 eprintln!(
                     "kinetic: prompt passes on the matrix units are off: their buffers do \
-                     not fit in the GPU's memory"
+                     not fit in the GPU's memory or its buffer limit"
                 );
             }
             let device = gpu.device().to_owned();
