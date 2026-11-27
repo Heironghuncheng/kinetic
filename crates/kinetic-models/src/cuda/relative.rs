@@ -144,8 +144,8 @@ impl RelLayer {
     }
 
     /// A fresh state for up to `capacity` positions run in batches of up
-    /// to `rows`, with room for [`MAX_BATCH`] tokens between a checkpoint
-    /// and its rollback.
+    /// to `rows`, with room for the tokens a pass that verifies a draft
+    /// runs between a checkpoint and its rollback.
     pub fn new_state(
         &self,
         gpu: &Gpu,
@@ -172,7 +172,8 @@ impl RelLayer {
             Some(w) => w + rows.max(MAX_BATCH) + MAX_BATCH,
             None => capacity,
         };
-        let conv = |(c, taps)| ConvState::new(&gpu.ctx, &gpu.stream, c, taps, MAX_BATCH);
+        let since = super::wide_verify(rows.max(MAX_BATCH));
+        let conv = |(c, taps)| ConvState::new(&gpu.ctx, &gpu.stream, c, taps, since);
         let [a, b, c, d] = self.convs();
         Ok(RelState {
             kv: KvCache::new(&gpu.ctx, &attention, slots)?,

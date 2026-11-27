@@ -326,6 +326,9 @@ fn tiny_model(c: Tiny) -> Memory {
 const PROMPT: [u32; 12] = [1, 40, 10, 23, 50, 7, 31, 12, 33, 6, 45, 24];
 const NEXT: [u32; 6] = [30, 3, 59, 7, 17, 9];
 
+/// Room for the prompt and a verify pass of the widest draft.
+const CONTEXT: usize = 256;
+
 fn bits(x: &[f32]) -> Vec<u32> {
     x.iter().map(|v| v.to_bits()).collect()
 }
@@ -401,6 +404,48 @@ fn inkling_on_cuda_matches_the_cpu_and_changes_no_bit() {
             eprintln!("{exact:?} offloaded: {stats:?}");
             assert!(stats.host_experts > 0 && stats.loaded > 0, "{stats:?}");
         }
+    }
+}
+
+/// A verify pass of the widest draft keeps the bits of decoding, with every
+/// expert on the device and with most of them on the host.
+#[test]
+#[ignore = "needs a CUDA device"]
+fn wide_verify_passes_change_no_bit() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        wide_verify_on_both_expert_types();
+        done.send(()).unwrap();
+    });
+    match finished.recv_timeout(std::time::Duration::from_secs(180)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("no result in three minutes"),
+        Err(_) => panic!("the check failed"),
+        Ok(()) => {}
+    }
+}
+
+fn wide_verify_on_both_expert_types() {
+    for experts in [TensorType::IQ4NL, TensorType::NVFP4] {
+        let tiny = Tiny {
+            dense: TensorType::Q8_0,
+            experts,
+            used: 2,
+            unrolled: false,
+            wide: false,
+        };
+        let file = tiny_model(tiny);
+        let model = kinetic_models::load(&file).unwrap();
+        let resident = CudaModel::load(&model, CONTEXT).unwrap();
+        a_wide_verify_pass_keeps_the_bits_of_decoding(&resident);
+        drop(resident);
+        let placement = Placement {
+            expert_cache: Some(3 * gpu_slot_bytes(experts)),
+            ..Placement::default()
+        };
+        let offloaded = CudaModel::load_with(&model, CONTEXT, placement).unwrap();
+        a_wide_verify_pass_keeps_the_bits_of_decoding(&offloaded);
+        let stats = offloaded.stats().unwrap();
+        assert!(stats.host_experts > 0, "{stats:?}");
     }
 }
 
@@ -494,6 +539,41 @@ fn a_batch_matches_token_by_token(gpu: &CudaModel) {
     for (i, &t) in NEXT.iter().enumerate() {
         let logits = gpu.run(&mut single, &[t], false).unwrap().logits;
         assert_eq!(bits(&logits), bits(&all[i * vocab..][..vocab]), "row {i}");
+    }
+}
+
+/// A draft of the widest pass, verified at once, gives every row the bits
+/// of one-token decoding; a rollback after any row leaves the state as if
+/// only the rows kept had run, one token at a time.
+fn a_wide_verify_pass_keeps_the_bits_of_decoding(gpu: &CudaModel) {
+    let rows = gpu.verify_rows();
+    assert_eq!(rows, 128);
+    let vocab = gpu.n_vocab();
+    let draft: Vec<u32> = (0..rows).map(|i| (i * 13 % 59) as u32).collect();
+    let decoded = |keep: usize| {
+        let mut state = gpu.new_state().unwrap();
+        gpu.run(&mut state, &PROMPT, false).unwrap();
+        let mut logits = Vec::new();
+        for &t in &draft[..keep] {
+            logits.extend(gpu.run(&mut state, &[t], false).unwrap().logits);
+        }
+        (state, logits)
+    };
+    let (_, want) = decoded(rows);
+    for keep in [0, 1, 17, 77, rows] {
+        let mut state = gpu.new_state().unwrap();
+        gpu.run(&mut state, &PROMPT, false).unwrap();
+        gpu.checkpoint(&mut state).unwrap();
+        let got = gpu.run(&mut state, &draft, true).unwrap().logits;
+        for (row, (g, w)) in got.chunks(vocab).zip(want.chunks(vocab)).enumerate() {
+            assert_eq!(bits(g), bits(w), "row {row}");
+        }
+        gpu.rollback(&mut state, keep).unwrap();
+        let after = gpu.run(&mut state, &[42, 5], true).unwrap().logits;
+        let (mut plain, _) = decoded(keep);
+        let mut expected = gpu.run(&mut plain, &[42], false).unwrap().logits;
+        expected.extend(gpu.run(&mut plain, &[5], false).unwrap().logits);
+        assert_eq!(bits(&after), bits(&expected), "kept {keep}");
     }
 }
 
