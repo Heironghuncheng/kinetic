@@ -434,3 +434,15 @@ fn drafts_go_only_as_far_as_they_pay() {
         assert_eq!(speculative(&mut Greedy, &mut decoder).0, expected);
     }
 }
+
+/// Drafts that never come true are judged against the output and never
+/// verified, so every step is a plain one, even where rows are free.
+#[test]
+fn drafts_that_never_pay_cost_no_pass() {
+    for ratio in [1.0, 1.3] {
+        let mut decoder = Decoder::new(Zeros);
+        decoder.costs = Costs::fixed(&[ratio]);
+        let (tokens, passes, _) = speculative(&mut Greedy, &mut decoder);
+        assert_eq!((tokens, passes), (plain(&mut Greedy), N), "ratio {ratio}");
+    }
+}
