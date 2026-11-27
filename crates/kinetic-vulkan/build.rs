@@ -203,11 +203,11 @@ fn wide_source(name: &str, source: &str) -> String {
     let mut source = source.to_string();
     let mut lets = String::new();
     if source.contains(LANE) {
-        source = source.replace(LANE, "@builtin(subgroup_invocation_id) wave_lane: u32,");
-        lets += "\n    let lane = wave_lane % 32u;";
+        source = source.replace(LANE, "@builtin(subgroup_invocation_id) wide_lane: u32,");
+        lets += "\n    let lane = wide_lane % 32u;";
         if source.contains(SLOT) {
-            source = source.replace(SLOT, "@builtin(subgroup_id) wave: u32,");
-            lets += "\n    let slot = 2u * wave + wave_lane / 32u;";
+            source = source.replace(SLOT, "@builtin(subgroup_id) wide_group: u32,");
+            lets += "\n    let slot = 2u * wide_group + wide_lane / 32u;";
         }
     }
     assert!(
