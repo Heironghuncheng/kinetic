@@ -220,6 +220,12 @@ recorded CUDA graph. Expert offloading itself is known (for example Eliseev
 and Mazur, 2023, and llama.cpp's `--override-tensor`); Flywheel makes the
 placement automatic.
 
+On Vulkan, Flywheel places whole layers: it keeps every expert of the layers
+a token runs most often on the GPU, as many as fit, and runs the experts of
+the others on the CPU from the mapped file, so no expert crosses the bus
+while the model runs. A looped model such as Inkling 2 runs the layers of
+its loop once per pass, so those come first.
+
 See [Devices and offload](devices.md) for what runs where.
 
 ## References

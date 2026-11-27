@@ -1,14 +1,17 @@
 // The greedy token of each row the output head ran on: the index of the
 // largest logit, the lowest index among equals, then that logit's bits.
+// With `cap` above zero every logit first becomes cap tanh(logit / cap), in
+// place, so the logits read back are the capped ones too.
 
 struct Shape {
     vocab: u32,
+    cap: f32,
 }
 
 var<immediate> shape: Shape;
 
 @group(0) @binding(0) var<storage, read> batch: array<u32>;
-@group(0) @binding(1) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> logits: array<f32>;
 @group(0) @binding(2) var<storage, read_write> best: array<u32>;
 
 const THREADS: u32 = 256u;
@@ -38,7 +41,11 @@ fn main(
     var v = -3.4e38;
     var at = 0xFFFFFFFFu;
     for (var i = tid; i < shape.vocab; i += THREADS) {
-        let l = logits[base + i];
+        var l = logits[base + i];
+        if shape.cap > 0.0 {
+            l = shape.cap * tanh(l / shape.cap);
+            logits[base + i] = l;
+        }
         if l > v {
             v = l;
             at = i;

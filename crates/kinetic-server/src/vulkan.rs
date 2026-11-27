@@ -64,6 +64,9 @@ impl<'a> VulkanBackend<'a> {
     /// lack.
     pub fn new(model: &'a Model<'a>, context: usize, matrix: bool) -> Result<Self, LoadError> {
         let mut gpu = VulkanModel::load(model, context, matrix)?;
+        if let Some(line) = gpu.host_weights() {
+            eprintln!("kinetic: {line}");
+        }
         // the drafter's cache shares the memory, so a full device fails here
         // and not on the first request
         let states = |gpu: &VulkanModel| -> kinetic_vulkan::Result<VulkanState> {
@@ -79,6 +82,7 @@ impl<'a> VulkanBackend<'a> {
             }
             Err(e) => return Err(vulkan_error(e)),
         };
+        eprintln!("kinetic: {}", gpu.memory_line(&state));
         Ok(VulkanBackend {
             decoder: drafter::decoder(&gpu),
             cached: Some(Sequence {
@@ -268,6 +272,11 @@ impl<'a> Run<VulkanModel<'a>> for VulkanBackend<'a> {
         // the token chosen last is never run
         self.replied = seq.tokens.len() > prompt.len();
         self.cached = Some(seq);
+        // where an offloaded model's time went, beside the run's summary
+        if let Some(report) = self.gpu.expert_report() {
+            eprintln!("[{report}]");
+            self.gpu.reset_expert_report();
+        }
         Timings {
             prompt_tokens: prompt.len(),
             cached_tokens,

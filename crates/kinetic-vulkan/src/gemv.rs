@@ -24,29 +24,44 @@ const ROWS_PER_GROUP: usize = 16;
 /// four subgroups of two rows.
 #[cfg(metal_driver)]
 const MANY_ROWS_PER_GROUP: usize = 8;
+/// Rows per workgroup of experts.wgsl, on every driver.
+const ROWS_PER_EXPERT_GROUP: usize = 4;
 /// Elements per scale in the int8 copy of the input.
 const Q8_BLOCK: usize = 32;
 /// Invocations per workgroup of quantize_q8.wgsl, one per block of 32.
 const QUANTIZE_THREADS: usize = 64;
 
 /// Elements per kernel block for each type with a GEMV kernel.
-fn block_len(ty: TensorType) -> Option<usize> {
+pub(crate) fn block_len(ty: TensorType) -> Option<usize> {
     Some(match ty {
         TensorType::F32 => 4,
         TensorType::F16 => 8,
-        TensorType::Q8_0 => 32,
-        TensorType::Q4K | TensorType::Q5K | TensorType::Q6K => 256,
+        TensorType::Q8_0 | TensorType::IQ4NL => 32,
+        TensorType::NVFP4 => 64,
+        TensorType::Q3K
+        | TensorType::Q4K
+        | TensorType::Q5K
+        | TensorType::Q6K
+        | TensorType::IQ2XS
+        | TensorType::IQ2S
+        | TensorType::IQ3XXS
+        | TensorType::IQ3S => 256,
         _ => return None,
     })
 }
 
+/// Whether weights of type `ty` have GEMV and expert kernels.
+pub fn has_kernel(ty: TensorType) -> bool {
+    block_len(ty).is_some()
+}
+
 /// A weight matrix in device memory, laid out for the GEMV kernels.
 pub struct DeviceMatrix {
-    ty: TensorType,
-    rows: usize,
-    cols: usize,
-    bytes: usize,
-    data: DeviceBuffer<u8>,
+    pub(crate) ty: TensorType,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) bytes: usize,
+    pub(crate) data: DeviceBuffer<u8>,
 }
 
 impl DeviceMatrix {
@@ -440,6 +455,109 @@ impl Kernels {
         };
     }
 
+    /// Records the expert products of a mixture-of-experts layer: `w` holds
+    /// `count` experts of equal shape one after another, and for each token
+    /// of the batch and each of its `used` picks in `picks` (see
+    /// [`Kernels::route`]), job `j` multiplies the picked expert with input
+    /// row `j / per_input` of `x` and writes output row `j` as `out` says,
+    /// times the entry of `scales` its pick names, if given.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_experts(
+        &self,
+        w: &DeviceMatrix,
+        count: usize,
+        used: usize,
+        picks: &DeviceBuffer<u32>,
+        x: &GemvInput,
+        per_input: usize,
+        scales: Option<&DeviceBuffer<f32>>,
+        y: &DeviceBuffer<f32>,
+        out: Out,
+        batch: &Batch,
+        commands: &mut Commands,
+    ) -> Result<()> {
+        let block = block_len(w.ty).ok_or(Error::Unsupported(w.ty))?;
+        let rows = w.rows / count.max(1);
+        let jobs = batch.rows() * used;
+        let needed = (jobs.max(1) - 1)
+            .checked_mul(out.stride)
+            .and_then(|end| end.checked_add(out.offset + rows));
+        if count == 0
+            || !w.rows.is_multiple_of(count)
+            || per_input == 0
+            || x.width() != w.cols
+            || x.rows() < jobs.div_ceil(per_input)
+            || picks.len() < 2 * jobs
+            || scales.is_some_and(|s| s.len() < count)
+            || out.stride < out.offset + rows
+            || needed.is_none_or(|n| n > y.len() || u32::try_from(n).is_err())
+            || jobs > MAX_GROUPS as usize
+            || rows.div_ceil(ROWS_PER_EXPERT_GROUP) > MAX_GROUPS as usize
+        {
+            return Err(Error::Shape(format!(
+                "expert GEMV of {count} experts of a {}x{} matrix, {used} per token, on {} rows \
+                 of {} into {} outputs at stride {} offset {}",
+                w.rows,
+                w.cols,
+                x.rows(),
+                x.width(),
+                y.len(),
+                out.stride,
+                out.offset
+            )));
+        }
+        let kernel = match w.ty {
+            TensorType::F32 => &self.experts_f32,
+            TensorType::F16 => &self.experts_f16,
+            TensorType::Q8_0 => &self.experts_q8_0,
+            TensorType::Q4K => &self.experts_q4_k,
+            TensorType::Q5K => &self.experts_q5_k,
+            TensorType::Q6K => &self.experts_q6_k,
+            TensorType::IQ4NL => &self.experts_iq4_nl,
+            TensorType::NVFP4 => &self.experts_nvfp4,
+            TensorType::IQ3XXS => &self.experts_iq3_xxs,
+            TensorType::IQ2XS => &self.experts_iq2_xs,
+            TensorType::Q3K => &self.experts_q3_k,
+            TensorType::IQ3S => &self.experts_iq3_s,
+            TensorType::IQ2S => &self.experts_iq2_s,
+            _ => unreachable!("block_len admits only types with kernels"),
+        };
+        // SAFETY: matches experts.wgsl: weights, x, qs, ds, y, the batch and
+        // the picks at bindings 0..6, then the rows of an expert, blocks per
+        // row, experts, picks per token, jobs per input row, output stride
+        // and offset, the scales at 7 and whether to read them. Checked
+        // above: the picks, input rows and output rows of every job the
+        // batch can hold, and a scale per expert; jobs of experts past the
+        // last are skipped.
+        unsafe {
+            commands.dispatch(
+                kernel,
+                &[
+                    w.data.allocation(),
+                    x.x.allocation(),
+                    x.qs.allocation(),
+                    x.ds.allocation(),
+                    y.allocation(),
+                    batch.device().allocation(),
+                    picks.allocation(),
+                    scales.unwrap_or(y).allocation(),
+                ],
+                &[
+                    rows as u32,
+                    (w.cols / block) as u32,
+                    count as u32,
+                    used as u32,
+                    per_input as u32,
+                    out.stride as u32,
+                    out.offset as u32,
+                    scales.is_some() as u32,
+                ],
+                [rows.div_ceil(ROWS_PER_EXPERT_GROUP) as u32, jobs as u32, 1],
+            )
+        };
+        Ok(())
+    }
+
     /// The kernel for weights of type `ty` and the rows one of its
     /// workgroups takes; with `many`, the one written for a pass of many
     /// tokens, where the driver has it.
@@ -462,6 +580,13 @@ impl Kernels {
             TensorType::Q4K => &self.gemv_q4_k,
             TensorType::Q5K => &self.gemv_q5_k,
             TensorType::Q6K => &self.gemv_q6_k,
+            TensorType::IQ4NL => &self.gemv_iq4_nl,
+            TensorType::NVFP4 => &self.gemv_nvfp4,
+            TensorType::IQ3XXS => &self.gemv_iq3_xxs,
+            TensorType::IQ2XS => &self.gemv_iq2_xs,
+            TensorType::Q3K => &self.gemv_q3_k,
+            TensorType::IQ3S => &self.gemv_iq3_s,
+            TensorType::IQ2S => &self.gemv_iq2_s,
             _ => unreachable!("block_len admits only types with kernels"),
         };
         (kernel, ROWS_PER_GROUP)

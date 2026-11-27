@@ -53,6 +53,7 @@ impl Network<'_> {
     }
 
     /// Most blocks a mix reads besides the stream, and most a bank holds.
+    #[cfg(any(feature = "cuda", feature = "vulkan"))]
     pub(crate) fn most_blocks(&self) -> (usize, usize) {
         let blocks = self.wiring.len().div_ceil(self.block);
         let bank = self

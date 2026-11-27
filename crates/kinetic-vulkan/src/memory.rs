@@ -372,6 +372,32 @@ impl Commands {
     }
 
     /// Records a copy of `len` elements from `src` at `src_at` to `dst` at
+    /// `dst_at`, two buffers on the device.
+    pub fn copy_buffer<T: DeviceCopy>(
+        &mut self,
+        src: &DeviceBuffer<T>,
+        src_at: usize,
+        dst: &DeviceBuffer<T>,
+        dst_at: usize,
+        len: usize,
+    ) -> Result<()> {
+        check_range("copy", src_at, len, src.len())?;
+        check_range("copy", dst_at, len, dst.len())?;
+        let t = size_of::<T>();
+        // SAFETY: both ranges were checked above.
+        unsafe {
+            self.copy(
+                src.allocation(),
+                src_at * t,
+                dst.allocation(),
+                dst_at * t,
+                len * t,
+            )
+        };
+        Ok(())
+    }
+
+    /// Records a copy of `len` elements from `src` at `src_at` to `dst` at
     /// `dst_at`.
     pub fn download<T: DeviceCopy>(
         &mut self,

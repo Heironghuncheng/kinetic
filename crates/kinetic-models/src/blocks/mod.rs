@@ -21,8 +21,10 @@ pub use folding::Folding;
 pub use mamba2::{Mamba2, Mamba2State};
 #[cfg(all(test, feature = "cuda"))]
 pub(crate) use moe::scale_offsets;
+#[cfg(any(feature = "cuda", feature = "vulkan"))]
+pub(crate) use moe::Job;
 #[cfg(feature = "cuda")]
-pub(crate) use moe::{packed_dot, unpack, unpacked_dot, Job, Pick, Unpacked};
+pub(crate) use moe::{packed_dot, unpack, unpacked_dot, Pick, Unpacked};
 pub(crate) use moe::{ExpertNorms, Experts, Gating, Glu, Moe};
 pub use relative::{RelAttention, RelState};
 pub use short_conv::{ShortConv, ShortConvState};
