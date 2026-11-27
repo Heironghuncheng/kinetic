@@ -118,7 +118,8 @@ impl<'a> CudaBackend<'a> {
         // The drafter's cache comes out of the same memory; finding out here
         // keeps a full device from failing the first request instead.
         drop(gpu.new_mtp_state().map_err(cuda_error)?);
-        let decoder = drafter::decoder(&*gpu);
+        let mut decoder = drafter::decoder(&*gpu);
+        decoder.max_draft = gpu.verify_rows() - 1;
         Ok(CudaBackend {
             max_draft: decoder.max_draft,
             decoder,
@@ -623,7 +624,10 @@ impl Backend for CudaBackend<'_> {
         let gpu = Arc::clone(&self.gpu);
         let seat = gpu.seat();
         // drafts shrink so every seat's rows fit one shared GEMV
-        let rows = MAX_BATCH / gpu.seats();
+        let rows = match gpu.seats() {
+            1 => gpu.verify_rows(),
+            seats => MAX_BATCH / seats,
+        };
         self.decoder.max_draft = self.max_draft.min(rows.saturating_sub(1));
         sequence::generate(self, prompt, job, &mut |t| seat.away(|| emit(t)))
     }
