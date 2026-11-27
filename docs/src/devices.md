@@ -272,8 +272,7 @@ Experts of a weight type without a Vulkan kernel run on the CPU as well.
 
 ## Coming
 
-- **More on Vulkan**: more architectures, speculative decoding, Warm Start
-  and layer splits.
+- **More on Vulkan**: more architectures and layer splits.
 - **Several GPUs** for mixture-of-experts models, Gemma 4 E2B/E4B and
   shared passes; dense models already spread over them with `--gpus`.
 
