@@ -95,6 +95,15 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
   `<tool_call>` without closing `</think>` first; the call used to stay in
   `reasoning_content` and the reply ended with `finish_reason: "stop"`.
 
+### Speed
+
+- RAD-1 no longer makes decoding slower on a model split between the GPU and
+  the CPU, by layers or by experts. It times its steps by the rows each pass
+  runs, on the model as it is placed, and measures how far drafts come true;
+  a draft is verified only up to the length that gives the most tokens per
+  second expected, and not at all when a plain step gives as many. The
+  output does not change.
+
 ## [0.1.0] - 2026-11-05
 
 The first public release.

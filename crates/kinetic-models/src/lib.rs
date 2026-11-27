@@ -18,6 +18,8 @@ mod loader;
 pub mod lora;
 pub mod memory;
 mod model;
+#[cfg(feature = "cuda")]
+mod offload;
 mod per_layer;
 pub mod speculative;
 #[cfg(feature = "vulkan")]

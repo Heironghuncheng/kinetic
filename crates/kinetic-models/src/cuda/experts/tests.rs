@@ -2,11 +2,11 @@
 
 use kinetic_cuda::{
     Context, Device, DeviceBuffer, ExpertArena, ExpertGroup, ExpertProduct, ExpertTables, Q8kRows,
-    Routing, EXPERT_GROUP, EXPERT_TYPES, Q8K_BLOCK,
+    Routing, EXPERT_GROUP, EXPERT_TYPES,
 };
 use kinetic_quant::{Matrix, TensorType};
 
-use super::Gpu;
+use super::{form, Gpu};
 use crate::blocks::{scale_offsets, Experts, Gating, Glu, Job, Moe};
 
 fn gpu() -> Option<Gpu> {
@@ -33,7 +33,10 @@ fn random_experts(
     count: usize,
     seed: &mut u64,
 ) -> Vec<u8> {
-    let mut data = random_bytes(count * rows * cols / 256 * ty.block_bytes(), seed);
+    let mut data = random_bytes(
+        count * rows * cols / ty.block_len() * ty.block_bytes(),
+        seed,
+    );
     for (i, blk) in data.chunks_exact_mut(ty.block_bytes()).enumerate() {
         for (j, &at) in scale_offsets(ty).iter().enumerate() {
             let d = half::f16::from_f32(0.002 + ((i + 5 * j) % 17) as f32 * 4e-4);
@@ -49,23 +52,40 @@ fn device_experts_equal_host_experts_bit_for_bit() {
         eprintln!("skipped: no CUDA device or kernels");
         return;
     };
-    let (d, f, count, tokens) = (512, 256, 3, 4);
+    let (d, count, tokens) = (512, 3, 4);
     let mut seed = 9;
-    for (gate_ty, down_ty) in [
-        (EXPERT_TYPES[0], EXPERT_TYPES[3]),
-        (EXPERT_TYPES[1], EXPERT_TYPES[2]),
-        (TensorType::Q4K, TensorType::Q6K),
-        (TensorType::Q5K, TensorType::Q2K),
-        (TensorType::Q2K, TensorType::Q3K),
-        (TensorType::Q6K, TensorType::Q4K),
-        (TensorType::Q3K, TensorType::Q5K),
+    let situ = Glu::Situ {
+        beta: 4.0,
+        linear: 25.0,
+    };
+    for (gate_ty, down_ty, glu, f) in [
+        (EXPERT_TYPES[0], EXPERT_TYPES[3], Glu::Silu, 256),
+        (EXPERT_TYPES[1], EXPERT_TYPES[2], Glu::Silu, 256),
+        (TensorType::Q4K, TensorType::Q6K, Glu::Silu, 256),
+        (TensorType::Q5K, TensorType::Q2K, Glu::Silu, 256),
+        (TensorType::Q2K, TensorType::Q3K, Glu::Silu, 256),
+        (TensorType::Q6K, TensorType::Q4K, Glu::Silu, 256),
+        (TensorType::Q3K, TensorType::Q5K, Glu::Silu, 256),
+        (TensorType::Q4K, TensorType::Q6K, situ, 256),
+        (TensorType::IQ4NL, TensorType::IQ4NL, situ, 288),
+        (TensorType::IQ4NL, TensorType::IQ4NL, Glu::Silu, 96),
+        (TensorType::NVFP4, TensorType::NVFP4, situ, 256),
+        (TensorType::NVFP4, TensorType::Q5K, situ, 256),
+        (TensorType::Q8_0, TensorType::NVFP4, Glu::Silu, 192),
+        (TensorType::IQ2S, TensorType::IQ3S, situ, 256),
+        (TensorType::IQ2S, TensorType::Q2_0, situ, 256),
+        (TensorType::IQ1S, TensorType::NVFP4, Glu::Silu, 256),
+        (TensorType::IQ1S, TensorType::Q2_0, situ, 256),
+        (TensorType::IQ2XXS, TensorType::NVFP4, situ, 256),
+        (TensorType::IQ2XS, TensorType::Q2_0, situ, 256),
+        (TensorType::IQ3XXS, TensorType::IQ4NL, situ, 256),
     ] {
         let gate = random_experts(gate_ty, f, d, count, &mut seed);
         let up = random_experts(gate_ty, f, d, count, &mut seed);
         let down = random_experts(down_ty, d, f, count, &mut seed);
         let router = vec![0u8; 4 * d * count];
         fn experts(ty: TensorType, data: &[u8], rows: usize, cols: usize) -> Experts<'_> {
-            let count = data.len() / (rows * cols / 256 * ty.block_bytes());
+            let count = data.len() / (rows * cols / ty.block_len() * ty.block_bytes());
             Experts {
                 ty,
                 data,
@@ -82,9 +102,13 @@ fn device_experts_equal_host_experts_bit_for_bit() {
             n_used: 2,
             shared_gate: None,
             gating: Gating::Softmax,
-            glu: Glu::Silu,
+            glu,
             weight_scale: 1.0,
-            scales: Default::default(),
+            // per-expert scales, as the NVFP4 files carry them
+            scales: match gate_ty {
+                TensorType::NVFP4 => [0.5, 1.25, 2.0].map(|s| Some(vec![s, -s, 3.0 * s])),
+                _ => Default::default(),
+            },
             norms: None,
         };
         let h: Vec<f32> = random_bytes(tokens * d, &mut seed)
@@ -93,20 +117,16 @@ fn device_experts_equal_host_experts_bit_for_bit() {
             .collect();
         // Expert 2 for tokens 0, 1 and 3, expert 0 for token 2.
         let jobs = [(2, 0), (2, 1), (2, 3), (0, 2)].map(|(expert, row)| Job { row, expert });
-        let want = moe.run_experts(&h, &jobs);
+        let want = super::run_host(&moe, &h, &jobs);
 
-        let (ge, ue, de) = (
-            moe.gate.expert_bytes(),
-            moe.up.expert_bytes(),
-            moe.down.expert_bytes(),
-        );
-        let slot_bytes = ge + ue + de;
-        let mut arena = Vec::new();
-        for e in 0..count {
-            for m in [moe.gate.expert(e), moe.up.expert(e), moe.down.expert(e)] {
-                arena.extend_from_slice(m.data);
-            }
+        let layout = form::layout(&moe);
+        let (ge, ue, de) = (layout.gate, layout.up, layout.down);
+        let slot_bytes = layout.bytes();
+        let mut arena = vec![0; count * slot_bytes];
+        for (e, slot) in arena.chunks_exact_mut(slot_bytes).enumerate() {
+            form::stage(&moe, e, slot);
         }
+        let scales = (layout.scales > 0).then_some(ge + ue + de);
         let arena = DeviceBuffer::from_slice(&g.ctx, &arena).unwrap();
         let arena = ExpertArena {
             data: &arena,
@@ -134,12 +154,12 @@ fn device_experts_equal_host_experts_bit_for_bit() {
         let a = jobs.len();
         let hs = DeviceBuffer::from_slice(&g.ctx, &h).unwrap();
         let mut hq = DeviceBuffer::<i8>::new(&g.ctx, tokens * d).unwrap();
-        let mut hd = DeviceBuffer::<f32>::new(&g.ctx, tokens * d / Q8K_BLOCK).unwrap();
-        k.quantize_q8k(&hs, tokens, d, &mut hq, &mut hd, stream)
-            .unwrap();
+        let mut hd = DeviceBuffer::<f32>::new(&g.ctx, tokens * d / 16).unwrap();
+        let (gate_dev, down_dev) = (form::device_type(gate_ty), form::device_type(down_ty));
+        super::quantize(k, gate_dev, &hs, tokens, d, &mut hq, &mut hd, stream).unwrap();
         let mut act = DeviceBuffer::<f32>::new(&g.ctx, a * f).unwrap();
         let mut actq = DeviceBuffer::<i8>::new(&g.ctx, a * f).unwrap();
-        let mut actd = DeviceBuffer::<f32>::new(&g.ctx, a * f / Q8K_BLOCK).unwrap();
+        let mut actd = DeviceBuffer::<f32>::new(&g.ctx, a * f / 16).unwrap();
         let mut out = DeviceBuffer::<f32>::new(&g.ctx, a * d).unwrap();
         let product = |ty, inputs, first, second, rows, cols| ExpertProduct {
             ty,
@@ -152,27 +172,33 @@ fn device_experts_equal_host_experts_bit_for_bit() {
             second,
             rows,
             cols,
+            situ: match glu {
+                Glu::Silu => None,
+                Glu::Situ { beta, linear } => Some((beta, linear)),
+                Glu::Gelu => unreachable!("not among these cases"),
+            },
+            scales: scales.map(|at| (at, if second.is_some() { 0 } else { 2 })),
+            most: 3,
         };
         // SAFETY: the groups cover the four assignments, whose slots hold
         // the experts at these offsets and whose inputs are rows of `h`.
         unsafe {
             let x = Q8kRows { qs: &hq, ds: &hd };
-            let p = product(gate_ty, Some(&inputs), 0, Some(ge), f, d);
+            let p = product(gate_dev, Some(&inputs), 0, Some(ge), f, d);
             k.moe_product(&p, arena, &tables, &x, &mut act, stream)
                 .unwrap();
-            k.quantize_q8k(&act, a, f, &mut actq, &mut actd, stream)
-                .unwrap();
+            super::quantize(k, down_dev, &act, a, f, &mut actq, &mut actd, stream).unwrap();
             let x = Q8kRows {
                 qs: &actq,
                 ds: &actd,
             };
-            let p = product(down_ty, None, ge + ue, None, d, f);
+            let p = product(down_dev, None, ge + ue, None, d, f);
             k.moe_product(&p, arena, &tables, &x, &mut out, stream)
                 .unwrap();
         }
         let got = out.to_vec().unwrap();
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        assert_eq!(bits(&got), bits(&want), "{gate_ty}/{down_ty}");
+        assert_eq!(bits(&got), bits(&want), "{gate_ty}/{down_ty} {glu:?}");
     }
 }
 
@@ -204,6 +230,7 @@ fn device_sigmoid_routing_picks_what_the_host_picks() {
         stride,
         sigmoid: true,
         bias: Some(&bias_dev),
+        scale: 1.0,
     };
     g.kernels
         .moe_route(&routing, &mut experts, &mut weights, &g.stream)
@@ -244,6 +271,7 @@ fn device_routing_picks_what_the_host_picks() {
         stride,
         sigmoid: false,
         bias: None,
+        scale: 1.0,
     };
     let (kn, stream) = (&g.kernels, &g.stream);
     kn.moe_route(&routing, &mut experts, &mut weights, stream)
@@ -261,6 +289,7 @@ fn device_routing_picks_what_the_host_picks() {
         &slots,
         &mut groups,
         a,
+        EXPERT_GROUP,
         &mut inputs,
         &mut rows,
         stream,
@@ -298,5 +327,61 @@ fn device_routing_picks_what_the_host_picks() {
             .expect("every assignment is in a group");
         assert_eq!(group[0], n_exp as u32 - 1 - experts[s]);
         assert!(group[2] as usize <= EXPERT_GROUP);
+    }
+}
+
+/// Every expert of several layers copied to the device at load holds the
+/// bytes the host stages for it: the copies of one layer never overwrite
+/// staging an earlier layer's copies still read.
+#[test]
+fn experts_loaded_at_once_hold_their_bytes() {
+    let Some(g) = gpu() else {
+        eprintln!("skipped: no CUDA device or kernels");
+        return;
+    };
+    let (d, f, count, layers) = (256, 256, 64, 4);
+    let mut seed = 3;
+    let ty = TensorType::Q8_0;
+    let data: Vec<[Vec<u8>; 3]> = (0..layers)
+        .map(|_| std::array::from_fn(|_| random_experts(ty, f, d, count, &mut seed)))
+        .collect();
+    let router = vec![0u8; 4 * d * count];
+    let moes: Vec<Moe> = data
+        .iter()
+        .map(|[gate, up, down]| {
+            let experts = |data, rows, cols| Experts {
+                ty,
+                data,
+                rows,
+                cols,
+                stride: rows * cols / ty.block_len() * ty.block_bytes(),
+            };
+            Moe {
+                router: Matrix::new(TensorType::F32, &router, count, d),
+                gate: experts(&gate[..], f, d),
+                up: experts(&up[..], f, d),
+                down: experts(&down[..], d, f),
+                n_used: 2,
+                shared_gate: None,
+                gating: Gating::Softmax,
+                glu: Glu::Silu,
+                weight_scale: 1.0,
+                scales: Default::default(),
+                norms: None,
+            }
+        })
+        .collect();
+    let off = super::Offload::new(&g, moes, &[1; 4], 1 << 30, None, 0).unwrap();
+    assert!(off.is_resident());
+    let arena = off.arenas[off.cache.pool_of(0)].to_vec().unwrap();
+    let slot_bytes = off.plan.pools[0].slot_bytes;
+    let mut want = vec![0; off.staging.region];
+    for (l, moe) in off.moes.iter().enumerate() {
+        for e in 0..count {
+            let len = form::stage(moe, e, &mut want);
+            let slot = off.cache.slot(l, e).unwrap() as usize;
+            let got = &arena[slot * slot_bytes..][..len];
+            assert!(got == &want[..len], "layer {l} expert {e}");
+        }
     }
 }

@@ -45,6 +45,21 @@ impl CudaMixer {
                 }
                 out
             }
+            (CudaMixer::Relative(r), LayerState::Relative(s)) => {
+                let (k, v) = save_cache(&s.kv, r.weights.window(), pos)?;
+                let mut out = vec![k, v];
+                for ((channels, taps), conv) in r.weights.convs().into_iter().zip(&s.convs) {
+                    let host = conv.save()?;
+                    out.push(ring_to_past(
+                        &host.ring,
+                        host.ring_rows,
+                        channels,
+                        taps,
+                        pos,
+                    ));
+                }
+                out
+            }
             _ => unreachable!("state does not belong to this mixer"),
         })
     }
@@ -93,6 +108,14 @@ impl CudaMixer {
                     rest = m.load(s, pos, rest)?;
                 }
                 Ok(rest)
+            }
+            (CudaMixer::Relative(r), LayerState::Relative(s)) => {
+                load_cache(&mut s.kv, r.weights.window(), pos, bufs[0], bufs[1])?;
+                let convs = r.weights.convs().into_iter().zip(&mut s.convs);
+                for ((shape, conv), past) in convs.zip(&bufs[2..6]) {
+                    conv.load(&ring(conv.ring_rows(), shape, past))?;
+                }
+                Ok(&bufs[6..])
             }
             _ => unreachable!("state does not belong to this mixer"),
         }
@@ -150,6 +173,7 @@ pub(super) fn clear_layer(state: &mut LayerState, stream: &Stream) -> kinetic_cu
         LayerState::ShortConv(s) => s.clear(stream),
         LayerState::Mamba2(s) => s.clear(stream),
         LayerState::Parallel(ss) => ss.iter_mut().try_for_each(|s| clear_layer(s, stream)),
+        LayerState::Relative(s) => s.convs.iter_mut().try_for_each(|c| c.clear(stream)),
     }
 }
 

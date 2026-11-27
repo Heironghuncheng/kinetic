@@ -17,8 +17,7 @@
 constexpr unsigned QK_IQ = 256;
 // Most assignments of one expert a block multiplies at once.
 constexpr unsigned MOE_GROUP = 8;
-constexpr unsigned MOE_WARPS = 4;
-constexpr unsigned MOE_THREADS = MOE_WARPS * WARP;
+constexpr unsigned MOE_THREADS = 256;
 
 // Byte offsets of the codebooks in the table buffer, read through the
 // cache: a few KiB that every warp looks up at random.
@@ -26,6 +25,9 @@ constexpr unsigned IQ2XXS_OFFSET = 0;
 constexpr unsigned IQ2XS_OFFSET = 2048;
 constexpr unsigned IQ3XXS_OFFSET = 6144;
 constexpr unsigned IQ4NL_OFFSET = 7168;
+constexpr unsigned MXFP4_OFFSET = 7184;
+constexpr unsigned IQ2S_OFFSET = 7200;
+constexpr unsigned IQ1S_OFFSET = IQ2S_OFFSET + 1024 * 8;
 
 // x quantized per 256 values: d = max|x| / 127, q = round(x / d) half away
 // from zero. One warp per block, eight values per lane.
@@ -47,11 +49,6 @@ extern "C" __global__ void quantize_q8k(const float* x, int8_t* qs, float* ds, u
     for (unsigned j = 0; j < 8; ++j)
         q[j] = static_cast<int8_t>(fminf(fmaxf(roundf(__fmul_rn(v[j], inv)), -127.0f), 127.0f));
     if (lane == 0) ds[b] = d;
-}
-
-// Eight sign bits from a 7-bit index; the eighth keeps the count even.
-__device__ __forceinline__ unsigned iq_signs(unsigned i) {
-    return i | ((__popc(i) & 1u) << 7);
 }
 
 // Four magnitudes in `v` negated where the low four bits of `signs` say.
@@ -301,11 +298,31 @@ __device__ __forceinline__ float exact_silu(float x) {
     return __fdiv_rn(x, __fadd_rn(1.0f, exact_exp(-x)));
 }
 
+// The host's `soft_clip`, b tanh(x / b), operation by operation: Cephes' odd
+// polynomial below 0.625, 1 - 2 / (e^2y + 1) through `exact_exp` above.
+__device__ __forceinline__ float exact_soft_clip(float x, float b) {
+    const float y = __fdiv_rn(x, b), a = fabsf(y);
+    float t;
+    if (a < 0.625f) {
+        const float z = __fmul_rn(y, y);
+        float p = -5.7049887e-3f;
+        p = __fadd_rn(__fmul_rn(p, z), 2.063909e-2f);
+        p = __fadd_rn(__fmul_rn(p, z), -5.3739716e-2f);
+        p = __fadd_rn(__fmul_rn(p, z), 1.3331442e-1f);
+        p = __fadd_rn(__fmul_rn(p, z), -3.333328e-1f);
+        t = __fadd_rn(__fmul_rn(__fmul_rn(p, z), y), y);
+    } else {
+        t = __fsub_rn(1.0f, __fdiv_rn(2.0f, __fadd_rn(exact_exp(__fmul_rn(2.0f, a)), 1.0f)));
+        if (y < 0.0f) t = -t;
+    }
+    return __fmul_rn(b, t);
+}
+
 struct MoeParams {
     const uint8_t* arena;
     unsigned long long slot_bytes;
     // Per group: its slot, first assignment and number of assignments (at
-    // most MOE_GROUP), consecutive.
+    // most MOE_GROUP, or MOE_WIDE for `moe_wide`), consecutive.
     const uint4* groups;
     // Per assignment, the input row it reads; null when assignment `a`
     // reads row `a`.
@@ -319,88 +336,352 @@ struct MoeParams {
     unsigned second;
     unsigned rows;
     unsigned cols;
+    // Gated products take SITU with these betas in place of SiLU.
+    unsigned situ;
+    float beta;
+    float linear;
+    // Where a slot's per-expert scales of its gate, up and down products
+    // start, or 0 without; the first matrix's is number `scale_index`.
+    unsigned scales;
+    unsigned scale_index;
+    // Most assignments in a group, and rows per block.
+    unsigned most;
+    unsigned tile;
 };
 
-// Each warp computes rows of every assignment in its group, reading each
-// weight once for all of them. With `GATED`, y = silu(gate x) * up x,
-// otherwise y = first x; y holds one row of `rows` values per assignment.
-template <class F, bool GATED>
-__device__ void moe_rows(const MoeParams& p) {
-    extern __shared__ int8_t shared[];
-    const uint4 g = p.groups[blockIdx.y];
-    const unsigned count = g.z, blocks = p.cols / QK_IQ;
-    // Groups past those a batch's routing filled are empty.
-    if (count == 0) return;
-    int8_t* xs = shared;
-    float* ds = reinterpret_cast<float*>(xs + MOE_GROUP * p.cols);
-    const uint8_t* table = p.tables + F::TABLE;
-    for (unsigned t = 0; t < count; ++t) {
-        const unsigned a = g.y + t;
-        const size_t row = p.inputs ? p.inputs[a] : a;
-        for (unsigned i = threadIdx.x; i < p.cols / 4; i += blockDim.x)
-            reinterpret_cast<int*>(xs + t * p.cols)[i] =
-                reinterpret_cast<const int*>(p.xq + row * p.cols)[i];
-        for (unsigned i = threadIdx.x; i < blocks; i += blockDim.x)
-            ds[t * blocks + i] = p.xd[row * blocks + i];
-    }
-    __syncthreads();
+// silu(g) u, or SITU: beta tanh(g / beta) sigmoid(g) times u, itself
+// soft-clipped by `linear` unless that is zero.
+__device__ __forceinline__ float moe_glu(const MoeParams& p, float g, float u) {
+    if (!p.situ) return __fmul_rn(exact_silu(g), u);
+    const float up = p.linear == 0.0f ? u : exact_soft_clip(u, p.linear);
+    const float sig = __fdiv_rn(1.0f, __fadd_rn(1.0f, exact_exp(-g)));
+    return __fmul_rn(__fmul_rn(exact_soft_clip(g, p.beta), sig), up);
+}
 
-    const unsigned lane = threadIdx.x % WARP;
+// A row's value from its sums of the first and (gated) second matrix: each
+// times its expert's scale, when the slot carries them, then combined.
+template <bool GATED>
+__device__ __forceinline__ float moe_output(const MoeParams& p, const uint8_t* slot, float first, float second) {
+    if (p.scales) {
+        const uint8_t* s = slot + p.scales + 4 * p.scale_index;
+        first = __fmul_rn(first, __int_as_float(static_cast<int>(u32_at(s))));
+        if (GATED) second = __fmul_rn(second, __int_as_float(static_cast<int>(u32_at(s + 4))));
+    }
+    return GATED ? moe_glu(p, first, second) : first;
+}
+
+// Each product takes two steps. First each thread takes 32 values of a
+// row of one matrix and turns their exact integer sums with every
+// assignment's input into the terms of their blocks or groups, each times
+// its two scales, in shared memory; then one thread per row and assignment
+// adds a row's terms in order, as the host does. A block computes
+// `p.tile` rows of the expert its group names.
+
+// Stages the inputs of the group's assignments, each with one input scale
+// per `per` values read every `stride` floats of `p.xd`, and returns where
+// the terms go in shared memory.
+__device__ __forceinline__ float* moe_stage(const MoeParams& p, uint4 g, unsigned per, unsigned stride,
+                                            int8_t*& xs, float*& ds) {
+    extern __shared__ int8_t shared[];
+    const unsigned blocks = p.cols / per;
+    xs = shared;
+    ds = reinterpret_cast<float*>(xs + (p.most * p.cols + 15) / 16 * 16);
+    for (unsigned t = 0; t < g.z; ++t) {
+        const size_t row = p.inputs ? p.inputs[g.y + t] : g.y + t;
+        for (unsigned i = threadIdx.x; i < p.cols / 4; i += blockDim.x)
+            reinterpret_cast<int*>(xs + t * p.cols)[i] = reinterpret_cast<const int*>(p.xq + row * p.cols)[i];
+        for (unsigned i = threadIdx.x; i < blocks; i += blockDim.x) ds[t * blocks + i] = p.xd[stride * (row * blocks + i)];
+    }
+    return ds + p.most * blocks;
+}
+
+// The second step: per matrix and row, `terms` holds `units` terms of
+// `kinds` kinds for each assignment, rows `row_floats` apart; a term of the
+// second kind is subtracted.
+template <bool GATED>
+__device__ __forceinline__ void moe_sum_rows(const MoeParams& p, uint4 g, const float* terms, unsigned units,
+                                             unsigned kinds, unsigned row_floats, unsigned row0, unsigned tile) {
     const uint8_t* slot = p.arena + p.slot_bytes * g.x;
-    const size_t row_bytes = static_cast<size_t>(blocks) * F::BYTES;
-    const unsigned warps = gridDim.x * MOE_WARPS;
-    for (unsigned r = blockIdx.x * MOE_WARPS + threadIdx.x / WARP; r < p.rows; r += warps) {
-        float acc[2][MOE_GROUP] = {};
+    for (unsigned i = threadIdx.x; i < tile * g.z; i += blockDim.x) {
+        const unsigned r = i / g.z, t = i % g.z;
+        float acc[2] = {0.0f, 0.0f};
 #pragma unroll
         for (unsigned m = 0; m < (GATED ? 2 : 1); ++m) {
-            const uint8_t* w = slot + (m == 0 ? p.first : p.second) + r * row_bytes;
-            for (unsigned b = 0; b < blocks; ++b) {
-                const uint8_t* blk = w + b * F::BYTES;
-                const Lane8 l = F::lane(blk, lane, table);
-                const float wd = F::scale(blk);
-                const float wmin = F::min_scale(blk);
-#pragma unroll
-                for (unsigned t = 0; t < MOE_GROUP; ++t) {
-                    if (t >= count) break;
-                    const int* x = reinterpret_cast<const int*>(xs + t * p.cols + b * QK_IQ + 8 * lane);
-                    const float xd = ds[t * blocks + b];
-                    const int sum = warp_isum(l.mul * dp4a(l.w[1], x[1], dp4a(l.w[0], x[0], 0)));
-                    acc[m][t] = __fadd_rn(acc[m][t], __fmul_rn(__fmul_rn(wd, xd), static_cast<float>(sum)));
-                    if (F::MINS && wmin != 0.0f) {
-                        const int ones = 0x01010101;
-                        const int offsets = warp_isum(l.min * dp4a(ones, x[1], dp4a(ones, x[0], 0)));
-                        acc[m][t] = __fsub_rn(acc[m][t],
-                                              __fmul_rn(__fmul_rn(wmin, xd), static_cast<float>(offsets)));
-                    }
-                }
+            const float* row = terms + (m * tile + r) * row_floats + t;
+            float a = 0.0f;
+            if (kinds == 2) {
+                for (unsigned u = 0; u < units; ++u)
+                    a = __fsub_rn(__fadd_rn(a, row[2 * u * p.most]), row[(2 * u + 1) * p.most]);
+            } else {
+#pragma unroll 8
+                for (unsigned u = 0; u < units; ++u) a = __fadd_rn(a, row[u * p.most]);
             }
+            acc[m] = a;
         }
-        if (lane == 0) {
-            for (unsigned t = 0; t < count; ++t) {
-                const float v = GATED ? __fmul_rn(exact_silu(acc[0][t]), acc[1][t]) : acc[0][t];
-                p.y[static_cast<size_t>(g.y + t) * p.rows + r] = v;
-            }
-        }
+        p.y[static_cast<size_t>(g.y + t) * p.rows + row0 + r] = moe_output<GATED>(p, slot, acc[0], acc[1]);
     }
 }
 
-#define MOE_KERNELS(name, F)                                                                 \
+// The rows of types read per 256 values: eight threads give one block's
+// sums.
+template <class F, bool GATED>
+__device__ void moe_rows(const MoeParams& p) {
+    const uint4 g = p.groups[blockIdx.y];
+    if (g.z == 0) return;
+    int8_t* xs;
+    float* ds;
+    float* terms = moe_stage(p, g, QK_IQ, 1, xs, ds);
+    const unsigned row0 = blockIdx.x * p.tile, tile = min(p.tile, p.rows - row0);
+    const unsigned blocks = p.cols / QK_IQ, chunks = p.cols / 32;
+    const unsigned row_floats = 2 * blocks * p.most + 1;
+    const uint8_t* slot = p.arena + p.slot_bytes * g.x;
+    const uint8_t* table = p.tables + F::TABLE;
+    const size_t row_bytes = static_cast<size_t>(blocks) * F::BYTES;
+    __syncthreads();
+    // Each warp takes rows, its lanes 32 values each; every lane takes each
+    // step, so that the eight lanes of a block can add up their sums.
+    const unsigned lane_id = threadIdx.x % WARP;
+    for (unsigned mr = threadIdx.x / WARP; mr < (GATED ? 2 : 1) * tile; mr += blockDim.x / WARP) {
+        const unsigned m = mr / tile, r = mr % tile;
+        const uint8_t* w = slot + (m == 0 ? p.first : p.second) + (row0 + r) * row_bytes;
+        float* row = terms + mr * row_floats;
+        for (unsigned c0 = 0; c0 < chunks; c0 += WARP) {
+            const unsigned c = c0 + lane_id, b = c / 8;
+            const bool live = c < chunks;
+            const uint8_t* blk = w + b * F::BYTES;
+            int sum[MOE_GROUP] = {}, offsets[MOE_GROUP] = {};
+            if (live) {
+#pragma unroll
+                for (unsigned k = 0; k < 4; ++k) {
+                    const unsigned lane = 4 * (c % 8) + k;
+                    const Lane8 l = F::lane(blk, lane, table);
+#pragma unroll
+                    for (unsigned t = 0; t < MOE_GROUP; ++t) {
+                        if (t >= g.z) break;
+                        const int* x = reinterpret_cast<const int*>(xs + t * p.cols + b * QK_IQ + 8 * lane);
+                        sum[t] += l.mul * dp4a(l.w[1], x[1], dp4a(l.w[0], x[0], 0));
+                        if (F::MINS) offsets[t] += l.min * dp4a(0x01010101, x[1], dp4a(0x01010101, x[0], 0));
+                    }
+                }
+            }
+#pragma unroll
+            for (unsigned t = 0; t < MOE_GROUP; ++t) {
+                if (t >= g.z) break;
+#pragma unroll
+                for (unsigned o = 1; o < 8; o *= 2) {
+                    sum[t] += __shfl_xor_sync(FULL_MASK, sum[t], o);
+                    if (F::MINS) offsets[t] += __shfl_xor_sync(FULL_MASK, offsets[t], o);
+                }
+            }
+            if (!live || c % 8 != 0) continue;
+            const float wd = F::scale(blk), wmin = F::min_scale(blk);
+            float* out = row + 2 * b * p.most;
+            for (unsigned t = 0; t < g.z; ++t) {
+                const float xd = ds[t * blocks + b];
+                out[t] = __fmul_rn(__fmul_rn(wd, xd), static_cast<float>(sum[t]));
+                out[p.most + t] =
+                    F::MINS && wmin != 0.0f ? __fmul_rn(__fmul_rn(wmin, xd), static_cast<float>(offsets[t])) : 0.0f;
+            }
+        }
+    }
+    __syncthreads();
+    moe_sum_rows<GATED>(p, g, terms, blocks, 2, row_floats, row0, tile);
+}
+
+// The half-value scale of an NVFP4 group from its unsigned E4M3 byte, as
+// kinetic-quant's `ue4m3_half` reads it.
+__device__ __forceinline__ float ue4m3_half(unsigned b) {
+    if (b == 0x7F) return 0.0f;
+    const unsigned m = b & 0x7F;
+    const float v = m < 8 ? __fmul_rn(static_cast<float>(m), 1.0f / 512.0f) : __int_as_float((m + (120u << 3)) << 20);
+    return __fmul_rn(v, 0.5f);
+}
+
+// Four table entries for the nibbles of `q` at `shift`, packed as bytes.
+__device__ __forceinline__ int table4(const uint8_t* q, unsigned shift, const uint8_t* table) {
+    unsigned v = 0;
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) v |= static_cast<unsigned>(table[q[j] >> shift & 0xf]) << (8 * j);
+    return static_cast<int>(v);
+}
+
+// Types whose scales each cover GROUP values, 16 or 32, read with inputs
+// quantized per 32 as GEMV inputs are: an int8 copy and (d, d * sum) per
+// 32. `lane` gives weights v .. v + 8 of a row as signed bytes and returns
+// the scale of their group; a block of BLOCK values takes BYTES bytes.
+struct Iq4Nl {
+    static constexpr unsigned GROUP = 32, BLOCK = 32, BYTES = 18;
+    // The low nibbles of the 16 bytes, then the high ones.
+    static __device__ __forceinline__ float lane(const uint8_t* row, unsigned v, const uint8_t* tables, int w[2]) {
+        const uint8_t* b = row + v / BLOCK * BYTES;
+        const unsigned part = v % BLOCK / 8;
+        const uint8_t* q = b + 2 + 8 * (part % 2);
+        const unsigned shift = part < 2 ? 0 : 4;
+        w[0] = table4(q, shift, tables + IQ4NL_OFFSET);
+        w[1] = table4(q + 4, shift, tables + IQ4NL_OFFSET);
+        return half_at(b);
+    }
+};
+
+// Four scale bytes, then per group of 16 eight bytes of E2M1 codes, low
+// nibbles first.
+struct Nvfp4 {
+    static constexpr unsigned GROUP = 16, BLOCK = 64, BYTES = 36;
+    static __device__ __forceinline__ float lane(const uint8_t* row, unsigned v, const uint8_t* tables, int w[2]) {
+        const uint8_t* b = row + v / BLOCK * BYTES;
+        const unsigned at = v % BLOCK, group = at / GROUP;
+        const uint8_t* q = b + 4 + 8 * group;
+        const unsigned shift = at % GROUP < 8 ? 0 : 4;
+        w[0] = table4(q, shift, tables + MXFP4_OFFSET);
+        w[1] = table4(q + 4, shift, tables + MXFP4_OFFSET);
+        return ue4m3_half(b[group]);
+    }
+};
+
+struct Q8Zero {
+    static constexpr unsigned GROUP = 32, BLOCK = 32, BYTES = 34;
+    static __device__ __forceinline__ float lane(const uint8_t* row, unsigned v, const uint8_t*, int w[2]) {
+        const uint8_t* b = row + v / BLOCK * BYTES;
+        const uint8_t* q = b + 2 + v % BLOCK;
+        w[0] = static_cast<int>(u32_at(q));
+        w[1] = static_cast<int>(u32_at(q + 4));
+        return half_at(b);
+    }
+};
+
+// IQ2_S: per 256 values an f16 d, 32 low index bytes, 32 sign bytes, 8
+// bytes of high index bits and 8 of 4-bit scales; each 8 values are a grid
+// row with signs, each 16 share the scale d (0.5 + s) / 4.
+struct Iq2S {
+    static constexpr unsigned GROUP = 16, BLOCK = 256, BYTES = 82;
+    static __device__ __forceinline__ float lane(const uint8_t* row, unsigned v, const uint8_t* tables, int w[2]) {
+        const uint8_t* b = row + v / BLOCK * BYTES;
+        const unsigned k = v % BLOCK / 8;
+        const unsigned index = b[2 + k] | (b[66 + k / 4] >> (2 * (k % 4)) & 3) << 8;
+        const uint2 g = reinterpret_cast<const uint2*>(tables + IQ2S_OFFSET)[index];
+        const unsigned signs = b[34 + k];
+        w[0] = signed4(g.x, signs);
+        w[1] = signed4(g.y, signs >> 4);
+        const unsigned s = b[74 + k / 4] >> (4 * (k % 4 / 2)) & 0xf;
+        return __fmul_rn(__fmul_rn(half_at(b), 0.5f + static_cast<float>(s)), 0.25f);
+    }
+};
+
+// IQ1_S: per 256 values an f16 d, 32 low index bytes and per 32 values a
+// u16 of high index bits, a 3-bit scale and the sign of a delta of 1/8.
+// Each value is (d (2 s + 1) / 8) (8 g +- 1) for its grid entry g in -1..1.
+struct Iq1S {
+    static constexpr unsigned GROUP = 32, BLOCK = 256, BYTES = 50;
+    static __device__ __forceinline__ float lane(const uint8_t* row, unsigned v, const uint8_t* tables, int w[2]) {
+        const uint8_t* b = row + v / BLOCK * BYTES;
+        const unsigned sub = v % BLOCK / 32, l = v % 32 / 8;
+        const unsigned qh = b[34 + 2 * sub] | b[35 + 2 * sub] << 8;
+        const unsigned index = b[2 + 4 * sub + l] | (qh >> (3 * l) & 7) << 8;
+        const int8_t* g = reinterpret_cast<const int8_t*>(tables + IQ1S_OFFSET) + 8 * index;
+        const int delta = qh & 0x8000 ? -1 : 1;
+#pragma unroll
+        for (unsigned h = 0; h < 2; ++h) {
+            unsigned packed = 0;
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j)
+                packed |= static_cast<unsigned>(static_cast<uint8_t>(8 * g[4 * h + j] + delta)) << (8 * j);
+            w[h] = static_cast<int>(packed);
+        }
+        const float scale = static_cast<float>(2 * (qh >> 12 & 7) + 1);
+        return __fmul_rn(__fmul_rn(half_at(b), scale), 0.125f);
+    }
+};
+
+// Q2_0: per 64 values an f16 d and 2-bit codes c, each value (c - 1) d.
+struct Q2Zero {
+    static constexpr unsigned GROUP = 32, BLOCK = 64, BYTES = 18;
+    static __device__ __forceinline__ float lane(const uint8_t* row, unsigned v, const uint8_t*, int w[2]) {
+        const uint8_t* b = row + v / BLOCK * BYTES;
+        const uint8_t* q = b + 2 + v % BLOCK / 4;
+#pragma unroll
+        for (unsigned h = 0; h < 2; ++h) {
+            unsigned packed = 0;
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j)
+                packed |= static_cast<unsigned>(static_cast<uint8_t>(static_cast<int>(q[h] >> (2 * j) & 3) - 1)) << (8 * j);
+            w[h] = static_cast<int>(packed);
+        }
+        return half_at(b);
+    }
+};
+
+// `moe_rows` for those types: a thread's 32 values are one group or two,
+// each with its own term.
+template <class F, bool GATED>
+__device__ void moe_rows_grouped(const MoeParams& p) {
+    const uint4 g = p.groups[blockIdx.y];
+    if (g.z == 0) return;
+    int8_t* xs;
+    float* ds;
+    float* terms = moe_stage(p, g, 32, 2, xs, ds);
+    constexpr unsigned PER = 32 / F::GROUP;
+    const unsigned row0 = blockIdx.x * p.tile, tile = min(p.tile, p.rows - row0);
+    const unsigned chunks = p.cols / 32, units = PER * chunks;
+    const unsigned row_floats = units * p.most + 1;
+    const uint8_t* slot = p.arena + p.slot_bytes * g.x;
+    const size_t row_bytes = static_cast<size_t>(p.cols / F::BLOCK) * F::BYTES;
+    __syncthreads();
+    // Each warp takes rows, its lanes 32 values each.
+    for (unsigned mr = threadIdx.x / WARP; mr < (GATED ? 2 : 1) * tile; mr += blockDim.x / WARP) {
+        const unsigned m = mr / tile, r = mr % tile;
+        const uint8_t* w = slot + (m == 0 ? p.first : p.second) + (row0 + r) * row_bytes;
+        float* row = terms + mr * row_floats;
+        for (unsigned c = threadIdx.x % WARP; c < chunks; c += WARP) {
+            int sum[PER][MOE_GROUP] = {};
+            float wd[PER];
+#pragma unroll
+            for (unsigned k = 0; k < 4; ++k) {
+                const unsigned v = 32 * c + 8 * k, u = k * PER / 4;
+                int wq[2];
+                wd[u] = F::lane(w, v, p.tables, wq);
+#pragma unroll
+                for (unsigned t = 0; t < MOE_GROUP; ++t) {
+                    if (t >= g.z) break;
+                    const int* x = reinterpret_cast<const int*>(xs + t * p.cols + v);
+                    sum[u][t] += dp4a(wq[1], x[1], dp4a(wq[0], x[0], 0));
+                }
+            }
+            float* out = row + PER * c * p.most;
+            for (unsigned t = 0; t < g.z; ++t) {
+                const float xd = ds[t * chunks + c];
+#pragma unroll
+                for (unsigned u = 0; u < PER; ++u)
+                    out[u * p.most + t] = __fmul_rn(__fmul_rn(wd[u], xd), static_cast<float>(sum[u][t]));
+            }
+        }
+    }
+    __syncthreads();
+    moe_sum_rows<GATED>(p, g, terms, units, 1, row_floats, row0, tile);
+}
+
+#define MOE_KERNELS(name, F, ROWS)                                                           \
     extern "C" __global__ void __launch_bounds__(MOE_THREADS) moe_gate_up_##name(MoeParams p) { \
-        moe_rows<F, true>(p);                                                                \
+        ROWS<F, true>(p);                                                                    \
     }                                                                                        \
     extern "C" __global__ void __launch_bounds__(MOE_THREADS) moe_down_##name(MoeParams p) {    \
-        moe_rows<F, false>(p);                                                               \
+        ROWS<F, false>(p);                                                                   \
     }
 
-MOE_KERNELS(iq2_xxs, Iq2Xxs)
-MOE_KERNELS(iq2_xs, Iq2Xs)
-MOE_KERNELS(iq3_xxs, Iq3Xxs)
-MOE_KERNELS(iq4_xs, Iq4Xs)
-MOE_KERNELS(q2_k, Q2K)
-MOE_KERNELS(q3_k, Q3K)
-MOE_KERNELS(q4_k, Q4K)
-MOE_KERNELS(q5_k, Q5K)
-MOE_KERNELS(q6_k, Q6K)
+MOE_KERNELS(iq2_xxs, Iq2Xxs, moe_rows)
+MOE_KERNELS(iq2_xs, Iq2Xs, moe_rows)
+MOE_KERNELS(iq3_xxs, Iq3Xxs, moe_rows)
+MOE_KERNELS(iq4_xs, Iq4Xs, moe_rows)
+MOE_KERNELS(q2_k, Q2K, moe_rows)
+MOE_KERNELS(q3_k, Q3K, moe_rows)
+MOE_KERNELS(q4_k, Q4K, moe_rows)
+MOE_KERNELS(q5_k, Q5K, moe_rows)
+MOE_KERNELS(q6_k, Q6K, moe_rows)
+MOE_KERNELS(iq4_nl, Iq4Nl, moe_rows_grouped)
+MOE_KERNELS(nvfp4, Nvfp4, moe_rows_grouped)
+MOE_KERNELS(q8_0, Q8Zero, moe_rows_grouped)
+MOE_KERNELS(iq2_s, Iq2S, moe_rows_grouped)
+MOE_KERNELS(iq1_s, Iq1S, moe_rows_grouped)
+MOE_KERNELS(q2_0, Q2Zero, moe_rows_grouped)
 
 // Routing on the device, for layers whose experts all have a slot.
 
@@ -421,6 +702,8 @@ struct RouteParams {
     unsigned sigmoid;
     // Added to each expert's probability to choose, not to weigh, or null.
     const float* bias;
+    // Multiplies the weights once they are shares.
+    float scale;
 };
 
 // Per token, the softmax (or sigmoid) of the logits, then the `k` likeliest experts,
@@ -479,7 +762,7 @@ extern "C" __global__ void moe_route(RouteParams p) {
     }
     if (lane == 0) {
         const float total = fmaxf(picked, 6.1035156e-5f);
-        for (unsigned j = 0; j < p.k; ++j) weights[j] = __fdiv_rn(weights[j], total);
+        for (unsigned j = 0; j < p.k; ++j) weights[j] = __fmul_rn(__fdiv_rn(weights[j], total), p.scale);
     }
 }
 
@@ -488,7 +771,7 @@ struct AssignParams {
     const unsigned* experts;
     // The cache slot of every expert of the layer.
     const unsigned* slots;
-    // Out: groups of up to MOE_GROUP assignments, the rest of `max_groups`
+    // Out: groups of up to `size` assignments, the rest of `max_groups`
     // empty; per assignment its input row; per pick its assignment.
     uint4* groups;
     unsigned* inputs;
@@ -497,10 +780,12 @@ struct AssignParams {
     unsigned k;
     unsigned n_exp;
     unsigned max_groups;
+    // Most assignments per group.
+    unsigned size;
 };
 
 // Gives every pick an assignment, the picks of each expert together in
-// pick order and in groups of up to MOE_GROUP, for `moe_rows`. One block;
+// pick order and in groups of up to `size`, for `moe_rows` or `moe_wide`. One block;
 // shared memory holds the picks and three words per expert.
 extern "C" __global__ void moe_assign(AssignParams p) {
     extern __shared__ unsigned assign_shared[];
@@ -523,7 +808,7 @@ extern "C" __global__ void moe_assign(AssignParams p) {
             first[e] = a;
             group[e] = n;
             a += count[e];
-            n += (count[e] + MOE_GROUP - 1) / MOE_GROUP;
+            n += (count[e] + p.size - 1) / p.size;
         }
         total = n;
     }
@@ -535,8 +820,8 @@ extern "C" __global__ void moe_assign(AssignParams p) {
             const unsigned a = first[e] + j;
             p.inputs[a] = s / p.k;
             p.rows[s] = a;
-            if (j % MOE_GROUP == 0)
-                p.groups[group[e] + j / MOE_GROUP] = make_uint4(p.slots[e], a, min(MOE_GROUP, count[e] - j), 0);
+            if (j % p.size == 0)
+                p.groups[group[e] + j / p.size] = make_uint4(p.slots[e], a, min(p.size, count[e] - j), 0);
             ++j;
         }
     }

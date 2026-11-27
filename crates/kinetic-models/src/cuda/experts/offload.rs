@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use kinetic_cuda::{DeviceBuffer, Event, ExpertArena, ExpertTables, PinnedBuffer, Stream};
@@ -10,8 +11,8 @@ use super::Gpu;
 use crate::blocks::{Job, Moe};
 use crate::LoadError;
 
-/// Experts staged for copies a layer waits for, and for copies ahead of the
-/// next layer.
+/// Experts staged for copies a layer waits for, and for copies into the
+/// cache made while the host waits for the device.
 pub(super) const DEMAND_STAGING: usize = 48;
 pub(super) const PREFETCH_STAGING: usize = 16;
 
@@ -94,7 +95,11 @@ pub(in crate::cuda) struct Offload<'m> {
     pub(super) usage: Vec<u32>,
     /// The experts predicted for the layer about to run.
     pub(super) predicted: Vec<u32>,
-    /// The stream copies ahead of a layer go on, and the event recorded
+    /// Experts to copy into a cache slot reserved for them, by layer, and
+    /// the copies queued since `copied` last passed.
+    pub(super) admissions: VecDeque<(usize, usize, u32)>,
+    pub(super) in_flight: usize,
+    /// The stream copies into the cache go on, and the event recorded
     /// after the latest of them.
     pub(super) copies: Stream,
     pub(super) copied: Event,
@@ -106,23 +111,20 @@ pub(in crate::cuda) struct Offload<'m> {
 }
 
 impl<'m> Offload<'m> {
-    /// Plans the cache for `moes` in at most `budget` device bytes, besides
-    /// `dense_bytes` already taken.
+    /// Plans the cache for `moes`, whose layers run `visits` times a token,
+    /// in at most `budget` device bytes, besides `dense_bytes` already
+    /// taken, the cache itself at most `cache` bytes.
     pub fn new(
         gpu: &Gpu,
         moes: Vec<Moe<'m>>,
+        visits: &[usize],
         budget: usize,
+        cache: Option<usize>,
         dense_bytes: usize,
     ) -> Result<Offload<'m>, LoadError> {
         let err = super::cuda_error;
-        let layouts: Vec<SlotLayout> = moes
-            .iter()
-            .map(|m| SlotLayout {
-                gate: m.gate.expert_bytes(),
-                up: m.up.expert_bytes(),
-                down: m.down.expert_bytes(),
-            })
-            .collect();
+        let layouts: Vec<SlotLayout> = moes.iter().map(super::form::layout).collect();
+
         let n_experts = moes[0].n_experts();
         let region = layouts.iter().map(SlotLayout::bytes).max().unwrap_or(0);
         let staging = Staging {
@@ -131,8 +133,10 @@ impl<'m> Offload<'m> {
             region,
         };
         let transit = DeviceBuffer::<u8>::new(&gpu.ctx, TRANSIT_SLOTS * region).map_err(err)?;
-        let budget = budget.saturating_sub(transit.len());
-        let (pools, pool_of) = plan::share_cache(&layouts, n_experts, budget);
+        let budget = budget
+            .saturating_sub(transit.len())
+            .min(cache.unwrap_or(usize::MAX));
+        let (pools, pool_of) = plan::share_cache(&layouts, n_experts, visits, budget);
         let arenas = pools
             .iter()
             .map(|p| DeviceBuffer::<u8>::new(&gpu.ctx, (p.slots * p.slot_bytes).max(1)))
@@ -161,6 +165,8 @@ impl<'m> Offload<'m> {
             plan,
             stats: Stats::default(),
             predicted: Vec::new(),
+            admissions: VecDeque::new(),
+            in_flight: 0,
             copies: Stream::new(&gpu.ctx).map_err(err)?,
             copied: Event::new(&gpu.ctx).map_err(err)?,
             staged: [
@@ -254,7 +260,7 @@ impl<'m> Offload<'m> {
                 })
                 .collect();
             let start = Instant::now();
-            moe.run_experts(&h[..tokens * d], &jobs);
+            super::run_host(moe, &h[..tokens * d], &jobs);
             start.elapsed().as_secs_f64() / (experts as f64 * bytes)
         };
         // The best of a few rounds, since other programs may be busy.
@@ -274,7 +280,7 @@ impl<'m> Offload<'m> {
             let slot_bytes = self.plan.pools[pool].slot_bytes;
             for e in 0..slots {
                 let at = e * region;
-                let len = stage(
+                let len = super::form::stage(
                     &self.moes[0],
                     e,
                     &mut self.staging.demand.as_mut_slice()[at..],
@@ -303,15 +309,4 @@ impl<'m> Offload<'m> {
             slowdown: 1.0,
         })
     }
-}
-
-/// Copies expert `e`'s gate, up and down matrices from the file to the
-/// start of `dst` and returns their length.
-pub(super) fn stage(moe: &Moe, e: usize, dst: &mut [u8]) -> usize {
-    let mut at = 0;
-    for m in [moe.gate.expert(e), moe.up.expert(e), moe.down.expert(e)] {
-        dst[at..at + m.data.len()].copy_from_slice(m.data);
-        at += m.data.len();
-    }
-    at
 }

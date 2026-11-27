@@ -2,6 +2,7 @@ use kinetic_cuda::{Argmax, Batch, DeviceBuffer, GemvInput, MAX_BATCH};
 
 use super::experts::ExpertWork;
 use super::layer::{CudaLayer, LayerState};
+use super::network::NetBuffers;
 use super::pass::PassRows;
 use super::Gpu;
 use crate::blocks::MixerState;
@@ -71,6 +72,8 @@ pub(super) struct Work {
     /// model.
     pub experts: Option<ExpertWork>,
     pub pass: Option<PassRows>,
+    /// The buffers of a model whose layers run in a network.
+    pub net: Option<NetBuffers>,
     /// The states of the layers that run on the host.
     pub front: Vec<MixerState>,
     /// The batch, scratch and layer states of each shard, on its device.
@@ -194,6 +197,7 @@ impl Work {
             layers: states,
             experts: None,
             pass: None,
+            net: None,
             front: Vec::new(),
             shards: Vec::new(),
         })
@@ -227,7 +231,8 @@ impl Work {
             .sum();
         let layers: usize = self.layers.iter().map(LayerState::size_bytes).sum();
         let experts = self.experts.as_ref().map_or(0, ExpertWork::size_bytes)
-            + self.pass.as_ref().map_or(0, PassRows::size_bytes);
+            + self.pass.as_ref().map_or(0, PassRows::size_bytes)
+            + self.net.as_ref().map_or(0, NetBuffers::size_bytes);
         4 * (buffers + proj) + inputs + layers + experts
     }
 }

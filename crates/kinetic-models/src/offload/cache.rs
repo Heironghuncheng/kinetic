@@ -3,15 +3,17 @@
 
 /// Where one layer's expert matrices sit inside a slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SlotLayout {
+pub(crate) struct SlotLayout {
     pub gate: usize,
     pub up: usize,
     pub down: usize,
+    /// The expert's scales of its three products, if it has them.
+    pub scales: usize,
 }
 
 impl SlotLayout {
     pub fn bytes(&self) -> usize {
-        self.gate + self.up + self.down
+        self.gate + self.up + self.down + self.scales
     }
 }
 
@@ -27,7 +29,7 @@ struct Pool {
     protected: Vec<bool>,
 }
 
-pub(super) struct ExpertCache {
+pub(crate) struct ExpertCache {
     pools: Vec<Pool>,
     /// The pool of each layer.
     pool_of: Vec<usize>,
@@ -90,6 +92,11 @@ impl ExpertCache {
     /// Marks every pending copy as done.
     pub fn settle(&mut self) {
         self.pools.iter_mut().for_each(|p| p.pending.fill(false));
+    }
+
+    /// Marks `slot` of `layer`'s pool as awaiting a copy again.
+    pub fn set_pending(&mut self, layer: usize, slot: u32) {
+        self.pool_mut(layer).pending[slot as usize] = true;
     }
 
     /// Keeps `slot` of `layer`'s pool until [`ExpertCache::release`].

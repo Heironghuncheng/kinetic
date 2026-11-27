@@ -19,6 +19,7 @@
 
 mod attention;
 mod delta_net;
+mod expand;
 mod experts;
 mod ffn;
 mod fold;
@@ -28,8 +29,12 @@ mod lanes;
 mod layer;
 mod mamba2;
 mod mtp;
+mod network;
 mod pass;
 mod per_layer;
+#[cfg(test)]
+mod pieces;
+mod relative;
 mod scratch;
 mod short_conv;
 mod split;
@@ -50,10 +55,12 @@ use crate::blocks::{Folding, Moe};
 use crate::convoy::Convoy;
 use crate::model::Mark;
 use crate::{Forward, LoadError, Model};
+use expand::{Expanded, Use};
 use experts::{CudaExperts, ExpertWork, Offload};
 use fold::CudaFolding;
 use kinetic_cuda::Flow;
 use layer::{copy_lent, CudaLayer, LayerState, Routed};
+use network::CudaNetwork;
 use pass::{PassRows, PASS_ROWS};
 use per_layer::{CudaLayerInput, CudaPerLayer};
 use scratch::{Scratch, Spare, Work};
@@ -64,6 +71,9 @@ pub use host::CudaRunner;
 pub use lanes::{Ran, Run};
 pub use mtp::CudaMtpState;
 pub use split::Placement;
+
+/// Least growth of the expert cache worth placing it again for.
+const GROW_STEP: usize = 64 << 20;
 
 /// Most tokens one prefill pass runs on GPUs with tensor cores; a state
 /// keeps buffers for this many.
@@ -106,6 +116,10 @@ struct Gpu {
     copied: Event,
     /// How attention caches store keys and values.
     cache: [KvType; 2],
+    /// The weights uploaded expanded, for the line said after loading.
+    expanded: Expanded,
+    /// Device bytes the planner leaves free.
+    reserve: usize,
 }
 
 /// Layers that run on a further device, after those of the device before.
@@ -133,6 +147,8 @@ impl Gpu {
             handoff: Event::new(&ctx)?,
             copied: Event::new(&ctx)?,
             cache: [KvType::F16; 2],
+            expanded: Expanded::default(),
+            reserve: 0,
             ctx,
         })
     }
@@ -150,8 +166,16 @@ impl Gpu {
         self.stream.wait(&self.join)
     }
 
+    /// Uploads `m`, expanded on the host when no GEMV kernel reads its type.
     fn matrix(&self, m: &kinetic_quant::Matrix) -> kinetic_cuda::Result<DeviceMatrix> {
-        DeviceMatrix::upload(&self.ctx, m)
+        if expand::device_type(m.ty, Use::Matrix) == m.ty || !expand::expandable(m.ty) {
+            return DeviceMatrix::upload(&self.ctx, m);
+        }
+        let bytes = expand::matrix(m);
+        self.expanded
+            .add(m.ty, bytes.len() as isize - m.data.len() as isize);
+        let wide = kinetic_quant::Matrix::new(expand::EXPANDED, &bytes, m.rows, m.cols);
+        DeviceMatrix::upload(&self.ctx, &wide)
     }
 
     fn vector(&self, v: &[f32]) -> kinetic_cuda::Result<DeviceBuffer<f32>> {
@@ -187,6 +211,8 @@ pub struct CudaModel<'m> {
     folded: bool,
     output_norm: DeviceBuffer<f32>,
     layers: Vec<CudaLayer>,
+    /// Runs `layers` in a model whose layers do not run one after another.
+    network: Option<CudaNetwork>,
     /// The layers after `layers`, on further devices in turn.
     shards: Vec<Shard>,
     per_layer: Option<CudaPerLayer>,
@@ -313,6 +339,10 @@ impl<'m> CudaModel<'m> {
             let ctx = Context::new(Device::get(d).map_err(cuda_error)?).map_err(cuda_error)?;
             let mut gpu = Gpu::new(ctx).map_err(cuda_error)?;
             gpu.cache = [placement.cache_k, placement.cache_v];
+            let (_, total) = gpu.ctx.memory_info().map_err(cuda_error)?;
+            gpu.reserve = placement
+                .device_reserve
+                .unwrap_or_else(|| experts::device_reserve(total));
             Ok(gpu)
         };
         let gpu = device(placement.devices.first().copied().unwrap_or(0))?;
@@ -371,9 +401,17 @@ impl<'m> CudaModel<'m> {
             .map(|(g, _)| batch_rows(&g.kernels, context, prefill))
             .fold(batch_rows(&gpu.kernels, context, prefill), usize::min);
         let mut shard_layers = Vec::new();
+        let mut network = None;
         let (embd, front, layers) = match moes {
             Some(_) => {
-                let layers = upload_experts_layers(&gpu, model)?;
+                let layers = match &model.network {
+                    Some(net) => {
+                        let (layers, net) = network::upload(&gpu, model, net)?;
+                        network = Some(net);
+                        layers
+                    }
+                    None => upload_experts_layers(&gpu, model)?,
+                };
                 // A tied head or a prediction block reads the table.
                 let device = tied
                     || model
@@ -446,6 +484,7 @@ impl<'m> CudaModel<'m> {
             embd_folding: fold(&model.embd_folding)?,
             folded: model.folded,
             layers,
+            network,
             shards,
             per_layer,
             rows,
@@ -463,7 +502,11 @@ impl<'m> CudaModel<'m> {
             staging: RefCell::new(None),
         };
         if let Some(moes) = moes {
-            cuda.offload = Some(RefCell::new(cuda.plan_offload(moes)?));
+            cuda.offload = Some(RefCell::new(cuda.plan_offload(
+                moes,
+                &expert_visits(model),
+                placement.expert_cache,
+            )?));
             if cuda.routes_on_host() {
                 model.page_in_experts();
             }
@@ -478,20 +521,73 @@ impl<'m> CudaModel<'m> {
                 mtp.spare = Some(RefCell::new(Spare::new(spare)));
             }
         }
+        if let Some(line) = cuda.gpu.expanded.report() {
+            eprintln!("{line}");
+        }
         Ok(cuda)
     }
 
     /// Gives the routed experts the device memory left after the weights,
     /// one state and a reserve.
-    fn plan_offload(&self, moes: Vec<Moe<'m>>) -> Result<Offload<'m>, LoadError> {
+    fn plan_offload(
+        &self,
+        moes: Vec<Moe<'m>>,
+        visits: &[usize],
+        cache: Option<usize>,
+    ) -> Result<Offload<'m>, LoadError> {
+        let (before, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
         let mut state = self.new_dense_state().map_err(cuda_error)?;
         state.work.experts = Some(self.expert_work(&moes).map_err(cuda_error)?);
         state.work.pass = Some(PassRows::new(&self.gpu, self.n_embd).map_err(cuda_error)?);
-        let state_bytes = state.work.size_bytes();
+        // many small buffers take more than their bytes
+        let (after, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
+        let state_bytes = state.work.size_bytes().max(before.saturating_sub(after));
         drop(state);
         let (free, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
-        let budget = free.saturating_sub(state_bytes + experts::DEVICE_RESERVE);
-        Offload::new(&self.gpu, moes, budget, self.weight_bytes() + state_bytes)
+        let mut budget = free.saturating_sub(state_bytes + self.gpu.reserve);
+        let need = state_bytes + self.gpu.reserve;
+        // Largest budget seen to leave the room needed, smallest seen not to.
+        let (mut fit, mut over) = (0, usize::MAX);
+        loop {
+            let off = Offload::new(
+                &self.gpu,
+                moes.clone(),
+                visits,
+                budget,
+                cache,
+                self.weight_bytes() + state_bytes,
+            )?;
+            // the desktop may have taken memory meanwhile: check what is left
+            let (left, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
+            // Large allocations can take more than they hold, so what is
+            // left need not move with the budget: the next one is between
+            // the two seen, and never past what was left.
+            let next = if left >= need {
+                fit = budget;
+                (budget + (left - need)).min(budget + (over - budget) / 2)
+            } else {
+                over = budget;
+                budget
+                    .saturating_sub(need - left)
+                    .max(fit + (budget - fit) / 2)
+            };
+            if (left >= need && next < budget + GROW_STEP) || budget == 0 {
+                eprintln!(
+                    "kinetic: the model takes {} MiB of the GPU with one sequence; {} MiB stay free",
+                    (self.weight_bytes() + state_bytes + free.saturating_sub(left)) >> 20,
+                    left.saturating_sub(state_bytes) >> 20
+                );
+                return Ok(off);
+            }
+            drop(off);
+            if left < need && fit == 0 {
+                eprintln!(
+                    "kinetic: the GPU has {} MiB less free than planned; the expert cache shrinks to fit",
+                    (need - left) >> 20
+                );
+            }
+            budget = next;
+        }
     }
 
     fn expert_work(&self, moes: &[Moe]) -> kinetic_cuda::Result<ExpertWork> {
@@ -504,6 +600,7 @@ impl<'m> CudaModel<'m> {
                 .layers
                 .iter()
                 .filter_map(|l| l.experts.as_ref())
+                .chain(self.network.iter().flat_map(CudaNetwork::experts))
                 .map(CudaExperts::score_rows)
                 .max()
                 .unwrap_or(0),
@@ -560,7 +657,8 @@ impl<'m> CudaModel<'m> {
             Embeddings::Host => 0,
         };
         let per_layer = self.per_layer.as_ref().map_or(0, CudaPerLayer::size_bytes);
-        embd + output + layers + mtp + per_layer
+        let network = self.network.as_ref().map_or(0, CudaNetwork::size_bytes);
+        embd + output + layers + mtp + per_layer + network
     }
 
     /// Free and total device memory in bytes.
@@ -574,6 +672,14 @@ impl<'m> CudaModel<'m> {
         if let Some(off) = &self.offload {
             state.work.experts = Some(self.expert_work(&off.borrow().moes)?);
             state.work.pass = Some(PassRows::new(&self.gpu, self.n_embd)?);
+        }
+        // a state past the reserve would spill out of the GPU's own memory
+        let (free, _) = self.gpu.ctx.memory_info()?;
+        if free < self.gpu.reserve / 2 {
+            return Err(shape(format!(
+                "no room on the GPU for another sequence: {} MiB left",
+                free >> 20
+            )));
         }
         Ok(state)
     }
@@ -604,6 +710,9 @@ impl<'m> CudaModel<'m> {
             0,
             self.folded,
         )?;
+        if let Some(net) = &self.network {
+            work.net = Some(net.buffers(&self.gpu, &self.layers, rows)?);
+        }
         for shard in &self.shards {
             let layers: Vec<&CudaLayer> = shard.layers.iter().collect();
             // no head there; the batch comes over whole, grid and all
@@ -818,7 +927,8 @@ impl<'m> CudaModel<'m> {
             hidden: vec![0.0; tokens.len() * d],
             logits: Vec::new(),
         };
-        if self.routes_on_host() && since.is_none() && !all_rows && tokens.len() > MAX_BATCH {
+        let passes = self.routes_on_host() && self.network.is_none();
+        if passes && since.is_none() && !all_rows && tokens.len() > MAX_BATCH {
             self.forward_passes(state, tokens, logits, &mut out)?;
             return Ok(out);
         }
@@ -1102,6 +1212,20 @@ impl<'m> CudaModel<'m> {
 
     /// Queues the main device's layers over the batch in `work`.
     fn queue_main(&self, work: &mut Work, flow: Flow) -> kinetic_cuda::Result<()> {
+        if let Some(net) = &self.network {
+            let offload = self.offload.as_ref().expect("a network has experts");
+            let output_norm = &self.output_norm;
+            // the network takes no part in a flow: a draft's pass records too
+            let record = work.batch.len() <= MAX_BATCH && !self.eager;
+            return net.queue(
+                &self.gpu,
+                &self.layers,
+                work,
+                &mut offload.borrow_mut(),
+                output_norm,
+                record,
+            );
+        }
         let n = work.batch.len();
         let s = &mut work.scratch;
         if let Some(p) = &self.per_layer {
@@ -1372,7 +1496,27 @@ fn slices(rows: Range<usize>) -> impl Iterator<Item = Range<usize>> {
 
 /// The routed experts of the layers that have them, in order; the dense
 /// layers come before them (LFM2 MoE).
+/// How many times a token runs each layer [`routed_experts`] gives: once,
+/// or in a network, once for every step that runs it.
+fn expert_visits(model: &Model) -> Vec<usize> {
+    let Some(net) = &model.network else {
+        return vec![1; model.layers.iter().filter(|l| l.experts.is_some()).count()];
+    };
+    let mut visits = vec![0; net.wiring.len()];
+    for step in net.steps() {
+        if let crate::arch::inkling2_steps::Step::Layer { layer, .. } = step {
+            visits[layer] += 1;
+        }
+    }
+    visits
+}
+
 fn routed_experts<'m>(model: &Model<'m>) -> Result<Option<Vec<Moe<'m>>>, LoadError> {
+    // later passes of a loop route to the experts of their physical layer
+    if let Some(net) = &model.network {
+        let physical = &model.layers[..net.wiring.len()];
+        return Ok(physical.iter().map(|l| l.experts.clone()).collect());
+    }
     let moes: Vec<Moe<'m>> = model
         .layers
         .iter()
