@@ -497,9 +497,10 @@ kinetic run -hf ggml-org/gemma-3-1b-it-GGUF:Q4_K_M "Hello"
 kinetic serve -hf org/repo -hff model-Q8_0.gguf
 ```
 
-Kinetic never connects to the network, except when you run `kinetic pull` or
-pass `-hf`; without it, `run`, `chat`, `serve` and the others never download
-anything.
+Kinetic downloads only when you run `kinetic pull` or `kinetic update` or
+pass `-hf`; without them, `run`, `chat`, `serve` and the others never
+download anything. The one other connection is the daily check for a new
+release, described under [update](#update).
 
 When a command fails, the error ends with a line saying what to do: a path
 to check, a smaller model or `-c`, a driver to install, a free `--port`, or a
