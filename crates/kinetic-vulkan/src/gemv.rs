@@ -20,6 +20,10 @@ const ROWS_PER_GROUP: usize = 4;
 /// subgroups of 32, each taking a tile of four rows.
 #[cfg(metal_driver)]
 const ROWS_PER_GROUP: usize = 16;
+/// Rows per workgroup of the GEMV kernels of the other types, which take a
+/// row per subgroup on Metal too.
+#[cfg(metal_driver)]
+const ONE_ROW_PER_GROUP: usize = 4;
 /// Rows per workgroup of the kernels for many tokens in `shaders/metal`:
 /// four subgroups of two rows.
 #[cfg(metal_driver)]
@@ -589,6 +593,18 @@ impl Kernels {
             TensorType::IQ2S => &self.gemv_iq2_s,
             _ => unreachable!("block_len admits only types with kernels"),
         };
+        #[cfg(metal_driver)]
+        if !matches!(
+            ty,
+            TensorType::F32
+                | TensorType::F16
+                | TensorType::Q8_0
+                | TensorType::Q4K
+                | TensorType::Q5K
+                | TensorType::Q6K
+        ) {
+            return (kernel, ONE_ROW_PER_GROUP);
+        }
         (kernel, ROWS_PER_GROUP)
     }
 }

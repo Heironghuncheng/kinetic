@@ -83,10 +83,22 @@ const MATRIX_KERNELS: &[(&str, &str, &[&str])] = &[
     ("mm_q6_k", "", &["mm", "mm_q6_k"]),
 ];
 
-/// Kernels that take one part more on Metal, whose GEMV kernels are
-/// written differently: there an invocation takes a tile of four rows and
-/// the block sums are floats, which is faster on a Mac's GPU and slower on
-/// the others. A part with a file in `shaders/metal` is read from there.
+/// The GEMV kernels written differently for Metal: there an invocation
+/// takes a tile of four rows and the block sums are floats, which is faster
+/// on a Mac's GPU and slower on the others. A part with a file in
+/// `shaders/metal` is read from there. The other GEMV kernels, as the
+/// expert kernels, take one row per subgroup on every driver.
+#[cfg(feature = "metal")]
+const METAL_GEMV: &[&str] = &[
+    "gemv_f32",
+    "gemv_f16",
+    "gemv_q8_0",
+    "gemv_q4_k",
+    "gemv_q5_k",
+    "gemv_q6_k",
+];
+
+/// Metal GEMV kernels that take one part more.
 #[cfg(feature = "metal")]
 const METAL_PARTS: &[(&str, &str)] = &[
     ("gemv_f32", "gemv_dots"),
@@ -145,8 +157,9 @@ fn main() {
         if metal {
             let mut parts = parts.to_vec();
             parts.extend(METAL_PARTS.iter().filter(|p| p.0 == name).map(|p| p.1));
-            // The expert kernels take one row per subgroup on every driver.
-            let dirs: &[&str] = match name.starts_with("experts") {
+            let one_row = name.starts_with("experts")
+                || (name.starts_with("gemv") && !METAL_GEMV.contains(&name));
+            let dirs: &[&str] = match one_row {
                 true => &["shaders"],
                 false => &["shaders/metal", "shaders"],
             };
