@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::Settings;
 use crate::Result;
 
 const REPO: &str = "Veloresearch/kinetic";
@@ -234,15 +235,23 @@ fn write_check(when: u64, version: &str) {
     }
 }
 
-/// Whether the daily check is off, by `KINETIC_NO_UPDATE_CHECK`.
-fn off() -> bool {
-    std::env::var_os("KINETIC_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty() && v != "0")
+/// Whether an environment variable is set to something other than 0.
+fn set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether the daily check may run: only when Settings or
+/// `KINETIC_UPDATE_CHECK` turn it on, and never with `forced_off`.
+fn wanted(settings: &Settings, env_on: bool, forced_off: bool) -> bool {
+    !forced_off && (env_on || settings.checks_updates())
 }
 
 /// The newer release the last check saw, if any; asks GitHub again, once,
-/// in the background, when that check is a day old. Nothing when off.
-pub fn available() -> Option<String> {
-    if off() {
+/// in the background, when that check is a day old. When the check is not
+/// turned on, nothing: no file is read and nothing is asked.
+pub fn available(settings: &Settings, forced_off: bool) -> Option<String> {
+    let forced_off = forced_off || set("KINETIC_NO_UPDATE_CHECK");
+    if !wanted(settings, set("KINETIC_UPDATE_CHECK"), forced_off) {
         return None;
     }
     let seen = last_check();
@@ -265,14 +274,14 @@ pub fn available() -> Option<String> {
 
 /// One line on stderr when a newer release is out, for a person at a
 /// terminal only.
-pub fn notice(args: &[String]) {
+pub fn notice(args: &[String], settings: &Settings, forced_off: bool) {
     let terminal = std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
         && std::io::stderr().is_terminal();
     let json = args.iter().any(|a| a == "--json");
     let updating = args.get(1).is_some_and(|a| a == "update");
     if terminal && !json && !updating {
-        if let Some(version) = available() {
+        if let Some(version) = available(settings, forced_off) {
             eprintln!("Kinetic {version} is out: run kinetic update");
         }
     }
@@ -289,6 +298,19 @@ mod tests {
         assert!(!newer("0.1.0", "0.1"));
         assert!(!newer("0.1", "0.1.1"));
         assert!(!newer("nightly", "0.1"));
+    }
+
+    #[test]
+    fn the_check_runs_only_when_turned_on_and_not_forced_off() {
+        let mut on = Settings::default();
+        on.set(crate::config::UPDATE_CHECK, "on");
+        let off = Settings::default();
+        assert!(!wanted(&off, false, false));
+        assert!(wanted(&on, false, false));
+        assert!(wanted(&off, true, false));
+        assert!(!wanted(&on, true, true));
+        assert!(!wanted(&on, false, true));
+        assert_eq!(available(&off, true), None);
     }
 
     #[test]
