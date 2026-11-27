@@ -44,8 +44,9 @@ far the next one is, and it moves with the commits that move it.
 
 Inkling 2 Mini on NVIDIA GPUs through CUDA and on AMD GPUs through Vulkan, also on cards
 with 6 GB; macOS on Apple Silicon, on the CPU and on the GPU through Metal; older NVIDIA GPUs
-(Pascal, Volta), several GPUs for one model with `--gpus`, and AMD's GCN and Vega GPUs; a
-home screen when you run `kinetic` alone, and `kinetic update`. Everything else is in the
+(Pascal, Volta), several GPUs for one model with `--gpus`, and AMD's GCN and Vega GPUs;
+drafting that no longer slows down models split between the GPU and the CPU; a home screen
+when you run `kinetic` alone, and `kinetic update`. Everything else is in the
 [changelog](CHANGELOG.md).
 
 Still known:
@@ -738,10 +739,9 @@ Method and [`scripts/bench_vs_llamacpp.py`](scripts/bench_vs_llamacpp.py):
 
 ## Privacy
 
-**Kinetic connects to the network only to download what you ask for and, once a day, to
-see whether a newer release is out.** No telemetry, no accounts. The check sends nothing
-about you or your computer, never downloads anything by itself, and `--no-update-check` or
-`KINETIC_NO_UPDATE_CHECK=1` turn it off.
+**Kinetic never connects to the network, except when you run `kinetic pull` or
+`kinetic update` or download with `-hf`.** No telemetry, no accounts, and no update checks
+unless you turn on the daily check in Settings.
 
 - The server listens on `127.0.0.1` unless you pass `--host`, and warns when
   you do; `--api-key` requires a key on every route but `/health`.

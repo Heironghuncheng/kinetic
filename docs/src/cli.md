@@ -28,7 +28,7 @@ keys, Enter opens, Esc goes back one screen (on the home screen it asks
 before quitting), and `q` quits. The line at the bottom of every screen
 lists its keys.
 
-<!-- screenshot: the home screen only (replace this line with the image); never another screen, as they show the computer's processor and GPU -->
+![The kinetic home screen: tiles for Chat, Models, API, Benchmark, Doctor and Settings, and an Every command button](images/home.png)
 
 | Tile | Opens |
 |---|---|
@@ -500,7 +500,7 @@ kinetic serve -hf org/repo -hff model-Q8_0.gguf
 Kinetic downloads only when you run `kinetic pull` or `kinetic update` or
 pass `-hf`; without them, `run`, `chat`, `serve` and the others never
 download anything. The one other connection is the daily check for a new
-release, described under [update](#update).
+release, and only if you turn it on; see [update](#update).
 
 When a command fails, the error ends with a line saying what to do: a path
 to check, a smaller model or `-c`, a driver to install, a free `--port`, or a
@@ -521,8 +521,10 @@ removes. `--nightly` follows the nightly build of main instead.
 `KINETIC_RELEASES` points both at a mirror that serves `latest`,
 `tags/<tag>` and `download/<tag>/<file>`.
 
-Once a day at most, a command run at a terminal asks GitHub for the newest
-release, in the background, sending nothing about you or this computer.
+The daily check for a new release is off by default; turn it on in
+Settings. Then, once a day at most, a command run at a terminal asks GitHub
+for the newest release, in the background, sending nothing about you or
+this computer.
 When it is newer, the next interactive command prints one line on stderr,
 `Kinetic 0.1.2 is out: run kinetic update`, and the home screen shows it in
 its corner, where `u` runs the update. Nothing is downloaded or replaced

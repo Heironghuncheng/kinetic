@@ -148,9 +148,11 @@ home screen in the terminal.
   measures on the model as it is placed. It times its steps by the rows
   each pass runs and measures how far drafts come true; a draft is verified
   only up to the length that gives the most tokens per second expected, and
-  not at all when a plain step gives as many. On a model split between the
-  GPU and the CPU, by layers or by experts, where wide passes cost more, it
-  drafts less. The output does not change.
+  not at all when a plain step gives as many. Every draft is judged against
+  the output at no cost, depth by depth, and verified only once its measured
+  chances pay, so drafts that don't pay cost no verify pass. Drafting no
+  longer slows down a model split between the GPU and the CPU, by layers or
+  by experts. The output does not change.
 - RAD-1 on CUDA: when Inkling 2 runs with all its layers on one GPU, a draft
   of up to 127 tokens is verified in one pass, its experts run once for the
   whole pass, and drafts grow to fill it while they keep coming true. Every
@@ -190,9 +192,8 @@ home screen in the terminal.
   for the next answers, and `/` lists the commands.
 - `kinetic update` installs the newest release for this computer and build,
   checked against its `SHA256SUMS`; `--nightly` follows the nightly build.
-  Once a day at most, a command run at a terminal asks GitHub for the newest
-  release in the background and says in one line when there is one.
-  `--no-update-check` or `KINETIC_NO_UPDATE_CHECK=1` turn the check off.
+  A daily check for a new release, which says in one line when there is
+  one, is off by default; Settings turns it on.
 - `-hf` and `-hff` download a model from Hugging Face as `kinetic pull`
   does, then run it, as llama.cpp's flags do
   ([#38](https://github.com/Veloresearch/kinetic/pull/38)).
