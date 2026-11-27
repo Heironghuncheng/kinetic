@@ -233,6 +233,9 @@ pub struct CudaModel<'m> {
     /// Full prefill buffers shared by every state, unless states keep their
     /// own.
     spare: Option<RefCell<Spare>>,
+    /// The state the expert cache was placed around, which the first
+    /// [`CudaModel::new_state`] hands out.
+    planned: RefCell<Option<CudaState>>,
     /// The last shared one-token pass recorded, and the states it runs.
     shared_step: RefCell<Option<(Vec<u64>, Graph)>>,
     /// See [`Placement::eager`].
@@ -498,6 +501,7 @@ impl<'m> CudaModel<'m> {
             front,
             convoy: Convoy::for_device(),
             spare: None,
+            planned: RefCell::new(None),
             shared_step: RefCell::new(None),
             eager: placement.eager,
             unrecorded: Cell::new(false),
@@ -530,7 +534,8 @@ impl<'m> CudaModel<'m> {
     }
 
     /// Gives the routed experts the device memory left after the weights,
-    /// one state and a reserve.
+    /// one state and a reserve. The state is made first and kept for the
+    /// first sequence, so the cache is placed around what it really takes.
     fn plan_offload(
         &self,
         moes: Vec<Moe<'m>>,
@@ -541,12 +546,11 @@ impl<'m> CudaModel<'m> {
         let mut state = self.new_dense_state().map_err(cuda_error)?;
         state.work.experts = Some(self.expert_work(&moes).map_err(cuda_error)?);
         state.work.pass = Some(PassRows::new(&self.gpu, self.n_embd).map_err(cuda_error)?);
-        // many small buffers take more than their bytes
-        let (after, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
-        let state_bytes = state.work.size_bytes().max(before.saturating_sub(after));
-        drop(state);
+        self.gpu.stream.synchronize().map_err(cuda_error)?;
         let (free, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
-        let need = state_bytes + self.gpu.reserve;
+        // many small buffers take more than their bytes
+        let state_bytes = state.work.size_bytes().max(before.saturating_sub(free));
+        let need = self.gpu.reserve;
         let mut budget = free.saturating_sub(need);
         let mut search = BudgetSearch::new(need);
         let mut placed = 0;
@@ -577,8 +581,9 @@ impl<'m> CudaModel<'m> {
                     eprintln!(
                         "kinetic: the model takes {} MiB of the GPU with one sequence; {} MiB stay free",
                         (self.weight_bytes() + state_bytes + free.saturating_sub(left)) >> 20,
-                        left.saturating_sub(state_bytes) >> 20
+                        left >> 20
                     );
+                    *self.planned.borrow_mut() = Some(state);
                     return Ok(off);
                 }
             }
@@ -663,6 +668,9 @@ impl<'m> CudaModel<'m> {
 
     /// An empty state for a new sequence.
     pub fn new_state(&self) -> kinetic_cuda::Result<CudaState> {
+        if let Some(state) = self.planned.borrow_mut().take() {
+            return Ok(state);
+        }
         let mut state = self.new_dense_state()?;
         if let Some(off) = &self.offload {
             state.work.experts = Some(self.expert_work(&off.borrow().moes)?);

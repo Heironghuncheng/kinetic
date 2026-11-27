@@ -407,6 +407,31 @@ fn inkling_on_cuda_matches_the_cpu_and_changes_no_bit() {
     }
 }
 
+/// The first sequence is the state the expert cache was placed around: it
+/// takes no more device memory, and the next one is a new state.
+#[test]
+#[ignore = "needs a CUDA device"]
+fn the_first_sequence_is_the_one_the_cache_was_placed_around() {
+    let file = tiny_model(Tiny {
+        dense: TensorType::Q8_0,
+        experts: TensorType::IQ4NL,
+        used: 2,
+        unrolled: false,
+        wide: false,
+    });
+    let model = kinetic_models::load(&file).unwrap();
+    let gpu = CudaModel::load(&model, 128).unwrap();
+    let (before, _) = gpu.memory_info().unwrap();
+    let first = gpu.new_state().unwrap();
+    let (after, _) = gpu.memory_info().unwrap();
+    let second = gpu.new_state().unwrap();
+    let (last, _) = gpu.memory_info().unwrap();
+    // other programs may take or give back a little meanwhile
+    let (one, two) = (before.saturating_sub(after), after.saturating_sub(last));
+    assert!(4 * one < two, "first took {one} bytes, second {two}");
+    drop((first, second));
+}
+
 /// A verify pass of the widest draft keeps the bits of decoding, with every
 /// expert on the device and with most of them on the host.
 #[test]
