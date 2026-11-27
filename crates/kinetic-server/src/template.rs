@@ -133,6 +133,16 @@ mod tests {
     }
 
     #[test]
+    fn mappings_keep_the_order_they_came_in() {
+        let t = ChatTemplate::new("{% for k, v in args.items() %}{{ k }} {% endfor %}").unwrap();
+        let args = json!({"file_path": "a.py", "old_string": "x", "new_string": "y"});
+        assert_eq!(
+            t.render(json!({ "args": args })).unwrap(),
+            "file_path old_string new_string "
+        );
+    }
+
+    #[test]
     fn templates_cannot_include_files() {
         let t = ChatTemplate::new("{% include 'Cargo.toml' %}").unwrap();
         assert!(t.render(json!({})).is_err());

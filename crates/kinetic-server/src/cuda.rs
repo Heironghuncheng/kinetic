@@ -216,17 +216,21 @@ impl<'a> CudaBackend<'a> {
         &self.device
     }
 
-    /// The cached sequence when `prompt` extends it, else a new one, run up
-    /// to the end of `prompt` with the token after it chosen; the number of
-    /// tokens reused; and the state to keep warm, if any.
+    /// The cached sequence when `prompt` extends it, else that one cut back
+    /// to where they part or a new one, run up to the end of `prompt` with
+    /// the token after it chosen; the number of tokens reused; and the state
+    /// to keep warm, if any.
     fn prefill(
         &mut self,
         prompt: &[u32],
         policy: &mut impl Policy<CudaModel<'a>>,
     ) -> (Sequence<CudaState>, usize, Option<Keep>) {
         self.settle_for(prompt);
-        self.unsettled = None;
+        if let Some(from) = self.unsettled.take() {
+            self.cut(prompt, from);
+        }
         self.rewind(prompt);
+        self.cut(prompt, usize::MAX);
         // The batches a cold prefill runs before its last one.
         let batch = self.gpu.prefill_batch();
         let head = &prompt[..(prompt.len() - 1) / batch * batch];
@@ -357,8 +361,9 @@ impl<'a> CudaBackend<'a> {
     /// Settles the reply that ends the cached sequence, if it is not yet,
     /// when `prompt` continues the sequence: the reply runs again only
     /// before a request that goes on from it, not before the response ends.
-    /// A sequence that `prompt` leaves is cleared, since its reply could not
-    /// be continued exactly; one `prompt` stops short in waits for the next.
+    /// A sequence that `prompt` leaves is cut back to before its reply,
+    /// which could not be continued exactly; one `prompt` stops short in
+    /// waits for the next.
     fn settle_for(&mut self, prompt: &[u32]) {
         let Some(from) = self.unsettled else {
             return;
@@ -369,15 +374,40 @@ impl<'a> CudaBackend<'a> {
             return;
         }
         self.unsettled = None;
-        let mut seq = self.cached.take().expect("an unsettled sequence");
-        if goes_on {
-            self.settle(&mut seq, from, None);
-        } else {
-            self.decoder.reset(&*self.gpu);
-            device(self.gpu.reset_state(&mut seq.state));
-            seq.tokens.clear();
+        if !goes_on {
+            self.cut(prompt, from);
+            return;
         }
+        let mut seq = self.cached.take().expect("an unsettled sequence");
+        self.settle(&mut seq, from, None);
         self.cached = Some(seq);
+    }
+
+    /// The length the cached sequence `seq` cuts back to for `prompt`, which
+    /// leaves it: its latest mark on the grid at or before both where the
+    /// two part and `most`, from which `prompt` runs exactly as it runs
+    /// cold; zero when there is none.
+    fn cut_point(&self, seq: &Sequence<CudaState>, prompt: &[u32], most: usize) -> usize {
+        let common = sequence::common_prefix(&seq.tokens, prompt);
+        let len = common.min(prompt.len() - 1).min(most) / PREFILL_GRID * PREFILL_GRID;
+        let to = self.gpu.reach(self.model, &seq.state, len);
+        match to.is_multiple_of(PREFILL_GRID) {
+            true => to,
+            false => 0,
+        }
+    }
+
+    /// Cuts the cached sequence back to [`CudaBackend::cut_point`] when
+    /// `prompt` leaves it.
+    fn cut(&mut self, prompt: &[u32], most: usize) {
+        let Some(seq) = self.cached.as_ref().filter(|s| !s.continues(prompt)) else {
+            return;
+        };
+        let to = self.cut_point(seq, prompt, most);
+        let seq = self.cached.as_mut().expect("a cached sequence");
+        device(self.gpu.truncate(self.model, &mut seq.state, to));
+        seq.tokens.truncate(to);
+        self.decoder.reset(&*self.gpu);
     }
 
     /// A new sequence run up to the end of `prompt` with the token after it
@@ -443,12 +473,18 @@ impl<'a> CudaBackend<'a> {
     }
 
     /// Takes the sequence a request for `prompt` would start from when it
-    /// cannot continue the cached one: the longest warm prefix, or none.
+    /// cannot continue the cached one: that one cut back to where they
+    /// part, else the longest warm prefix, or none.
     fn restart(&mut self, prompt: &[u32]) -> bool {
         let batch = self.gpu.prefill_batch();
         let head = &prompt[..(prompt.len() - 1) / batch * batch];
         if head.is_empty() {
             return false;
+        }
+        self.cut(prompt, usize::MAX);
+        if self.cached.as_ref().is_some_and(|s| !s.tokens.is_empty()) {
+            self.ahead = None;
+            return true;
         }
         self.decoder.reset(&self.gpu);
         let old = self.cached.take().map(|s| s.state);
@@ -603,10 +639,13 @@ impl Backend for CudaBackend<'_> {
 
     fn reuses(&self, prompt: &[u32]) -> usize {
         let tokens = self.settled_tokens();
-        match prompt.len() > tokens.len() && prompt.starts_with(tokens) {
-            true => tokens.len(),
-            false => 0,
+        if prompt.len() > tokens.len() && prompt.starts_with(tokens) {
+            return tokens.len();
         }
+        let most = self.unsettled.unwrap_or(usize::MAX);
+        self.cached
+            .as_ref()
+            .map_or(0, |seq| self.cut_point(seq, prompt, most))
     }
 
     fn run_ahead(&mut self, prompt: &[u32]) -> usize {
