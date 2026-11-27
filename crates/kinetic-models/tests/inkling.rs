@@ -376,7 +376,7 @@ fn tiny_features(model: &mut kinetic_models::Model, tokens: &[u32]) -> Vec<f32> 
 #[test]
 fn speculative_greedy_with_the_drafter_is_plain_greedy() {
     use kinetic_models::speculative::{
-        CompanionDrafter, Decoder, DsparkCompanion, Greedy, Lookup, Policy,
+        CompanionDrafter, Costs, Decoder, DsparkCompanion, Greedy, Lookup, Policy,
     };
 
     let (target, drafter) = (model(&REFERENCE), tiny_drafter());
@@ -402,6 +402,9 @@ fn speculative_greedy_with_the_drafter_is_plain_greedy() {
         drafter.lookup = lookup.then(Lookup::default);
         let mut decoder = Decoder::new(drafter);
         decoder.max_pause = 0;
+        // Verifying pays whatever the chances, so this drafter's drafts are
+        // verified as they come, hits and misses alike.
+        decoder.costs = Costs::fixed(&[0.5]);
         let mut state = model.new_state();
         let mut context = prompt.to_vec();
         decoder.prefill(&model, &mut Greedy, &mut state, &context, 0);
