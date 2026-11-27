@@ -212,3 +212,35 @@ fn finds_the_projector_sharing_the_longest_name_start() {
     assert_eq!(found.as_deref(), Some(files[1].as_path()));
     assert_eq!(super::projector_for("LFM3-1.7B-Q4_K_M", files.iter()), None);
 }
+
+#[test]
+fn resembling_names_hold_the_words_or_are_a_few_letters_off() {
+    let models: Vec<Local> = [
+        "unsloth/Qwen3.5-4B-MTP-GGUF",
+        "LiquidAI/LFM3-1.7B-GGUF",
+        "qwen3:4b",
+        "llama3.2:1b",
+    ]
+    .iter()
+    .map(|n| Local {
+        name: n.to_string(),
+        path: PathBuf::from(format!("{n}.gguf")),
+        projector: None,
+        store: Store::Folder,
+        header: Err(String::new()),
+    })
+    .collect();
+    let found = |q| -> Vec<&str> {
+        resembling(&models, q)
+            .into_iter()
+            .map(|i| models[i].name.as_str())
+            .collect()
+    };
+    assert_eq!(
+        found("qwen 4b"),
+        ["unsloth/Qwen3.5-4B-MTP-GGUF", "qwen3:4b"]
+    );
+    assert_eq!(found("lfm"), ["LiquidAI/LFM3-1.7B-GGUF"]);
+    assert_eq!(found("lama3.2"), ["llama3.2:1b"]);
+    assert!(found("mistral").is_empty());
+}

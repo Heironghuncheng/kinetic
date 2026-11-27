@@ -5,10 +5,12 @@ mod attach;
 mod bench;
 mod chat;
 mod compare;
+mod config;
 mod console;
 mod doctor;
 mod fit;
 mod fix;
+mod fuzzy;
 mod generate;
 mod gpu;
 mod info;
@@ -27,6 +29,8 @@ mod signals;
 mod start;
 mod system;
 mod tech;
+mod tui;
+mod update;
 
 use std::io::IsTerminal;
 use std::net::TcpListener;
@@ -63,6 +67,10 @@ const WARM_DISK: u64 = 2 << 30;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Skip the daily check for a newer release, as KINETIC_NO_UPDATE_CHECK=1
+    /// does
+    #[arg(long, global = true)]
+    no_update_check: bool,
 }
 
 #[derive(Subcommand)]
@@ -219,6 +227,14 @@ enum Command {
         #[arg(short = 't', long, value_name = "N")]
         threads: Option<usize>,
     },
+    /// Download the newest release of Kinetic for this computer, check it
+    /// against the release's checksums and put it in place of this one
+    Update {
+        /// Follow the nightly build of main instead: untested, replaced
+        /// every night
+        #[arg(long)]
+        nightly: bool,
+    },
     /// Measure perplexity over a text file, as llama-perplexity does (CPU)
     Perplexity {
         #[command(flatten)]
@@ -311,7 +327,7 @@ impl ModelArg {
             (None, Some(path)) => (path, None),
             (None, None) => unreachable!("clap requires a model"),
         };
-        Ok((library::locate(&arg)?, rest))
+        Ok((tui::locate(&arg)?, rest))
     }
 
     fn locate(self) -> Result<Local> {
@@ -570,33 +586,69 @@ impl GenArgs {
 }
 
 fn main() -> ExitCode {
+    update::tidy();
     if std::env::args().len() == 1 {
+        // a double click opens the home screen, then a terminal to type in
         if console::double_clicked() {
+            if let Err(e) = start::run() {
+                report(&*e);
+            }
             return console::open_terminal();
         }
-        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-            return finish(first_run());
+        if interactive() {
+            return finish(start::run());
         }
     }
     let args = match llama_flags::translate(llama_flags::dispatch(std::env::args().collect())) {
-        Ok(args) => args,
+        Ok(args) => config::Settings::load().apply(args),
         Err(msg) => {
             eprintln!("kinetic: {msg}");
             return ExitCode::from(2);
         }
     };
-    finish(run(Cli::parse_from(args)))
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e) => match model_wanted(&e, &args) {
+            Some(title) if interactive() => match tui::pick_model(title) {
+                Ok(Some(model)) => {
+                    let model = model.to_string_lossy().into_owned();
+                    Cli::parse_from(args.iter().cloned().chain([model]))
+                }
+                Ok(None) => return ExitCode::SUCCESS,
+                Err(e) => return finish(Err(e)),
+            },
+            _ => e.exit(),
+        },
+    };
+    if !cli.no_update_check {
+        update::notice(&args);
+    }
+    finish(run(cli))
 }
 
-/// `kinetic` with nothing after it: pick a model, then chat with it.
-fn first_run() -> Result<()> {
-    match start::run()? {
-        Some(model) => {
-            let args = ["kinetic".into(), "chat".into(), model.into_os_string()];
-            run(Cli::parse_from(args))
-        }
-        None => Ok(()),
+fn interactive() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// The title of the model list to show when `e` is only a command that
+/// needs a model and was given none.
+fn model_wanted(e: &clap::Error, args: &[String]) -> Option<&'static str> {
+    if e.kind() != clap::error::ErrorKind::MissingRequiredArgument
+        || !e.to_string().contains("<MODEL")
+    {
+        return None;
     }
+    match args.get(1).map(String::as_str) {
+        Some("chat") => Some("Pick a model to chat with"),
+        Some("serve") => Some("Pick a model to serve to your apps"),
+        Some("bench") => Some("Pick a model to measure"),
+        _ => None,
+    }
+}
+
+/// Runs the command line `args`, with the saved settings, as if typed.
+fn launch(args: Vec<String>) -> Result<()> {
+    run(Cli::try_parse_from(config::Settings::load().apply(args))?)
 }
 
 fn finish(result: Result<()>) -> ExitCode {
@@ -610,13 +662,18 @@ fn finish(result: Result<()>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            let msg = e.to_string();
-            eprintln!("kinetic: {msg}");
-            if let Some(fix) = fix::for_error(&msg) {
-                eprintln!("  {fix}");
-            }
+            report(&*e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Prints `e` and, when one is known, how to fix it.
+fn report(e: &(dyn std::error::Error + Send + Sync)) {
+    let msg = e.to_string();
+    eprintln!("kinetic: {msg}");
+    if let Some(fix) = fix::for_error(&msg) {
+        eprintln!("  {fix}");
     }
 }
 
@@ -645,16 +702,30 @@ fn run(cli: Cli) -> Result<()> {
             })
         }
         Command::Chat { model, mmproj, gen } => {
-            let model = model.locate()?;
-            read_ahead(&model.path);
-            let mmproj = mmproj.or_else(|| model.projector.clone());
-            with_engine(
-                &model,
-                mmproj.as_deref(),
-                &gen.runtime,
-                Some(1),
-                |engine, device, _| chat::chat(engine, &gen, device),
-            )
+            let mut model = model.locate()?;
+            let mut mmproj = mmproj;
+            loop {
+                if std::io::stdin().is_terminal() {
+                    tui::last::remember(&model.path);
+                }
+                read_ahead(&model.path);
+                let projector = mmproj.take().or_else(|| model.projector.clone());
+                let mut next = None;
+                with_engine(
+                    &model,
+                    projector.as_deref(),
+                    &gen.runtime,
+                    Some(1),
+                    |engine, device, _| {
+                        next = chat::chat(engine, &gen, device)?;
+                        Ok(())
+                    },
+                )?;
+                match next {
+                    Some(path) => model = library::locate(&path)?,
+                    None => return Ok(()),
+                }
+            }
         }
         Command::Serve {
             model,
@@ -761,6 +832,7 @@ fn run(cli: Cli) -> Result<()> {
         })
         .map(drop),
         Command::Models => library::list(),
+        Command::Update { nightly } => update::run(nightly),
         Command::Info { model } => info::print(&model.locate()?.path),
         Command::Verify { file } => verify(&file),
         Command::VerifyReceipt {
@@ -816,6 +888,11 @@ fn verify(file: &Path) -> Result<()> {
 }
 
 fn set_threads(threads: Option<usize>) -> Result<()> {
+    // the pool is built once; a second model in the same run keeps it
+    static BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if BUILT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
     // Apple Silicon has efficiency cores a decode step would wait for; the
     // default there is the performance cores, as `kinetic doctor` reports.
     if let Some(n) = threads.or_else(system::default_threads) {

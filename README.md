@@ -106,11 +106,19 @@ kinetic chat LiquidAI/LFM3-1.7B-GGUF
 ```
 
 <a name="quick-start"></a>
-Not sure which model to take? Run `kinetic` alone: it checks your computer,
-suggests two or three models that run well on it (the ones you already have
-first), and one key press downloads it and opens a chat. A GGUF file you already
-have works too if its model family is [supported](#supported-models):
-`kinetic chat path/to/model.gguf`.
+**Or type nothing at all.** Run `kinetic` alone: a home screen opens that
+you drive with the arrow keys and Enter. Chat, Models, API, Benchmark,
+Doctor and Settings are one key away; the model list shows every model
+already on your computer (Ollama's, LM Studio's and Hugging Face's
+included) and offers two to download, and a folder browser finds any other
+`.gguf` file. `kinetic chat` with no model opens the same list, and a model
+name typed slightly wrong is matched for you. See
+[the command line](docs/src/cli.md#without-typing).
+
+<!-- screenshot: the kinetic home screen only (replace this line with the image); never another screen, as they show the computer's processor and GPU -->
+
+A GGUF file you already have works too if its model family is
+[supported](#supported-models): `kinetic chat path/to/model.gguf`.
 
 <div align="center">
 

@@ -121,7 +121,7 @@ fn safe_path(path: &str) -> bool {
         .all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':']))
 }
 
-fn find_curl() -> Option<PathBuf> {
+pub fn find_curl() -> Option<PathBuf> {
     let name = format!("curl{}", std::env::consts::EXE_SUFFIX);
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)

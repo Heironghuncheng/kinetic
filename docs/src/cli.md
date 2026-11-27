@@ -19,13 +19,60 @@ kinetic <COMMAND> [OPTIONS] [MODEL] ...
 | [`verify-receipt`](#verify-receipt) | reruns the request a receipt records and checks every output token |
 | [`quantize`](#quantize) | writes a GGUF model in another type, as `llama-quantize` does |
 | [`perplexity`](#perplexity) | measures perplexity and KL divergence over a text file, as `llama-perplexity` does |
+| [`update`](#update) | installs the newest release in place of this one |
 
-`kinetic` alone in a terminal checks the computer, lists two or three models
-that run well on it with their size and expected speed, models already on
-disk first, and waits for one key: `1`-`3` or Enter picks, `q` quits. A model
-not on disk yet is downloaded as [`pull`](#pull) does, then [`chat`](#chat)
-opens. Nothing is downloaded before you pick. With input or output
-redirected, `kinetic` prints the help as before.
+## Without typing
+
+`kinetic` alone in a terminal opens the home screen. Move with the arrow
+keys, Enter opens, Esc goes back one screen (on the home screen it asks
+before quitting), and `q` quits. The line at the bottom of every screen
+lists its keys.
+
+<!-- screenshot: the home screen only (replace this line with the image); never another screen, as they show the computer's processor and GPU -->
+
+| Tile | Opens |
+|---|---|
+| Chat | the model list, then a [chat](#chat) with the model picked |
+| Models | the model list, then what to do with the model: chat, serve it to apps, benchmark it, or show what the file holds |
+| API | the model list, then [serve](#serve) on the first free port from 8080, with the address to paste into OpenCode, Open WebUI or any app that takes an OpenAI base URL |
+| Benchmark | the model list, then [bench](#bench) |
+| Doctor | [doctor](#doctor) |
+| Settings | the settings below |
+| Every command (under the tiles) | every command, then a form of all its options: Left and Right change a choice or a switch, typing sets a value, Enter on MODEL opens the model list, and the command line the form stands for shows under it until **Run** starts it |
+
+The model list shows every model [`models`](#models) finds: its name, size,
+where it was found, and where it runs (GPU, GPU + CPU or CPU) when that is
+sure. A vision projector or a drafter found with a model is marked on its
+row. Two models worth downloading are offered when they are not on disk
+yet, and nothing is downloaded before you pick one. Typing narrows the
+list: `qwen 4b` finds `unsloth/Qwen3.5-4B-MTP-GGUF`. **Browse a folder...**
+walks folders with the arrows to any `.gguf` file (Left or Backspace goes
+up a folder). The model picked last comes first next time.
+
+In the model list's action screen, `d` changes the device the model runs
+on, from the one Kinetic picks to the CPU or a GPU this build can use.
+
+`chat`, `serve` and `bench` with no model open the same list when input and
+output are a terminal. With either redirected, they fail as before, so a
+script never waits for a key. A model name that matches no file offers the
+names like it (`kinetic chat lfm3` asks "Did you mean LFM3-1.7B-Q4_K_M?").
+
+### Settings
+
+The Settings screen sets, with Left and Right, the device and GPUs, the
+context size, threads, requests at once, temperature, top-p, top-k, min-p,
+repeat penalty, the most tokens per answer and reasoning, and switches each
+speed technology on or off. Each setting shows the flag it stands for, and
+the screen shows the command a chat runs as. Backspace puts a setting back
+to its default.
+
+They are saved in `%LOCALAPPDATA%\kinetic\settings` on Windows and
+`$XDG_STATE_HOME/kinetic/settings` (`~/.local/state/kinetic/settings`) on
+Linux, one `--flag=value` a line, and `chat`, `serve`, `run` and `bench`
+take them as if typed after the command. A flag typed on the command line
+wins over the saved one. Delete the file to go back to the defaults.
+
+## Commands
 
 Every command except `verify` and `verify-receipt` takes the model as its first argument or with
 `-m`/`--model`, as a `.gguf` or `.ktc` file, or as a Hugging Face repository
@@ -164,6 +211,9 @@ words are processed. Ctrl+C stops an answer, and the conversation goes on.
 | Command | Does |
 |---|---|
 | `/clear` | starts a new conversation |
+| `/model` | opens the model list and switches to the model picked |
+| `/settings` | opens Settings; sampling, the most tokens per answer and reasoning apply to the next answers |
+| `/` | lists the commands to pick from with the arrows |
 | `/system TEXT` | sets the system prompt and starts over; `/system` alone clears it |
 | `/think` | turns the model's reasoning on or off (off at start); reasoning is shown dimmed |
 | `/temp X`, `/top-p X`, `/top-k N`, `/min-p X` | change sampling for the next answers |
@@ -454,6 +504,29 @@ anything.
 When a command fails, the error ends with a line saying what to do: a path
 to check, a smaller model or `-c`, a driver to install, a free `--port`, or a
 download to repeat.
+
+## update
+
+```sh
+kinetic update
+kinetic update --nightly
+```
+
+Downloads the newest release for this computer and this build (the full
+build, or the CPU build when this one is), checks it against the release's
+`SHA256SUMS`, and puts it in place of the running binary. On Windows the
+old binary is moved aside to `kinetic.exe.old`, which the next start
+removes. `--nightly` follows the nightly build of main instead.
+`KINETIC_RELEASES` points both at a mirror that serves `latest`,
+`tags/<tag>` and `download/<tag>/<file>`.
+
+Once a day at most, a command run at a terminal asks GitHub for the newest
+release, in the background, sending nothing about you or this computer.
+When it is newer, the next interactive command prints one line on stderr,
+`Kinetic 0.1.2 is out: run kinetic update`, and the home screen shows it in
+its corner, where `u` runs the update. Nothing is downloaded or replaced
+until you ask. Scripts, pipes and `--json` output never see the line, and
+`--no-update-check` or `KINETIC_NO_UPDATE_CHECK=1` turn the check off.
 
 ## doctor
 

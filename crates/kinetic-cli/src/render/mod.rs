@@ -3,7 +3,7 @@
 
 mod code;
 mod inline;
-mod screen;
+pub mod screen;
 mod table;
 
 use std::fmt::Write as _;
