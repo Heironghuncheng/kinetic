@@ -3,9 +3,6 @@
 Kinetic runs on Windows 10 and 11 and on Linux, on x86-64, and on macOS on
 Apple Silicon. Pick one way to install it.
 
-The macOS builds start with the release after 0.1.0. Until then, on a Mac,
-[build from source](building.md).
-
 ## Install script
 
 ```powershell
@@ -19,8 +16,8 @@ curl -fsSL https://raw.githubusercontent.com/Veloresearch/kinetic/main/scripts/i
 The scripts download the latest release (the full build, which runs on NVIDIA
 GPUs through CUDA, on AMD and Intel GPUs through Vulkan and on the CPU), check it against the release's `SHA256SUMS` and install it for the
 current user: into `%LOCALAPPDATA%\Programs\kinetic`, put on the user `PATH`, on
-Windows, and into `~/.local/bin` on Linux and macOS. `-Version 0.1.0` /
-`--version 0.1.0` picks a release and `-Cpu` / `--cpu` the smaller CPU-only
+Windows, and into `~/.local/bin` on Linux and macOS. `-Version 0.1.1` /
+`--version 0.1.1` picks a release and `-Cpu` / `--cpu` the smaller CPU-only
 build. macOS has one build, which uses the GPU through Metal.
 
 `-Nightly` / `--nightly` installs the nightly build instead: main as it was
@@ -52,14 +49,14 @@ download before you unpack it:
 ```sh
 # Linux
 sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf kinetic-0.1.0-linux-x86_64-cuda.tar.gz
-sudo install kinetic-0.1.0-linux-x86_64-cuda/kinetic /usr/local/bin/
+tar -xzf kinetic-0.1.1-linux-x86_64-cuda.tar.gz
+sudo install kinetic-0.1.1-linux-x86_64-cuda/kinetic /usr/local/bin/
 ```
 
 ```powershell
 # Windows (PowerShell): compare the hash with the line in SHA256SUMS
-Get-FileHash .\kinetic-0.1.0-windows-x86_64-cuda.zip -Algorithm SHA256
-Expand-Archive .\kinetic-0.1.0-windows-x86_64-cuda.zip -DestinationPath $env:LOCALAPPDATA\Programs
+Get-FileHash .\kinetic-0.1.1-windows-x86_64-cuda.zip -Algorithm SHA256
+Expand-Archive .\kinetic-0.1.1-windows-x86_64-cuda.zip -DestinationPath $env:LOCALAPPDATA\Programs
 ```
 
 Then put the unpacked folder on your `PATH` and check:

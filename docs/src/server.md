@@ -430,5 +430,6 @@ another address with `--host` makes the model usable by anyone who can reach
 that address; use `--api-key` there, and a TLS proxy if the key crosses an
 untrusted network. Browsers cannot send JSON to the server from another site, so web
 pages you visit cannot use it. A client has 30 seconds to send its request.
-Kinetic never connects to the network, except when you run `kinetic pull`.
+Kinetic never connects to the network, except when you run `kinetic pull` or
+`kinetic update`, download with `-hf`, or turn on the daily update check.
 The server never downloads anything.

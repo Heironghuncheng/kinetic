@@ -66,10 +66,17 @@ A pass over more rows is not free everywhere: layers or experts that run on
 the CPU, and the work of rolling a pass back, make each row cost something.
 So RAD-1 times its own steps by how many rows they run, on this model as it
 is placed, and keeps track of how far drafts have lately come true, judging
-every draft once the tokens it guessed are known. A draft is checked only up
-to the length that gives the most tokens per second expected, and not at
-all when a plain step gives as many, so drafting does not make decoding
-slower, on one GPU or split between the GPU and the CPU.
+every draft, depth by depth, against the tokens the model goes on to pick,
+which costs nothing. A draft is checked only up to the length that gives
+the most tokens per second expected, and only once its measured chances
+pay, so drafts that don't pay cost no verify pass, on one GPU or split
+between the GPU and the CPU.
+
+A pass checks up to 15 draft tokens. On CUDA, when Inkling 2 runs with all
+its layers on one GPU, a pass checks up to 127: every kernel on that path
+gives a row the bits it has alone at any width, and the experts run once
+for the whole pass. Drafts grow toward that length while they keep coming
+true, as they do in long edits of copied text.
 
 ### Why the output does not change
 
@@ -212,7 +219,9 @@ per layer     the router picks a few experts
 ```
 
 Flywheel gives the experts all the GPU memory left after the rest of the
-model, one sequence's state and a reserve. It measures how fast the CPU runs
+model, one sequence's state and a reserve, and shares the cache between
+layers by how many times a token runs each one, so the layers of a looped
+model such as Inkling 2 get more of it. It measures how fast the CPU runs
 an expert and how fast one copies to the GPU, keeps adjusting for other
 programs that slow the CPU down, and splits the work accordingly. When every
 expert fits, routing happens on the GPU and each one-token step runs as one

@@ -4,13 +4,13 @@ Kinetic's version is the one in the workspace `Cargo.toml`; the command
 line, the libraries and the Python package all carry it, and `kinetic
 --version` prints it.
 
-- **0.1.x** releases fix bugs. They add support where it was missing (a
-  pre-tokenizer, a weight type on a device) but do not change how existing
-  commands, flags or API fields behave.
-- **0.2** brings new features, such as macOS, older NVIDIA GPUs and
-  several GPUs for one model. While Kinetic is below 1.0, a minor version
-  may also change behavior; the [changelog](changelog.md) lists every such
-  change.
+- **0.1.x** releases fix bugs and add support: model families, weight
+  types, devices and platforms. They do not remove commands, flags or API
+  fields; where a release changes what one does, the
+  [changelog](changelog.md) says so under "Changed".
+- **0.2** brings what changes how Kinetic is used, such as new commands
+  and server behavior. While Kinetic is below 1.0, a minor version may also
+  change behavior; the changelog lists every such change.
 - **Every release before 1.0 is a beta.** Releases are measured and
   announced, and their notes say what is known not to work yet.
 - **Nightly builds** are main as it was last night, built every night main

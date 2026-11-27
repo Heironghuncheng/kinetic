@@ -9,26 +9,32 @@ are welcome; open an issue first so we can agree on the approach.
 
 - winget and scoop packages; the manifests are in `packaging/`.
 
-## 0.1.x: fixes
+## 0.1.x: small releases
 
-Bug fixes, new pre-tokenizers, better error messages and documentation. No
-changes to the command line or the server API that break existing use.
+Bug fixes and support for more models, weight types, devices and platforms,
+shipped often. What the next one brings is the checklist at the top of the
+[README](https://github.com/Veloresearch/kinetic#status). None removes a
+command, flag or API field; see [Versioning](https://veloresearch.github.io/kinetic/versioning.html).
 
-## 0.2: next features
+## 0.2: every popular model llama.cpp runs
 
-- **More on Vulkan.** Llama, Qwen2.5, Qwen3, LFM3 and Qwen3.5 run on AMD,
-  Intel and NVIDIA GPUs through `--device vulkan`; MoE models and the other
-  architectures are next.
+- **More on Vulkan.** Llama, Qwen2.5, Qwen3, LFM3, Qwen3.5 and
+  mixture-of-experts models such as Inkling 2 run on AMD, Intel and NVIDIA
+  GPUs through `--device vulkan`; the other architectures are next, and
+  LFM2.5 MoE matching the CPU there.
 - **Layer splits on Vulkan.** Dense models larger than the GPU split their
   layers between GPU and CPU through CUDA today (`--gpu-layers`); Vulkan is
   next.
-- **Gemma 4 26B A4B, LFM2.5 MoE** and more quantization formats.
-- **Block drafters for RAD-1.**
+- **Gemma 4 26B A4B on GPUs.** It runs on the CPU today.
+- **More block drafters for RAD-1**, such as DSpark drafters for every model
+  that has one, and long drafts for every mixture-of-experts and dense model.
 - **Shared passes everywhere.** Convoy runs on the CPU and on CUDA when the
   whole model is on the GPU; layer splits, expert offload and Vulkan are next.
 - **More vision models.** Today images work with Qwen3.5 and Gemma 4 and
   their `mmproj` projectors; other projectors are next.
-- **Two GPUs.** Splitting one model across two devices.
+- **More on several GPUs.** Dense models spread their layers over several
+  GPUs with `--gpus` today; mixture-of-experts models and splitting every
+  layer over two GPUs are next.
 
 ## Later
 
@@ -40,6 +46,5 @@ changes to the command line or the server API that break existing use.
 - `--imatrix` for `kinetic quantize`.
 - Tools to convert and sign `.ktc` files from the command line.
 
-Kinetic supports Windows and Linux on x86-64 and macOS on Apple Silicon, where
-the GPU runs through Metal; the macOS builds ship with the release after
-0.1.0. Intel Macs are not planned.
+Kinetic supports Windows and Linux on x86-64 and, since 0.1.1, macOS on
+Apple Silicon, where the GPU runs through Metal. Intel Macs are not planned.

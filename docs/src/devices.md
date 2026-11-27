@@ -115,6 +115,11 @@ them the integrated graphics of many Ryzen APUs, only run subgroups of 64;
 there each half of a subgroup does the work of a subgroup of 32, and models
 run on them as on the others.
 
+LFM2.5 mixture of experts (`lfm2moe`) runs through Vulkan but does not match
+the CPU yet: its logits differ by up to about 14% of the largest one, and
+the first tokens of an answer can differ. Use `--device cpu`, or CUDA on an
+NVIDIA GPU, for it until that is fixed.
+
 On GPUs with cooperative f16 matrices (`VK_KHR_cooperative_matrix`, such as
 AMD's RDNA3 cards and NVIDIA's RTX cards), prompts run on the matrix units:
 Q8_0 and K-quant products of passes of up to 512 tokens take 16x16x16 f16
@@ -248,6 +253,16 @@ needed.
 When every expert fits on the GPU, there is no offload: routing runs on the
 GPU too.
 
+Kinetic keeps part of the GPU's memory free for the driver and other
+programs: 300 MiB or a twentieth of the GPU, whichever is larger. The
+expert cache gets the largest size that leaves that reserve, measured on
+the state the model really builds. A looped model such as Inkling 2 runs
+some layers several times a token, and those layers get a larger share of
+the cache.
+
+Gemma 4 26B A4B runs on the CPU only for now: the GPU paths have no kernels
+yet for its experts, which use a GELU gate.
+
 On Vulkan, a model whose experts do not all fit keeps every expert of as
 many layers as fit on the GPU, the layers a token runs most often first: a
 looped model such as Inkling 2 runs the layers of its loop once per pass.
@@ -257,8 +272,7 @@ Experts of a weight type without a Vulkan kernel run on the CPU as well.
 
 ## Coming
 
-- **More on Vulkan**: more architectures, speculative decoding, Warm Start
-  and layer splits.
+- **More on Vulkan**: more architectures and layer splits.
 - **Several GPUs** for mixture-of-experts models, Gemma 4 E2B/E4B and
   shared passes; dense models already spread over them with `--gpus`.
 
