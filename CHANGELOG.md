@@ -25,8 +25,8 @@ home screen in the terminal.
   without tensor cores keep the earlier kernels), and experts that run on
   the CPU use AVX2 kernels on every core and give the GPU's bits, so where
   an expert runs never changes the answer. On a 6 GB NVIDIA GPU it generates
-  {{TG128}} tokens per second where llama.cpp gives {{LLAMA_TG128}} on the
-  same file, and repeated edits with long drafts reach {{EDIT_REPEATED}}.
+  about 25 tokens per second where llama.cpp gives about 18 on the same
+  file, and repeated edits with long drafts reach about 100.
 - Inkling 2 Mini through Vulkan, on AMD GPUs among others, in both layouts;
   see Devices.
 - Inkling 2 Mini on the CPU, in both published layouts: ggml-org's looped
@@ -308,6 +308,12 @@ home screen in the terminal.
   `--device cpu` or CUDA for LFM2.5 MoE until this is fixed.
 - Gemma 4 26B A4B runs on the CPU only: its experts have a GELU gate, which
   the GPU paths do not run yet.
+- With a very long context on a small GPU, plain generation falls behind
+  llama.cpp: at 32,000 tokens on a 6 GB GPU, Inkling 2 Mini generates about
+  10 tokens per second where llama.cpp gives about 14. The context is kept on
+  the GPU at full precision and takes room from the expert cache. Up to
+  8,000 tokens Kinetic is ahead.
+- Inkling 2 has no image input yet; its vision projector is not read.
 - When Inkling 2 verifies a long draft in one pass, the tokens of the pass
   reach the client when the pass ends, so a stream can come in bursts.
 - The kernels for Pascal and Volta are built with CUDA 12, as the release

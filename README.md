@@ -32,9 +32,9 @@ speed-up ever changes the answer.
 ## Status: beta, on the road to 0.2
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/coverage/progress-0.1.2-0-of-9-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="assets/coverage/progress-0.1.2-0-of-9-light.svg">
-  <img src="assets/coverage/progress-0.1.2-0-of-9-light.svg" alt="Next update 0.1.2: 0%, 0 of 9 done." width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/coverage/progress-0.1.2-0-of-12-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/coverage/progress-0.1.2-0-of-12-light.svg">
+  <img src="assets/coverage/progress-0.1.2-0-of-12-light.svg" alt="Next update 0.1.2: 0%, 0 of 12 done." width="100%">
 </picture>
 
 Until 0.2 we ship small 0.1.x updates often, each with fixes and new models. The bar shows how
@@ -54,6 +54,9 @@ Still known:
 - On Vulkan, LFM2.5 MoE gives logits that differ from the CPU's, and the first tokens of an
   answer can differ; dense models and Inkling 2 match.
 - Gemma 4 26B A4B runs on the CPU only.
+- With a very long context on a small GPU (32,000 tokens on 6 GB), plain generation is slower
+  than llama.cpp's; up to 8,000 tokens Kinetic is ahead.
+- Inkling 2 has no image input yet.
 - `--gpus` spreads dense models only.
 
 ### Next: 0.1.2
@@ -67,6 +70,9 @@ Still known:
 - [ ] Every layer split over two GPUs ([#40](https://github.com/Veloresearch/kinetic/pull/40))
 - [ ] LFM2.5 MoE on Vulkan matching the CPU
 - [ ] A live engine panel in the terminal screen
+- [ ] Long context on small GPUs: an 8-bit context cache as an option
+- [ ] Image input for Inkling 2
+- [ ] The first answer after loading at full speed
 
 ### Road to 0.2
 
