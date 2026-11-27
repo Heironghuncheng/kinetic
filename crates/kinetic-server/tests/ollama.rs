@@ -74,6 +74,10 @@ fn version_tags_and_show() {
         .unwrap()
         .contains(&json!("completion")));
     assert!(show["model_info"]["lfm3.context_length"].as_u64().unwrap() > 0);
+    assert!(show["modelfile"]
+        .as_str()
+        .unwrap()
+        .starts_with("# lfm3:test "));
     assert!(
         show["model_info"]["general.parameter_count"]
             .as_u64()

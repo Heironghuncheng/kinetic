@@ -257,6 +257,8 @@ fn conversation(
             "/help" => help(),
             // not in /help on purpose
             "/vroom" => "E = ½mv². The model fixes m, so Kinetic works on v.".to_owned(),
+            "/brake" => "Brakes turn motion into heat. The fans do that already.".to_owned(),
+            "/inertia" => "A model at rest stays at rest until a prompt acts on it.".to_owned(),
             "/clear" => {
                 messages = opening(system.as_deref());
                 images.clear();
@@ -938,7 +940,9 @@ mod tests {
         assert_eq!(names("/").len(), COMMANDS.len());
         assert!(names("/think on").is_empty());
         assert!(names("hello").is_empty());
-        assert!(names("/vroom").is_empty());
+        assert!(["/vroom", "/brake", "/inertia"]
+            .iter()
+            .all(|c| names(c).is_empty()));
         assert!(COMMANDS.iter().all(|(name, ..)| help().contains(name)));
     }
 

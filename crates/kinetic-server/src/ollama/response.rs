@@ -9,6 +9,8 @@ use crate::model_info::ModelInfo;
 use crate::text::Split;
 use crate::ToolCall;
 
+use super::Served;
+
 /// The Ollama release whose API this mirrors; clients gate features on it.
 pub const VERSION: &str = "0.13.0";
 
@@ -51,16 +53,21 @@ pub fn ps(name: &str, info: &ModelInfo, context: usize) -> Value {
 }
 
 /// `/api/show`.
-pub fn show(info: &ModelInfo, capabilities: &[&str]) -> Value {
+pub fn show(model: &Served) -> Value {
+    let info = model.info;
     let mut model_info = info.metadata.clone();
     model_info.insert("general.parameter_count".into(), info.parameters.into());
+    let modelfile = format!(
+        "# {} runs from its GGUF file in Kinetic, without a Modelfile\n",
+        model.name
+    );
     json!({
-        "modelfile": "",
+        "modelfile": modelfile,
         "parameters": "",
         "template": info.chat_template.clone().unwrap_or_default(),
         "details": details(info),
         "model_info": model_info,
-        "capabilities": capabilities,
+        "capabilities": model.capabilities,
         "modified_at": timestamp(info.loaded),
     })
 }
