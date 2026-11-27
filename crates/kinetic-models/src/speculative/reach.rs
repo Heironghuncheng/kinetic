@@ -4,17 +4,27 @@ const RATE: f32 = 0.2;
 /// How far drafts come true: for drafts of each length, the chance that
 /// the token at each depth matches what was generated, all before it
 /// included, kept apart for drafts that follow one accepted whole, as
-/// copied text gives, and drafts that follow a miss. Every draft counts
-/// once the tokens it guessed are known, whether or not it was verified,
-/// so drafts that are not verified are still judged.
+/// copied text gives, and drafts that follow a miss. Every draft counts,
+/// whether or not it was verified, each depth as soon as the token there is
+/// known, so drafts are judged for nothing while none is verified.
 #[derive(Clone, Debug, Default)]
 pub struct Reach {
     /// After a miss and after a draft accepted whole, by draft length from
-    /// one on; empty until a draft of it is judged.
-    chances: [Vec<Vec<f32>>; 2],
-    /// Drafts not yet judged, each with the context length it continues
-    /// and whether it followed a draft accepted whole.
-    open: Vec<(usize, Vec<u32>, bool)>,
+    /// one on, then by depth; `None` until a token at that depth is known.
+    chances: [Vec<Vec<Option<f32>>>; 2],
+    open: Vec<Open>,
+}
+
+/// A draft not yet judged to its end.
+#[derive(Clone, Debug)]
+struct Open {
+    /// The context length it continues.
+    at: usize,
+    tokens: Vec<u32>,
+    /// Whether it followed a draft accepted whole.
+    whole: bool,
+    /// Depths counted so far.
+    counted: usize,
 }
 
 impl Reach {
@@ -22,23 +32,38 @@ impl Reach {
     /// made after a draft accepted `whole` or not.
     pub fn guess(&mut self, at: usize, tokens: &[u32], whole: bool) {
         if !tokens.is_empty() {
-            self.open.push((at, tokens.to_vec(), whole));
+            self.open.push(Open {
+                at,
+                tokens: tokens.to_vec(),
+                whole,
+                counted: 0,
+            });
         }
     }
 
-    /// Judges every open draft whose outcome `context` shows: one that
-    /// missed, or whose tokens have all been generated.
+    /// Counts every depth of the open drafts that `context` now shows: up to
+    /// the tokens generated after each, or all of a draft once it missed.
     pub fn judge(&mut self, context: &[u32]) {
         let mut open = std::mem::take(&mut self.open);
-        open.retain(|(at, draft, whole)| {
-            let known = context.get(*at..).unwrap_or_default();
-            let hits = draft.iter().zip(known).take_while(|(a, b)| a == b).count();
-            let judged = hits < known.len().min(draft.len()) || known.len() >= draft.len();
-            if judged {
-                self.count(*whole, draft.len(), hits);
+        for d in &mut open {
+            let known = context.get(d.at..).unwrap_or_default();
+            let len = d.tokens.len();
+            let hits = d
+                .tokens
+                .iter()
+                .zip(known)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let upto = match hits < known.len().min(len) {
+                true => len,
+                false => known.len().min(len),
+            };
+            for depth in d.counted..upto {
+                self.count(d.whole, len, depth, depth < hits);
             }
-            !judged
-        });
+            d.counted = d.counted.max(upto);
+        }
+        open.retain(|d| d.counted < d.tokens.len());
         self.open = open;
     }
 
@@ -48,26 +73,40 @@ impl Reach {
     }
 
     /// The chance of each depth of a draft of `len` tokens made after a
-    /// draft accepted `whole` or not; sure until such a draft is judged, so
-    /// it is tried.
+    /// draft accepted `whole` or not. A length no draft of that kind was
+    /// judged at takes the nearest judged length's chances, of the other
+    /// kind if none, and a depth not yet known the chance of the one before
+    /// it. With nothing judged every chance is zero: drafts are judged
+    /// before any is verified.
     pub fn chances(&self, len: usize, whole: bool) -> Vec<f32> {
-        match self.chances[whole as usize].get(len.wrapping_sub(1)) {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => vec![1.0; len],
-        }
+        let nearest = |kind: bool| {
+            let rows = &self.chances[kind as usize];
+            (0..rows.len())
+                .filter(|&i| rows[i].first().copied().flatten().is_some())
+                .min_by_key(|&i| (i + 1).abs_diff(len))
+                .map(|i| &rows[i])
+        };
+        let Some(row) = nearest(whole).or_else(|| nearest(!whole)) else {
+            return vec![0.0; len];
+        };
+        let mut last = 0.0;
+        (0..len)
+            .map(|depth| {
+                last = row.get(depth).copied().flatten().unwrap_or(last);
+                last
+            })
+            .collect()
     }
 
-    fn count(&mut self, whole: bool, len: usize, hits: usize) {
+    fn count(&mut self, whole: bool, len: usize, depth: usize, hit: bool) {
         let by_len = &mut self.chances[whole as usize];
         if by_len.len() < len {
             by_len.resize(len, Vec::new());
         }
-        let chances = &mut by_len[len - 1];
-        chances.resize(len, 1.0);
-        for (depth, chance) in chances.iter_mut().enumerate() {
-            let hit = if depth < hits { 1.0 } else { 0.0 };
-            *chance += RATE * (hit - *chance);
-        }
+        let row = &mut by_len[len - 1];
+        row.resize(len, None);
+        let x = if hit { 1.0 } else { 0.0 };
+        row[depth] = Some(row[depth].map_or(x, |c| c + RATE * (x - c)));
     }
 }
 
@@ -76,18 +115,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drafts_are_judged_once_their_outcome_is_known() {
+    fn depths_are_judged_as_their_tokens_are_known() {
         let mut reach = Reach::default();
+        assert_eq!(reach.chances(3, false), [0.0; 3], "nothing judged yet");
         reach.guess(2, &[5, 6, 7], false);
-        reach.judge(&[1, 2, 5, 6]);
-        assert_eq!(reach.chances(3, false), [1.0; 3], "still open");
+        reach.judge(&[1, 2, 5]);
+        assert_eq!(reach.chances(3, false), [1.0; 3]);
         reach.judge(&[1, 2, 5, 6, 9]);
-        assert_eq!(reach.chances(3, false), [1.0, 1.0, 0.8]);
+        assert_eq!(reach.chances(3, false), [1.0, 1.0, 0.0]);
         reach.guess(5, &[4, 4, 4], false);
         reach.judge(&[1, 2, 5, 6, 9, 3]);
-        assert_eq!(reach.chances(3, false), [0.8, 0.8, 0.64]);
-        assert_eq!(reach.chances(2, false), [1.0; 2]);
-        assert_eq!(reach.chances(3, true), [1.0; 3]);
+        assert_eq!(reach.chances(3, false), [0.8, 0.8, 0.0]);
+        assert_eq!(reach.chances(2, false), [0.8, 0.8], "the nearest length");
+        assert_eq!(
+            reach.chances(4, true),
+            [0.8, 0.8, 0.0, 0.0],
+            "the other kind"
+        );
     }
 
     #[test]
@@ -99,8 +143,8 @@ mod tests {
             reach.guess(2 * at, &[0; 4], true);
             reach.judge(&vec![1; 2 * at + 4]);
         }
-        assert!(reach.chances(1, false)[0] < 0.02);
+        assert_eq!(reach.chances(1, false), [0.0]);
         assert_eq!(reach.chances(4, false), [1.0; 4]);
-        assert!(reach.chances(4, true)[0] < 0.02);
+        assert_eq!(reach.chances(4, true), [0.0; 4]);
     }
 }

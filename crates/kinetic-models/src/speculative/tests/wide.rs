@@ -47,14 +47,15 @@ impl Drafter<Toy> for MissAt {
     }
 }
 
-/// Drafts accepted whole double until they fill the widest pass, and every
-/// one of them is kept.
+/// The first draft is judged on the first token after it, and drafts
+/// accepted whole then double until they fill the widest pass, every one
+/// of them kept.
 #[test]
 fn whole_hits_grow_drafts_to_the_widest_pass() {
     let (tokens, steps) = long(&mut Greedy, Greedier);
     assert_eq!(tokens, plain_long(&mut Greedy));
-    let grown: Vec<usize> = steps.iter().map(|s| s.drafted).take(5).collect();
-    assert_eq!(grown, [8, 16, 32, 64, WIDE]);
+    let grown: Vec<usize> = steps.iter().map(|s| s.drafted).take(6).collect();
+    assert_eq!(grown, [0, 8, 16, 32, 64, WIDE]);
     assert!(steps.iter().all(|s| s.tokens == s.drafted + 1));
 }
 
