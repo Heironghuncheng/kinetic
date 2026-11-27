@@ -106,6 +106,8 @@ pub struct Kernels {
     pub(crate) tensor_cores: bool,
     /// See [`Kernels::half_products`].
     pub(crate) half: bool,
+    /// See [`Kernels::set_exact_rows`].
+    pub(crate) exact_rows: std::cell::Cell<bool>,
 }
 
 impl Kernels {
@@ -189,6 +191,7 @@ impl Kernels {
                 .transpose()?,
             unpacked: std::cell::RefCell::new(Vec::new()),
             unpack_limit: std::cell::Cell::new(usize::MAX),
+            exact_rows: std::cell::Cell::new(false),
             quantize_q8: module.function(c"quantize_q8")?,
             fold_rows: module.function(c"fold_rows")?,
             unfold_rows: module.function(c"unfold_rows")?,
@@ -259,6 +262,14 @@ impl Kernels {
     /// chunks on the CUDA cores.
     pub fn large_batches(&self) -> bool {
         self.attn_flash.is_some() || !self.tensor_cores
+    }
+
+    /// While on, weight products of any batch run on the GEMV, in launches
+    /// of [`MAX_BATCH`] inputs, so each input keeps the bits it has alone
+    /// instead of taking the matrix product's for batches past that. A pass
+    /// that verifies a long draft turns it on.
+    pub fn set_exact_rows(&self, on: bool) {
+        self.exact_rows.set(on);
     }
 
     /// Whether the device has the tensor-core instructions the kernels use;

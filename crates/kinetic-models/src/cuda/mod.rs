@@ -96,6 +96,10 @@ pub const PREFILL_GRID: usize = 32;
 /// [`MAX_BATCH`], where the larger kernels become the faster choice.
 const PREFILL_FROM: usize = 2 * MAX_BATCH;
 
+/// Most rows a pass that verifies a draft runs on paths that run it whole;
+/// see [`CudaModel::verify_rows`].
+const WIDE_VERIFY: usize = 128;
+
 /// The device, its kernels and the stream all work is queued on.
 struct Gpu {
     ctx: Rc<Context>,
@@ -788,9 +792,24 @@ impl<'m> CudaModel<'m> {
         Ok((out.greedy, out.hidden))
     }
 
+    /// Most tokens that may run between a [`CudaModel::checkpoint`] and its
+    /// rollback, and so the most rows a pass that verifies a draft takes.
+    ///
+    /// Paths whose every kernel gives a row the bits it has alone at any
+    /// width run such a pass whole, its routed experts once for all rows,
+    /// with weight products kept in GEMV launches of [`MAX_BATCH`]: a
+    /// network on one device, every layer on it. Others run it in steps of
+    /// [`MAX_BATCH`] and take no more.
+    pub fn verify_rows(&self) -> usize {
+        match self.network.is_some() && self.front == 0 && self.shards.is_empty() {
+            true => wide_verify(self.batch_rows()),
+            false => MAX_BATCH,
+        }
+    }
+
     /// Marks the current length so a later [`CudaModel::rollback`] can
-    /// return to any point after it. At most [`MAX_BATCH`] tokens may run
-    /// between the two.
+    /// return to any point after it. At most [`CudaModel::verify_rows`]
+    /// tokens may run between the two.
     pub fn checkpoint(&self, state: &mut CudaState) -> kinetic_cuda::Result<()> {
         if let Some(start) = state.checkpoint {
             self.rollback(state, state.pos - start)?;
@@ -906,11 +925,14 @@ impl<'m> CudaModel<'m> {
             )));
         }
         let since = state.checkpoint.map(|start| state.pos - start);
-        if since.is_some_and(|s| s + tokens.len() > MAX_BATCH) {
+        let most = self.verify_rows();
+        if since.is_some_and(|s| s + tokens.len() > most) {
             return Err(shape(format!(
-                "more than {MAX_BATCH} tokens between a checkpoint and its rollback"
+                "more than {most} tokens between a checkpoint and its rollback"
             )));
         }
+        let whole = since.is_some() && most > MAX_BATCH;
+        let _exact = whole.then(|| ExactRows::on(&self.gpu.kernels));
 
         let d = self.n_embd;
         let mut out = Output {
@@ -928,7 +950,11 @@ impl<'m> CudaModel<'m> {
             s.reset()?;
         }
         let mut done = 0;
-        for chunk in batches(tokens, state.pos, since.is_none(), self.batch_rows()) {
+        let chunks: Vec<&[u32]> = match whole {
+            true => vec![tokens],
+            false => batches(tokens, state.pos, since.is_none(), self.batch_rows()).collect(),
+        };
+        for chunk in chunks {
             let n = chunk.len();
             let last = done + n == tokens.len();
             let head = match (all_rows, last) {
@@ -1476,6 +1502,29 @@ fn batches(tokens: &[u32], pos: usize, prefill: bool, rows: usize) -> impl Itera
     };
     let (head, tail) = tokens.split_at(head);
     head.chunks(rows).chain(tail.chunks(MAX_BATCH))
+}
+
+/// Most rows a pass that verifies a draft runs whole on a device that runs
+/// batches of up to `rows`.
+fn wide_verify(rows: usize) -> usize {
+    WIDE_VERIFY.min(rows)
+}
+
+/// Keeps weight products in GEMV launches until dropped; see
+/// [`Kernels::set_exact_rows`].
+struct ExactRows<'k>(&'k Kernels);
+
+impl<'k> ExactRows<'k> {
+    fn on(kernels: &'k Kernels) -> Self {
+        kernels.set_exact_rows(true);
+        ExactRows(kernels)
+    }
+}
+
+impl Drop for ExactRows<'_> {
+    fn drop(&mut self) {
+        self.0.set_exact_rows(false);
+    }
 }
 
 /// `rows` in runs of at most [`MAX_BATCH`].

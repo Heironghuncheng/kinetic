@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod wide;
+
 const VOCAB: usize = 16;
 
 struct Toy;
