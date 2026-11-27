@@ -54,6 +54,7 @@ use kinetic_cuda::{
 use crate::blocks::{Folding, Moe};
 use crate::convoy::Convoy;
 use crate::model::Mark;
+use crate::offload::budget::{BudgetSearch, MOST_PLACEMENTS};
 use crate::{Forward, LoadError, Model};
 use expand::{Expanded, Use};
 use experts::{CudaExperts, ExpertWork, Offload};
@@ -71,9 +72,6 @@ pub use host::CudaRunner;
 pub use lanes::{Ran, Run};
 pub use mtp::CudaMtpState;
 pub use split::Placement;
-
-/// Least growth of the expert cache worth placing it again for.
-const GROW_STEP: usize = 64 << 20;
 
 /// Most tokens one prefill pass runs on GPUs with tensor cores; a state
 /// keeps buffers for this many.
@@ -544,11 +542,12 @@ impl<'m> CudaModel<'m> {
         let state_bytes = state.work.size_bytes().max(before.saturating_sub(after));
         drop(state);
         let (free, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
-        let mut budget = free.saturating_sub(state_bytes + self.gpu.reserve);
         let need = state_bytes + self.gpu.reserve;
-        // Largest budget seen to leave the room needed, smallest seen not to.
-        let (mut fit, mut over) = (0, usize::MAX);
+        let mut budget = free.saturating_sub(need);
+        let mut search = BudgetSearch::new(need);
+        let mut placed = 0;
         loop {
+            placed += 1;
             let off = Offload::new(
                 &self.gpu,
                 moes.clone(),
@@ -559,34 +558,26 @@ impl<'m> CudaModel<'m> {
             )?;
             // the desktop may have taken memory meanwhile: check what is left
             let (left, _) = self.gpu.ctx.memory_info().map_err(cuda_error)?;
-            // Large allocations can take more than they hold, so what is
-            // left need not move with the budget: the next one is between
-            // the two seen, and never past what was left.
-            let next = if left >= need {
-                fit = budget;
-                (budget + (left - need)).min(budget + (over - budget) / 2)
-            } else {
-                over = budget;
-                budget
-                    .saturating_sub(need - left)
-                    .max(fit + (budget - fit) / 2)
-            };
-            if (left >= need && next < budget + GROW_STEP) || budget == 0 {
-                eprintln!(
-                    "kinetic: the model takes {} MiB of the GPU with one sequence; {} MiB stay free",
-                    (self.weight_bytes() + state_bytes + free.saturating_sub(left)) >> 20,
-                    left.saturating_sub(state_bytes) >> 20
-                );
-                return Ok(off);
+            match search.next(budget, left, off.plan.cache_bytes()) {
+                Some(next) if placed < MOST_PLACEMENTS => {
+                    drop(off);
+                    if left < need && search.short() {
+                        eprintln!(
+                            "kinetic: the GPU has {} MiB less free than planned; the expert cache shrinks to fit",
+                            (need - left) >> 20
+                        );
+                    }
+                    budget = next;
+                }
+                _ => {
+                    eprintln!(
+                        "kinetic: the model takes {} MiB of the GPU with one sequence; {} MiB stay free",
+                        (self.weight_bytes() + state_bytes + free.saturating_sub(left)) >> 20,
+                        left.saturating_sub(state_bytes) >> 20
+                    );
+                    return Ok(off);
+                }
             }
-            drop(off);
-            if left < need && fit == 0 {
-                eprintln!(
-                    "kinetic: the GPU has {} MiB less free than planned; the expert cache shrinks to fit",
-                    (need - left) >> 20
-                );
-            }
-            budget = next;
         }
     }
 
