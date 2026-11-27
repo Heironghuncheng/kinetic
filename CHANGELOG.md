@@ -26,7 +26,7 @@ home screen in the terminal.
   the CPU use AVX2 kernels on every core and give the GPU's bits, so where
   an expert runs never changes the answer. On a 6 GB NVIDIA GPU it generates
   {{TG128}} tokens per second where llama.cpp gives {{LLAMA_TG128}} on the
-  same file.
+  same file, and repeated edits with long drafts reach {{EDIT_REPEATED}}.
 - Inkling 2 Mini through Vulkan, on AMD GPUs among others, in both layouts;
   see Devices.
 - Inkling 2 Mini on the CPU, in both published layouts: ggml-org's looped
@@ -144,12 +144,13 @@ home screen in the terminal.
 
 ### Speed
 
-- RAD-1 no longer makes decoding slower on a model split between the GPU and
-  the CPU, by layers or by experts. It times its steps by the rows each pass
-  runs, on the model as it is placed, and measures how far drafts come true;
-  a draft is verified only up to the length that gives the most tokens per
-  second expected, and not at all when a plain step gives as many. The
-  output does not change.
+- RAD-1 cuts each draft to the length that pays at the step costs it
+  measures on the model as it is placed. It times its steps by the rows
+  each pass runs and measures how far drafts come true; a draft is verified
+  only up to the length that gives the most tokens per second expected, and
+  not at all when a plain step gives as many. On a model split between the
+  GPU and the CPU, by layers or by experts, where wide passes cost more, it
+  drafts less. The output does not change.
 - RAD-1 on CUDA: when Inkling 2 runs with all its layers on one GPU, a draft
   of up to 127 tokens is verified in one pass, its experts run once for the
   whole pass, and drafts grow to fill it while they keep coming true. Every
@@ -309,6 +310,8 @@ home screen in the terminal.
   none for them.
 - `--gpus` spreads dense models only; mixture-of-experts models and Gemma 4
   E2B/E4B stay on one GPU.
+- `kinetic bench -d 8192` on a GPU with 6 GB can stop with "no room on the
+  GPU for another sequence".
 
 Thanks to @brianporeilly, @jasonkneen, @yagaltd, @Heironghuncheng and
 @orphytype for their pull requests, and to everyone who reported what broke.
