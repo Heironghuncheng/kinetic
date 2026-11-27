@@ -45,6 +45,21 @@ impl CudaMixer {
                 }
                 out
             }
+            (CudaMixer::Relative(r), LayerState::Relative(s)) => {
+                let (k, v) = save_cache(&s.kv, r.weights.window(), pos)?;
+                let mut out = vec![k, v];
+                for ((channels, taps), conv) in r.weights.convs().into_iter().zip(&s.convs) {
+                    let host = conv.save()?;
+                    out.push(ring_to_past(
+                        &host.ring,
+                        host.ring_rows,
+                        channels,
+                        taps,
+                        pos,
+                    ));
+                }
+                out
+            }
             _ => unreachable!("state does not belong to this mixer"),
         })
     }
@@ -93,6 +108,14 @@ impl CudaMixer {
                     rest = m.load(s, pos, rest)?;
                 }
                 Ok(rest)
+            }
+            (CudaMixer::Relative(r), LayerState::Relative(s)) => {
+                load_cache(&mut s.kv, r.weights.window(), pos, bufs[0], bufs[1])?;
+                let convs = r.weights.convs().into_iter().zip(&mut s.convs);
+                for ((shape, conv), past) in convs.zip(&bufs[2..6]) {
+                    conv.load(&ring(conv.ring_rows(), shape, past))?;
+                }
+                Ok(&bufs[6..])
             }
             _ => unreachable!("state does not belong to this mixer"),
         }
@@ -150,6 +173,7 @@ pub(super) fn clear_layer(state: &mut LayerState, stream: &Stream) -> kinetic_cu
         LayerState::ShortConv(s) => s.clear(stream),
         LayerState::Mamba2(s) => s.clear(stream),
         LayerState::Parallel(ss) => ss.iter_mut().try_for_each(|s| clear_layer(s, stream)),
+        LayerState::Relative(s) => s.convs.iter_mut().try_for_each(|c| c.clear(stream)),
     }
 }
 
@@ -218,10 +242,16 @@ impl CudaModel<'_> {
             .try_for_each(|(gpu, _, s)| clear_layer(s, &gpu.stream))
     }
 
+    /// The longest length up to `len` that [`CudaModel::truncate`] returns
+    /// `state` to, as [`Model::reach`] gives it for a host state.
+    pub fn reach(&self, model: &Model, state: &CudaState, len: usize) -> usize {
+        model.reach_marks(state.pos, &state.marks, len)
+    }
+
     /// Cuts `state` back to `len` tokens on the device as [`Model::truncate`]
-    /// cuts a host state: to the length [`Model::reach`] gives, the layers
-    /// that cannot cut back in place restored from the mark there. Returns
-    /// the length reached.
+    /// cuts a host state: to the length [`CudaModel::reach`] gives, the
+    /// layers that cannot cut back in place restored from the mark there.
+    /// Returns the length reached.
     pub fn truncate(
         &self,
         model: &Model,
@@ -229,21 +259,7 @@ impl CudaModel<'_> {
         len: usize,
     ) -> kinetic_cuda::Result<usize> {
         assert!(state.checkpoint.is_none(), "truncate inside a checkpoint");
-        let len = len.min(state.pos);
-        let in_place = model
-            .layers
-            .iter()
-            .all(|l| l.mixer.truncates_in_place(state.pos));
-        let to = match len == state.pos || in_place {
-            true => len,
-            false => state
-                .marks
-                .iter()
-                .map(|m| m.pos)
-                .filter(|&p| p <= len)
-                .max()
-                .unwrap_or(0),
-        };
+        let to = self.reach(model, state, len);
         if to == state.pos {
             return Ok(to);
         }

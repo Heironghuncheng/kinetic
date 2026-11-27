@@ -1,7 +1,8 @@
 //! Compiles the WGSL kernels in `shaders/` to SPIR-V with naga, so building
 //! needs no Vulkan SDK. Each kernel is its constants followed by the
 //! concatenation of its source parts; `src/kernels.rs` embeds the resulting
-//! `<name>.spv` files.
+//! `<name>.spv` files, and the `<name>_64.spv` built from them for devices
+//! whose subgroups are 64 wide.
 
 use std::env;
 use std::fs;
@@ -20,12 +21,39 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
     ("gemv_q4_k", "", &["gemv", "k4", "gemv_q4_k"]),
     ("gemv_q5_k", "", &["gemv", "k4", "gemv_q5_k"]),
     ("gemv_q6_k", "", &["gemv", "gemv_q6_k"]),
+    ("gemv_iq4_nl", "", &["gemv", "gemv_iq4_nl"]),
+    ("gemv_nvfp4", "", &["gemv", "gemv_nvfp4"]),
+    ("gemv_iq3_xxs", "", &["gemv", "iq", "gemv_iq3_xxs"]),
+    ("gemv_iq2_xs", "", &["gemv", "iq", "gemv_iq2_xs"]),
+    ("gemv_q3_k", "", &["gemv", "iq", "gemv_q3_k"]),
+    ("gemv_iq3_s", "", &["gemv", "iq", "gemv_iq3_s"]),
+    ("gemv_iq2_s", "", &["gemv", "iq", "gemv_iq2_s"]),
+    ("experts_f32", "", &["experts", "gemv_f32"]),
+    ("experts_f16", "", &["experts", "gemv_f16"]),
+    ("experts_q8_0", "", &["experts", "gemv_q8_0"]),
+    ("experts_q4_k", "", &["experts", "k4", "gemv_q4_k"]),
+    ("experts_q5_k", "", &["experts", "k4", "gemv_q5_k"]),
+    ("experts_q6_k", "", &["experts", "gemv_q6_k"]),
+    ("experts_iq4_nl", "", &["experts", "gemv_iq4_nl"]),
+    ("experts_nvfp4", "", &["experts", "gemv_nvfp4"]),
+    ("experts_iq3_xxs", "", &["experts", "iq", "gemv_iq3_xxs"]),
+    ("experts_iq2_xs", "", &["experts", "iq", "gemv_iq2_xs"]),
+    ("experts_q3_k", "", &["experts", "iq", "gemv_q3_k"]),
+    ("experts_iq3_s", "", &["experts", "iq", "gemv_iq3_s"]),
+    ("experts_iq2_s", "", &["experts", "iq", "gemv_iq2_s"]),
+    ("route", "", &["route"]),
+    ("mix_experts", "", &["mix_experts"]),
     ("quantize_q8", "", &["quantize_q8"]),
     ("read_sum", "", &["read_sum"]),
     ("norm", "", &["norm", "put_q8"]),
     ("swiglu", "", &["swiglu", "put_q8"]),
     ("argmax", "", &["argmax"]),
     ("rope", "", &["rope"]),
+    ("relative", "", &["relative"]),
+    ("residual_conv", "", &["residual_conv"]),
+    ("depth", "", &["depth"]),
+    ("join_norm", "", &["join_norm", "put_q8"]),
+    ("control", "", &["control"]),
     ("short_conv", "", &["short_conv", "put_q8"]),
     ("delta_conv", "", &["delta_conv"]),
     ("delta_rule", "", &["delta_rule"]),
@@ -55,10 +83,22 @@ const MATRIX_KERNELS: &[(&str, &str, &[&str])] = &[
     ("mm_q6_k", "", &["mm", "mm_q6_k"]),
 ];
 
-/// Kernels that take one part more on Metal, whose GEMV kernels are
-/// written differently: there an invocation takes a tile of four rows and
-/// the block sums are floats, which is faster on a Mac's GPU and slower on
-/// the others. A part with a file in `shaders/metal` is read from there.
+/// The GEMV kernels written differently for Metal: there an invocation
+/// takes a tile of four rows and the block sums are floats, which is faster
+/// on a Mac's GPU and slower on the others. A part with a file in
+/// `shaders/metal` is read from there. The other GEMV kernels, as the
+/// expert kernels, take one row per subgroup on every driver.
+#[cfg(feature = "metal")]
+const METAL_GEMV: &[&str] = &[
+    "gemv_f32",
+    "gemv_f16",
+    "gemv_q8_0",
+    "gemv_q4_k",
+    "gemv_q5_k",
+    "gemv_q6_k",
+];
+
+/// Metal GEMV kernels that take one part more.
 #[cfg(feature = "metal")]
 const METAL_PARTS: &[(&str, &str)] = &[
     ("gemv_f32", "gemv_dots"),
@@ -103,14 +143,27 @@ fn main() {
             .expect("write SPIR-V");
     }
     for &(name, constants, parts) in KERNELS {
-        let (module, info) = parse(name, &source(constants, parts, &["shaders"]));
+        let vulkan = source(constants, parts, &["shaders"]);
+        let (module, info) = parse(name, &vulkan);
         fs::write(out.join(format!("{name}.spv")), spirv(name, &module, &info))
             .expect("write SPIR-V");
+        let (module, info) = parse_wide(name, &wide_source(name, &vulkan));
+        fs::write(
+            out.join(format!("{name}_64.spv")),
+            spirv(name, &module, &info),
+        )
+        .expect("write SPIR-V");
         #[cfg(feature = "metal")]
         if metal {
             let mut parts = parts.to_vec();
             parts.extend(METAL_PARTS.iter().filter(|p| p.0 == name).map(|p| p.1));
-            let source = source(constants, &parts, &["shaders/metal", "shaders"]);
+            let one_row = name.starts_with("experts")
+                || (name.starts_with("gemv") && !METAL_GEMV.contains(&name));
+            let dirs: &[&str] = match one_row {
+                true => &["shaders"],
+                false => &["shaders/metal", "shaders"],
+            };
+            let source = source(constants, &parts, dirs);
             let (module, info) = parse(name, &source);
             fs::write(out.join(format!("{name}.metal")), msl(name, &module, &info))
                 .expect("write Metal source");
@@ -139,10 +192,138 @@ fn parse_with(
 ) -> (naga::Module, naga::valid::ModuleInfo) {
     let module = naga::front::wgsl::parse_str(source)
         .unwrap_or_else(|e| panic!("{name}:\n{}", e.emit_to_string(source)));
-    let info = Validator::new(ValidationFlags::all(), capabilities)
-        .validate(&module)
-        .unwrap_or_else(|e| panic!("{name}:\n{}", e.emit_to_string(source)));
+    let info = validate(name, source, &module, capabilities);
     (module, info)
+}
+
+fn validate(
+    name: &str,
+    source: &str,
+    module: &naga::Module,
+    capabilities: Capabilities,
+) -> naga::valid::ModuleInfo {
+    Validator::new(ValidationFlags::all(), capabilities)
+        .validate(module)
+        .unwrap_or_else(|e| panic!("{name}:\n{}", e.emit_to_string(source)))
+}
+
+/// The source of a kernel for subgroups of 64: the helpers of
+/// `subgroup_64.wgsl` first, then the kernel with `slot` and `lane` naming
+/// a half of a subgroup and a lane in that half.
+fn wide_source(name: &str, source: &str) -> String {
+    const SLOT: &str = "@builtin(subgroup_id) slot: u32,";
+    const LANE: &str = "@builtin(subgroup_invocation_id) lane: u32,";
+    let mut source = source.to_string();
+    let mut lets = String::new();
+    if source.contains(LANE) {
+        source = source.replace(LANE, "@builtin(subgroup_invocation_id) wide_lane: u32,");
+        lets += "\n    let lane = wide_lane % 32u;";
+        if source.contains(SLOT) {
+            source = source.replace(SLOT, "@builtin(subgroup_id) wide_group: u32,");
+            lets += "\n    let slot = 2u * wide_group + wide_lane / 32u;";
+        }
+    }
+    assert!(
+        source.matches("@builtin(subgroup").count() == lets.matches("let ").count(),
+        "{name}: a subgroup builtin is not declared as `slot` and `lane`"
+    );
+    let body = source
+        .find("fn main(")
+        .and_then(|at| source[at..].find(") {").map(|end| at + end + 3))
+        .unwrap_or_else(|| panic!("{name}: no fn main"));
+    source.insert_str(body, &lets);
+    let helpers = fs::read_to_string("shaders/subgroup_64.wgsl").expect("read subgroup_64.wgsl");
+    format!("{helpers}\n{source}")
+}
+
+/// Parses and validates a [`wide_source`], its reductions halved.
+fn parse_wide(name: &str, source: &str) -> (naga::Module, naga::valid::ModuleInfo) {
+    let (mut module, info) = parse(name, source);
+    halve_reductions(name, &mut module, &info);
+    let info = validate(name, source, &module, CAPABILITIES);
+    (module, info)
+}
+
+/// Replaces each subgroup reduction with a call to the helper of
+/// `subgroup_64.wgsl` for its operation and type.
+fn halve_reductions(name: &str, module: &mut naga::Module, info: &naga::valid::ModuleInfo) {
+    use naga::{CollectiveOperation, Expression, ScalarKind, Statement, SubgroupOperation};
+    let helpers: Vec<_> = module
+        .functions
+        .iter()
+        .filter_map(|(h, f)| Some((f.name.clone()?, h)))
+        .collect();
+    let types = &module.types;
+    let functions = module.functions.iter_mut().map(|(h, f)| (f, &info[h]));
+    let entries = module
+        .entry_points
+        .iter_mut()
+        .enumerate()
+        .map(|(i, e)| (&mut e.function, info.get_entry_point(i)));
+    for (function, function_info) in functions.chain(entries) {
+        let expressions = &mut function.expressions;
+        each_statement(&mut function.body, &mut |statement| {
+            let Statement::SubgroupCollectiveOperation {
+                op,
+                collective_op,
+                argument,
+                result,
+            } = *statement
+            else {
+                return;
+            };
+            let op = match (op, collective_op) {
+                (SubgroupOperation::Add, CollectiveOperation::Reduce) => "add",
+                (SubgroupOperation::Max, CollectiveOperation::Reduce) => "max",
+                (SubgroupOperation::Min, CollectiveOperation::Reduce) => "min",
+                _ => panic!("{name}: no 64-wide form of subgroup {op:?} {collective_op:?}"),
+            };
+            let ty = match function_info[argument].ty.inner_with(types).scalar() {
+                Some(s) if s.width == 4 && s.kind == ScalarKind::Float => "f32",
+                Some(s) if s.width == 4 && s.kind == ScalarKind::Sint => "i32",
+                Some(s) if s.width == 4 && s.kind == ScalarKind::Uint => "u32",
+                other => panic!("{name}: no 64-wide subgroup {op} of {other:?}"),
+            };
+            let helper = format!("half_{op}_{ty}");
+            let function = helpers
+                .iter()
+                .find(|(n, _)| *n == helper)
+                .unwrap_or_else(|| panic!("{name}: subgroup_64.wgsl has no {helper}"))
+                .1;
+            expressions[result] = Expression::CallResult(function);
+            *statement = Statement::Call {
+                function,
+                arguments: vec![argument],
+                result: Some(result),
+            };
+        });
+    }
+}
+
+/// Calls `visit` on every statement of `block` that holds no block itself.
+fn each_statement(block: &mut naga::Block, visit: &mut impl FnMut(&mut naga::Statement)) {
+    use naga::Statement;
+    for statement in block.iter_mut() {
+        match statement {
+            Statement::Block(inner) => each_statement(inner, visit),
+            Statement::If { accept, reject, .. } => {
+                each_statement(accept, visit);
+                each_statement(reject, visit);
+            }
+            Statement::Switch { cases, .. } => {
+                for case in cases {
+                    each_statement(&mut case.body, visit);
+                }
+            }
+            Statement::Loop {
+                body, continuing, ..
+            } => {
+                each_statement(body, visit);
+                each_statement(continuing, visit);
+            }
+            _ => visit(statement),
+        }
+    }
 }
 
 /// The kernel as a Metal shader. Storage buffer `i` of set 0 is Metal

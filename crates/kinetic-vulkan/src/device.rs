@@ -98,6 +98,10 @@ impl Device {
         }))
     }
 
+    pub(crate) fn physical(&self) -> &PhysicalDevice {
+        &self.physical
+    }
+
     pub fn info(&self) -> &DeviceInfo {
         self.physical.info()
     }

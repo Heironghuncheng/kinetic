@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod wide;
+
 const VOCAB: usize = 16;
 
 struct Toy;
@@ -189,6 +191,14 @@ fn speculative<P: Policy<Toy>, D: Drafter<Toy>>(
     (context.split_off(PROMPT.len()), passes, state.trees)
 }
 
+/// A decoder for which a pass costs the same at any width, so it drafts as
+/// far as its drafts reach.
+fn drafting<D>(drafter: D) -> Decoder<D> {
+    let mut decoder = Decoder::new(drafter);
+    decoder.costs = Costs::fixed(&[1.0]);
+    decoder
+}
+
 fn drafters() -> Vec<Box<dyn Drafter<Toy>>> {
     vec![
         Box::new(Counting),
@@ -222,7 +232,7 @@ fn sampling(seed: u64) -> Sampling {
 fn greedy_output_is_plain_greedy() {
     let expected = plain(&mut Greedy);
     for drafter in drafters() {
-        let mut decoder = Decoder::new(drafter);
+        let mut decoder = drafting(drafter);
         assert_eq!(speculative(&mut Greedy, &mut decoder).0, expected);
     }
 }
@@ -233,7 +243,7 @@ fn seeded_sampling_is_plain_sampling() {
     for seed in 0..64 {
         let expected = plain(&mut Sampler::new(sampling(seed)));
         for drafter in drafters() {
-            let mut decoder = Decoder::new(drafter);
+            let mut decoder = drafting(drafter);
             let (tokens, passes, _) = speculative(&mut Sampler::new(sampling(seed)), &mut decoder);
             assert_eq!(tokens, expected, "seed {seed}");
             saved += N - passes;
@@ -248,7 +258,7 @@ fn ensemble_scores_follow_the_hits() {
         Box::new(Zeros) as Box<dyn Drafter<Toy>>,
         Box::new(Counting),
     ]);
-    let mut decoder = Decoder::new(ensemble);
+    let mut decoder = drafting(ensemble);
     let (tokens, _, _) = speculative(&mut Greedy, &mut decoder);
     assert_eq!(tokens, plain(&mut Greedy));
     let scores = decoder.drafter.scores();
@@ -261,7 +271,7 @@ fn ensemble_scores_follow_the_hits() {
 #[test]
 fn trees_are_verified_losslessly() {
     let decoder = |row_cost| {
-        let mut decoder = Decoder::new(Ensemble::new(vec![
+        let mut decoder = drafting(Ensemble::new(vec![
             Box::new(Counting) as Box<dyn Drafter<Toy>>,
             Box::new(Greedier),
             Box::new(Zeros),
@@ -295,7 +305,7 @@ fn trees_are_verified_losslessly() {
 
 #[test]
 fn a_stop_token_ends_the_step() {
-    let mut decoder = Decoder::new(Counting);
+    let mut decoder = drafting(Counting);
     let mut state = ToyState::default();
     let mut context = PROMPT.to_vec();
     decoder.prefill(&Toy, &mut Greedy, &mut state, &context, 0);
@@ -376,10 +386,63 @@ fn every_sampler_is_exact_under_drafting() {
             for drafter in drafters() {
                 let drafted = Logprobs::new(3);
                 let mut sampler = Sampler::new(params.clone()).with_logprobs(drafted.clone());
-                let (tokens, _, _) = speculative(&mut sampler, &mut Decoder::new(drafter));
+                let (tokens, _, _) = speculative(&mut sampler, &mut drafting(drafter));
                 assert_eq!(tokens, expected, "{params:?}");
                 assert_eq!(drafted.range(0, N), log.range(0, N), "{params:?}");
             }
         }
+    }
+}
+
+/// Where a pass costs as much as running its rows one by one, no draft
+/// pays and every step runs one token; where rows past the third get dear,
+/// drafts stop at two tokens. The output is plain greedy decoding either
+/// way, and with costs measured as decoding goes.
+#[test]
+fn drafts_go_only_as_far_as_they_pay() {
+    let expected = plain(&mut Greedy);
+    let linear: Vec<f32> = (2..=N).map(|r| r as f32).collect();
+    for drafter in drafters() {
+        let mut decoder = Decoder::new(drafter);
+        decoder.costs = Costs::fixed(&linear);
+        assert_eq!(
+            speculative(&mut Greedy, &mut decoder),
+            (expected.clone(), N, 0)
+        );
+    }
+
+    let mut decoder = Decoder::new(Counting);
+    decoder.costs = Costs::fixed(&[1.0, 1.0, 10.0]);
+    let mut state = ToyState::default();
+    let mut context = PROMPT.to_vec();
+    decoder.prefill(&Toy, &mut Greedy, &mut state, &context, 0);
+    let mut longest = 0;
+    while context.len() - PROMPT.len() < N {
+        let limit = N - (context.len() - PROMPT.len());
+        let step = decoder.step(&Toy, &mut Greedy, &mut state, &mut context, limit, |_| {
+            false
+        });
+        longest = longest.max(step.drafted);
+    }
+    assert_eq!(
+        (context.split_off(PROMPT.len()), longest),
+        (expected.clone(), 2)
+    );
+
+    for drafter in drafters() {
+        let mut decoder = Decoder::new(drafter);
+        assert_eq!(speculative(&mut Greedy, &mut decoder).0, expected);
+    }
+}
+
+/// Drafts that never come true are judged against the output and never
+/// verified, so every step is a plain one, even where rows are free.
+#[test]
+fn drafts_that_never_pay_cost_no_pass() {
+    for ratio in [1.0, 1.3] {
+        let mut decoder = Decoder::new(Zeros);
+        decoder.costs = Costs::fixed(&[ratio]);
+        let (tokens, passes, _) = speculative(&mut Greedy, &mut decoder);
+        assert_eq!((tokens, passes), (plain(&mut Greedy), N), "ratio {ratio}");
     }
 }

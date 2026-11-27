@@ -32,7 +32,7 @@ impl VulkanMtp {
             eh_proj: gpu.matrix(&m.eh_proj)?,
             embd_norm: m.embd_norm.clone(),
             hidden_norm: m.hidden_norm.clone(),
-            layer: VulkanLayer::upload(gpu, &m.layer, ropes)?,
+            layer: VulkanLayer::upload(gpu, &m.layer, ropes, true)?,
             head_norm: gpu.vector(&m.head_norm)?,
             draft_head: RefCell::new(None),
         })
@@ -85,7 +85,7 @@ impl VulkanModel<'_> {
         let (dev, d) = (&self.gpu.device, self.n_embd);
         let batch = Batch::new(dev, MAX_BATCH, 1, self.context, self.ropes.words())?;
         let layers = std::slice::from_ref(&mtp.layer);
-        let work = Work::new(&self.gpu, layers, d, batch, self.n_vocab())?;
+        let work = Work::new(&self.gpu, layers, None, d, batch, self.n_vocab())?;
         let layer = mtp.layer.new_state(dev, self.context, MAX_BATCH)?;
         let joined = GemvInput::batch(dev, 2 * d, MAX_BATCH)?;
         let joined_host = HostBuffer::new(dev, MAX_BATCH * 2 * d)?;
@@ -131,13 +131,16 @@ impl VulkanModel<'_> {
             &w.batch,
             &w.x,
             None,
-            &mtp.layer.mixer_norm,
+            mtp.layer
+                .mixer_norm
+                .as_ref()
+                .expect("layers of a stream have input norms"),
             self.eps,
             &w.h,
             &mut c,
         )?;
         mtp.layer
-            .record(&self.gpu, w, layer, &mtp.head_norm, self.eps, &mut c)?;
+            .record(&self.gpu, w, layer, &mtp.head_norm, self.eps, None, &mut c)?;
         c.download(w.h.values(), 0, &w.hidden, 0, w.hidden.len())?;
         c.finish()
     }
@@ -232,7 +235,7 @@ impl VulkanModel<'_> {
             offset: 0,
         };
         k.gemv_rows(&head, &w.h, &w.logits, out, Rows::Head, &w.batch, &mut c)?;
-        k.argmax(&w.batch, &w.logits, vocab, &w.best, &mut c)?;
+        k.argmax(&w.batch, &w.logits, vocab, self.logit_cap, &w.best, &mut c)?;
         c.download(&w.best, 0, &w.greedy, 0, 1)?;
         c.finish()
     }

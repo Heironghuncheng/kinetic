@@ -1,9 +1,15 @@
 // The gated feed-forward activation of each token row, written as a GEMV
-// input: out = silu(gate) * up, where a row of `gu` holds the `len` gate
-// values followed by the `len` up values.
+// input: out = silu(gate) * up, or with `beta` above zero the SiTU product
+// beta tanh(gate / beta) sigmoid(gate) * up, where `up` first becomes
+// linear tanh(up / linear) when `linear` is above zero. A row of `gu` holds
+// the `len` gate values followed by the `len` up values. A token has
+// `per_token` rows: one, or one per expert it runs.
 
 struct Shape {
     len: u32,
+    per_token: u32,
+    beta: f32,
+    linear: f32,
 }
 
 var<immediate> shape: Shape;
@@ -23,10 +29,17 @@ fn main(
     let i = group.x * 256u + tid;
     let row = group.y;
     // `len` is a multiple of 32, so subgroups leave whole.
-    if row >= batch[0] || i >= shape.len {
+    if row >= batch[0] * shape.per_token || i >= shape.len {
         return;
     }
     let g = gu[2u * row * shape.len + i];
-    let u = gu[(2u * row + 1u) * shape.len + i];
-    put_q8(row * shape.len + i, g / (1.0 + exp(-g)) * u, lane);
+    var u = gu[(2u * row + 1u) * shape.len + i];
+    var v = g / (1.0 + exp(-g)) * u;
+    if shape.beta > 0.0 {
+        if shape.linear > 0.0 {
+            u = shape.linear * tanh(u / shape.linear);
+        }
+        v = shape.beta * tanh(g / shape.beta) / (1.0 + exp(-g)) * u;
+    }
+    put_q8(row * shape.len + i, v, lane);
 }

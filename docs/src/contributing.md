@@ -46,7 +46,8 @@ are a good place to start.
   expected; tables and grids of a format are data, and their source goes
   into `NOTICE`.
 - **No network.** Kinetic never connects to the network, except when you
-  run `kinetic pull`. Nothing else may open a connection.
+  run `kinetic pull` or `kinetic update`, download with `-hf`, or turn on
+  the daily update check. Nothing else may open a connection.
 - **Small files with one job**, doc comments on public items, comments only
   where the reason is not obvious, `unsafe` only at FFI, SIMD and kernel
   boundaries with a `// SAFETY:` comment.

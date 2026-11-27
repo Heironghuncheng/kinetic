@@ -10,7 +10,6 @@
 
 use kinetic_cuda::KvType;
 
-use super::experts::DEVICE_RESERVE;
 use super::layer::CudaLayer;
 use super::scratch::Work;
 use super::{cuda_error, CudaModel, Gpu};
@@ -35,6 +34,12 @@ pub struct Placement {
     /// them and so changes outputs.
     pub cache_k: KvType,
     pub cache_v: KvType,
+    /// Most device bytes the cache of routed experts may take, besides the
+    /// slots that carry a batch's uncached experts over.
+    pub expert_cache: Option<usize>,
+    /// Device bytes to leave free on each device, in place of
+    /// [`device_reserve`](crate::offload::plan::device_reserve).
+    pub device_reserve: Option<usize>,
     /// The CUDA devices to spread the layers over, by ordinal, in the order
     /// the layers run; the first also holds the embeddings and the output
     /// head. Empty means device 0 alone. A device may be named twice, which
@@ -128,7 +133,7 @@ fn upload_layers(
     let mut largest = 0;
     for l in layers.iter().rev().take(most) {
         let before = free()?;
-        if before < DEVICE_RESERVE + largest || start.saturating_sub(before) + largest > cap {
+        if before < gpu.reserve + largest || start.saturating_sub(before) + largest > cap {
             break;
         }
         match CudaLayer::upload(gpu, l, None, model.eps) {
@@ -156,7 +161,7 @@ fn upload_layers(
             Ok(work) => {
                 let used = start.saturating_sub(free()?);
                 drop(work);
-                used <= cap && free()? >= DEVICE_RESERVE
+                used <= cap && free()? >= gpu.reserve
             }
             Err(_) => false,
         };

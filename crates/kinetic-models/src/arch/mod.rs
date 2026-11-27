@@ -9,6 +9,7 @@ pub(crate) mod gemma4;
 pub(crate) mod gemma_embedding;
 pub(crate) mod granite;
 pub(crate) mod inkling2;
+pub(crate) mod inkling2_steps;
 pub(crate) mod lfm2;
 pub(crate) mod lfm3;
 mod mamba;

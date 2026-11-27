@@ -400,7 +400,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kinetic"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "kinetic-gguf",
  "kinetic-ktc",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "kinetic-cpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "half",
  "kinetic-quant",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "kinetic-cuda"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "half",
  "kinetic-quant",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "kinetic-gguf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "kinetic-quant",
  "memmap2",
@@ -439,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "kinetic-grammar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "kinetic-tokenizer",
  "serde_json",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "kinetic-ktc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "kinetic-models"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "half",
  "kinetic-cpu",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "kinetic-python"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "kinetic",
  "pyo3",
@@ -479,14 +479,14 @@ dependencies = [
 
 [[package]]
 name = "kinetic-quant"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "half",
 ]
 
 [[package]]
 name = "kinetic-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "kinetic-cuda",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "kinetic-tokenizer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "kinetic-gguf",
  "unicode-general-category",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "kinetic-vision"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "half",
  "image",
@@ -585,6 +585,7 @@ version = "2.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
 dependencies = [
+ "indexmap",
  "memo-map",
  "serde",
  "serde_json",

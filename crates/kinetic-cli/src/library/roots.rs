@@ -33,6 +33,19 @@ pub fn kinetic_dir() -> Option<PathBuf> {
     Some(base.join("kinetic").join("models"))
 }
 
+/// Where Kinetic keeps what it remembers between runs, such as the last
+/// model picked.
+pub fn state_dir() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        var("LOCALAPPDATA")
+    } else if cfg!(target_os = "macos") {
+        home().map(|h| h.join("Library").join("Application Support"))
+    } else {
+        var("XDG_STATE_HOME").or_else(|| home().map(|h| h.join(".local").join("state")))
+    }?;
+    Some(base.join("kinetic"))
+}
+
 /// Every place to look, in the order names are tried.
 pub fn all() -> Vec<(Store, PathBuf)> {
     let mut roots = Vec::new();

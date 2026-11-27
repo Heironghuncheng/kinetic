@@ -72,10 +72,9 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         let bytes = len
             .checked_mul(size_of::<T>())
             .filter(|&b| b as u64 <= device.info().max_buffer_bytes)
-            .ok_or_else(|| {
-                Error::Shape(format!(
-                    "buffer of {len} elements exceeds the device's buffer limit"
-                ))
+            .ok_or(Error::TooLarge {
+                elements: len,
+                limit: device.info().max_buffer_bytes,
             })?;
         Ok(DeviceBuffer {
             alloc: Rc::new(Allocation::new(device, bytes)?),
@@ -235,6 +234,32 @@ impl Commands {
     ) -> Result<()> {
         check_range("upload", src_at, len, src.len())?;
         check_range("upload", dst_at, len, dst.len())?;
+        let t = size_of::<T>();
+        // SAFETY: both ranges were checked above.
+        unsafe {
+            self.copy(
+                src.allocation(),
+                src_at * t,
+                dst.allocation(),
+                dst_at * t,
+                len * t,
+            )
+        };
+        Ok(())
+    }
+
+    /// Records a copy of `len` elements from `src` at `src_at` to `dst` at
+    /// `dst_at`, two buffers on the device.
+    pub fn copy_buffer<T: DeviceCopy>(
+        &mut self,
+        src: &DeviceBuffer<T>,
+        src_at: usize,
+        dst: &DeviceBuffer<T>,
+        dst_at: usize,
+        len: usize,
+    ) -> Result<()> {
+        check_range("copy", src_at, len, src.len())?;
+        check_range("copy", dst_at, len, dst.len())?;
         let t = size_of::<T>();
         // SAFETY: both ranges were checked above.
         unsafe {

@@ -102,15 +102,21 @@ impl PhysicalDevice {
                 && p11
                     .subgroup_supported_operations
                     .contains(vk::SubgroupFeatureFlags::ARITHMETIC);
-            features.subgroup_size_required = p13
-                .required_subgroup_size_stages
-                .contains(vk::ShaderStageFlags::COMPUTE)
-                && (p13.min_subgroup_size..=p13.max_subgroup_size).contains(&SUBGROUP);
+            let can_require = |size| {
+                p13.required_subgroup_size_stages
+                    .contains(vk::ShaderStageFlags::COMPUTE)
+                    && (p13.min_subgroup_size..=p13.max_subgroup_size).contains(&size)
+            };
             // A pipeline that neither requires a size nor allows a varying
             // one runs at the device's default size.
-            features.subgroup_size_32 = f13.subgroup_size_control == vk::TRUE
-                && f13.compute_full_subgroups == vk::TRUE
-                && (features.subgroup_size_required || p11.subgroup_size == SUBGROUP);
+            let runs = |size| {
+                f13.subgroup_size_control == vk::TRUE
+                    && f13.compute_full_subgroups == vk::TRUE
+                    && (can_require(size) || p11.subgroup_size == size)
+            };
+            features.subgroup_size_32 = runs(SUBGROUP);
+            features.subgroup_size_64 = runs(2 * SUBGROUP);
+            features.subgroup_size_required = can_require(features.subgroup_width());
             features.integer_dot_product = f13.shader_integer_dot_product == vk::TRUE;
             features.integer_dot_product_accelerated =
                 p13.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE;
@@ -118,6 +124,7 @@ impl PhysicalDevice {
             features.storage_8bit = f12.storage_buffer8_bit_access == vk::TRUE;
             features.cooperative_matrix = has_coop && coop.cooperative_matrix == vk::TRUE;
             features.matrix_f16 = features.cooperative_matrix
+                && features.subgroup_size_32
                 && f12.shader_float16 == vk::TRUE
                 && f12.vulkan_memory_model == vk::TRUE
                 && f12.vulkan_memory_model_device_scope == vk::TRUE

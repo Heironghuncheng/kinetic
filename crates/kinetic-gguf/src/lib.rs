@@ -1,8 +1,9 @@
 //! Reader for GGUF model files.
 //!
-//! [`Gguf::parse`] validates the header against the buffer it came from, so
-//! every tensor it reports lies inside that buffer. [`GgufFile`] maps a file
-//! from disk and hands out tensor bytes without copying.
+//! Validating the header against the buffer it came from, [`Gguf::parse`]
+//! ensures every tensor it reports lies inside that buffer. [`GgufFile`]
+//! loads a file from disk as a memory map and hands out tensor bytes
+//! only as views into that map, never as copies.
 
 mod file_type;
 mod lock;

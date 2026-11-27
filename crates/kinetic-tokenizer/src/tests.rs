@@ -678,7 +678,7 @@ fn mutated_tokenizer_metadata_errors_or_works() {
         Value::Array(Vec::new()),
         Value::Array(vec![Value::I32(9); 3]),
     ];
-    let mut rng = Rng(0xdead_beef_cafe_f00d);
+    let mut rng = Rng(0xb07f_c838_8600_6c62);
     for _ in 0..3000 {
         let mut gguf = base.clone();
         for _ in 0..1 + rng.below(3) {

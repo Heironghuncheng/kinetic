@@ -83,6 +83,7 @@ entry_points! {
     memset_d8_async = "cuMemsetD8Async"(CuDevicePtr, u8, usize, CuStream);
     mem_host_alloc = "cuMemHostAlloc"(*mut *mut c_void, usize, c_uint);
     mem_free_host = "cuMemFreeHost"(*mut c_void);
+    mem_host_get_device_pointer = "cuMemHostGetDevicePointer_v2"(*mut CuDevicePtr, *mut c_void, c_uint);
     module_load_data = "cuModuleLoadData"(*mut CuModule, *const c_void);
     module_unload = "cuModuleUnload"(CuModule);
     module_get_function = "cuModuleGetFunction"(*mut CuFunction, CuModule, *const c_char);

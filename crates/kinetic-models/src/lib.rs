@@ -18,6 +18,10 @@ mod loader;
 pub mod lora;
 pub mod memory;
 mod model;
+#[cfg(any(feature = "cuda", feature = "vulkan"))]
+// Vulkan reads less of the bookkeeping than CUDA does.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+mod offload;
 mod per_layer;
 pub mod speculative;
 #[cfg(feature = "vulkan")]

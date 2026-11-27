@@ -172,27 +172,31 @@ impl<'a> CpuBackend<'a> {
         );
     }
 
-    /// The cached sequence cut back to the last multiple of [`PREFILL_GRID`]
-    /// it shares with `head` that it returns to exactly, if that leaves any
-    /// of it.
+    /// The cached sequence cut back to [`CpuBackend::cut_point`], if that
+    /// leaves any of it.
     fn cut_cached(&mut self, head: &[u32]) -> Option<Sequence<State>> {
         let mut seq = self.cached.take()?;
-        let common = seq
-            .tokens
-            .iter()
-            .zip(head)
-            .take_while(|(a, b)| a == b)
-            .count();
-        let to = self
-            .model
-            .reach(&seq.state, common / PREFILL_GRID * PREFILL_GRID);
-        // only the grid resumes with the bits of a cold run
-        if to == 0 || !to.is_multiple_of(PREFILL_GRID) {
+        let to = self.cut_point(&seq, head);
+        if to == 0 {
             return None;
         }
         self.model.truncate(&mut seq.state, to);
         seq.tokens.truncate(to);
         Some(seq)
+    }
+
+    /// The last multiple of [`PREFILL_GRID`] that `seq` shares with `head`
+    /// and returns to exactly, or zero.
+    fn cut_point(&self, seq: &Sequence<State>, head: &[u32]) -> usize {
+        let common = sequence::common_prefix(&seq.tokens, head);
+        let to = self
+            .model
+            .reach(&seq.state, common / PREFILL_GRID * PREFILL_GRID);
+        // only the grid resumes with the bits of a cold run
+        match to.is_multiple_of(PREFILL_GRID) {
+            true => to,
+            false => 0,
+        }
     }
 
     /// Cuts the cached sequence back to where a request for `prompt` would
@@ -362,10 +366,14 @@ impl Backend for CpuBackend<'_> {
     }
 
     fn reuses(&self, prompt: &[u32]) -> usize {
-        self.cached
-            .as_ref()
-            .filter(|s| s.continues(prompt))
-            .map_or(0, |s| s.tokens.len())
+        let Some(seq) = &self.cached else {
+            return 0;
+        };
+        if seq.continues(prompt) {
+            return seq.tokens.len();
+        }
+        let head = &prompt[..sequence::ahead_end(0, prompt.len(), PREFILL_GRID)];
+        self.cut_point(seq, head)
     }
 
     fn run_ahead(&mut self, prompt: &[u32]) -> usize {

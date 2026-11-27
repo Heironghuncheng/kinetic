@@ -74,7 +74,7 @@ impl AttentionShape {
         self.n_head * self.q_head_len() + 2 * self.kv_dim()
     }
 
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         let fits = matches!(self.head_dim, 64 | 128 | 256)
             && self.n_head_kv > 0
             && self.n_head.is_multiple_of(self.n_head_kv)
@@ -93,10 +93,10 @@ impl AttentionShape {
 /// a window the last ones in a ring with room for a batch more, so a pass
 /// and a rollback never overwrite a position still seen.
 pub struct KvCache {
-    k: DeviceBuffer<u32>,
-    v: DeviceBuffer<u32>,
+    pub(crate) k: DeviceBuffer<u32>,
+    pub(crate) v: DeviceBuffer<u32>,
     positions: usize,
-    rows: usize,
+    pub(crate) rows: usize,
     slots: usize,
 }
 
@@ -235,7 +235,8 @@ impl Kernels {
         let [ox, oq, od] = out.outputs();
         // SAFETY: rope.wgsl takes the batch, qkv, consts and both caches at
         // bindings 0..4 and then its shape; attend.wgsl the batch, qkv, both
-        // caches and the three output buffers at 0..6 and its shape. Every
+        // caches, the three output buffers and a relative bias it does not
+        // read without relative terms at 0..7 and its shape. Every
         // index they form stays inside the sizes checked above: token rows
         // below the batch's rows, positions below its positions, constants
         // and table words where the offsets say. Workgroups past the pass's
@@ -277,6 +278,7 @@ impl Kernels {
                     ox,
                     oq,
                     od,
+                    qkv.allocation(),
                 ],
                 &[
                     shape.n_head as u32,
@@ -288,6 +290,10 @@ impl Kernels {
                     shape.gate_at() as u32,
                     shape.window.map_or(u32::MAX, |w| w as u32),
                     cache.slots as u32,
+                    0,
+                    0,
+                    0,
+                    0,
                 ],
                 [shape.n_head as u32, rows as u32, 1],
             );

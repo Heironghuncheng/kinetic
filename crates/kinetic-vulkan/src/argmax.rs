@@ -7,12 +7,14 @@ use crate::memory::DeviceBuffer;
 impl Kernels {
     /// Records the greedy token of each row the output head ran on: the
     /// index of the largest of its `vocab` logits, the lowest among equals,
-    /// followed by the bits of that logit: two words per row.
+    /// followed by the bits of that logit: two words per row. With `cap`,
+    /// the logits are first soft-capped in place to `cap * tanh(l / cap)`.
     pub fn argmax(
         &self,
         batch: &Batch,
         logits: &DeviceBuffer<f32>,
         vocab: usize,
+        cap: Option<f32>,
         best: &DeviceBuffer<u32>,
         commands: &mut Commands,
     ) -> Result<()> {
@@ -23,8 +25,8 @@ impl Kernels {
             )));
         }
         // SAFETY: matches argmax.wgsl: the batch, logits and output at
-        // bindings 0..2, then the vocabulary size; both buffers hold the
-        // head's rows, checked above.
+        // bindings 0..2, then the vocabulary size and the cap; both buffers
+        // hold the head's rows, checked above.
         unsafe {
             commands.dispatch(
                 &self.argmax,
@@ -33,7 +35,7 @@ impl Kernels {
                     logits.allocation(),
                     best.allocation(),
                 ],
-                &[vocab as u32],
+                &[vocab as u32, cap.unwrap_or(0.0).to_bits()],
                 [rows.max(1) as u32, 1, 1],
             )
         };

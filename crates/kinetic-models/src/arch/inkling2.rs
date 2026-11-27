@@ -7,6 +7,7 @@
 
 use kinetic_gguf::Value;
 
+use super::inkling2_steps::Step;
 use super::{Basics, Family, Stack};
 use crate::blocks::{mix, Control, Gating, Glu, Mixer, MixerState, Moe, RelAttention, Tree};
 use crate::loader::Loader;
@@ -36,33 +37,33 @@ const UNROLLED_CONTROLS: [&str; 4] = ["attn", "k", "v", "mlp"];
 /// read their inputs from, and the loop.
 pub(crate) struct Network<'a> {
     d: usize,
-    eps: f32,
-    embd_norm: Vec<f32>,
+    pub(crate) eps: f32,
+    pub(crate) embd_norm: Vec<f32>,
     /// The query that mixes the blocks into the input of the output norm.
-    out_query: Vec<f32>,
+    pub(crate) out_query: Vec<f32>,
     /// Layers per block.
-    block: usize,
+    pub(crate) block: usize,
     /// One per physical layer.
-    wiring: Vec<Wiring<'a>>,
-    core: Option<Core>,
+    pub(crate) wiring: Vec<Wiring<'a>>,
+    pub(crate) core: Option<Core>,
 }
 
 /// The physical layers `start..end` run `passes` times; pass `p > 0` keeps
 /// its states in the layers after the physical ones.
-struct Core {
-    start: usize,
-    end: usize,
-    passes: usize,
+pub(crate) struct Core {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) passes: usize,
 }
 
-struct Wiring<'a> {
+pub(crate) struct Wiring<'a> {
     /// One query for the input of a windowed layer, one each for the
     /// query, key and value inputs of a full one; the first layer has none.
-    attn_query: Option<Vec<f32>>,
-    ffn_query: Vec<f32>,
+    pub(crate) attn_query: Option<Vec<f32>>,
+    pub(crate) ffn_query: Vec<f32>,
     /// Layers of the core: queries for the messages to the query, key,
     /// value and feed-forward inputs, and their controls.
-    looped: Option<(Vec<f32>, [Control<'a>; 4])>,
+    pub(crate) looped: Option<(Vec<f32>, [Control<'a>; 4])>,
 }
 
 fn build<'a>(l: &Loader<'a>, b: &Basics) -> Result<Stack<'a>, LoadError> {
@@ -439,7 +440,8 @@ impl Network<'_> {
     /// through `layers`, the physical ones and then those of every later
     /// pass of the core, and returns the input of the output norm. The
     /// input of each layer visit in `taps`, counted in the order the layers
-    /// run, goes to its slot of `tapped`.
+    /// run, goes to its slot of `tapped`. With `trace`, the stream after
+    /// each layer is pushed to it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward(
         &self,
@@ -450,57 +452,51 @@ impl Network<'_> {
         states: &mut [MixerState],
         taps: &[usize],
         tapped: &mut [Vec<f32>],
+        mut trace: Option<&mut Vec<Vec<f32>>>,
     ) -> Vec<f32> {
         let mut cur = x;
         let d = self.d;
         self.norm_embeddings(&mut cur);
         let mut blocks: Vec<Vec<f32>> = Vec::new();
         let mut visit = 0;
-        let mut run =
-            |slot: usize, ip: usize, cur: Vec<f32>, blocks: &mut Vec<Vec<f32>>, message| {
-                tap(taps, visit, &cur, tapped);
-                visit += 1;
-                self.layer(
-                    &layers[slot],
-                    ip,
-                    cur,
-                    blocks,
-                    message,
-                    pos0,
-                    tree,
-                    &mut states[slot],
-                )
-            };
-        let (start, end) = self.core.as_ref().map_or((0, 0), |c| (c.start, c.end));
-        for i in 0..start {
-            cur = run(i, i, cur, &mut blocks, None);
-        }
-        if let Some(c) = &self.core {
-            let prelude = cur.clone();
-            let prelude_blocks = blocks.clone();
-            for pass in 0..c.passes {
-                if pass == 0 {
-                    for i in c.start..c.end {
-                        cur = run(i, i, cur, &mut blocks, None);
-                    }
-                    continue;
+        let mut prelude: Option<(Vec<f32>, Vec<Vec<f32>>)> = None;
+        let mut bank: Vec<Vec<f32>> = Vec::new();
+        for step in self.steps() {
+            match step {
+                Step::Prelude => prelude = Some((cur.clone(), blocks.clone())),
+                Step::Pass => {
+                    let (stream, kept) = prelude.as_ref().expect("the prelude comes first");
+                    bank = blocks.split_off(kept.len() + 1);
+                    bank.push(std::mem::replace(&mut cur, stream.clone()));
+                    blocks = kept.clone();
                 }
-                // The previous pass: its blocks after the first of the core,
-                // and its output.
-                let mut bank = blocks.split_off(prelude_blocks.len() + 1);
-                bank.push(std::mem::replace(&mut cur, prelude.clone()));
-                blocks = prelude_blocks.clone();
-                let bank: Vec<&[f32]> = bank.iter().map(|b| &b[..]).collect();
-                for i in c.start..c.end {
-                    let (query, _) = self.wiring[i].looped.as_ref().expect("core layers loop");
-                    let messages = mix(&bank, query, d);
-                    let slot = self.wiring.len() + (pass - 1) * (c.end - c.start) + i - c.start;
-                    cur = run(slot, i, cur, &mut blocks, Some(messages));
+                Step::Layer {
+                    layer,
+                    slot,
+                    looped,
+                } => {
+                    let messages = looped.then(|| {
+                        let (query, _) = self.wiring[layer].looped.as_ref().expect("core loops");
+                        let bank: Vec<&[f32]> = bank.iter().map(|b| &b[..]).collect();
+                        mix(&bank, query, d)
+                    });
+                    tap(taps, visit, &cur, tapped);
+                    visit += 1;
+                    cur = self.layer(
+                        &layers[slot],
+                        layer,
+                        cur,
+                        &mut blocks,
+                        messages,
+                        pos0,
+                        tree,
+                        &mut states[slot],
+                    );
+                    if let Some(t) = trace.as_deref_mut() {
+                        t.push(cur.clone());
+                    }
                 }
             }
-        }
-        for i in end.max(start)..self.wiring.len() {
-            cur = run(i, i, cur, &mut blocks, None);
         }
         mix_with(&blocks, &cur, &self.out_query, d).remove(0)
     }
@@ -550,7 +546,7 @@ impl Network<'_> {
 
         // The first layer of each block starts from the attention output
         // alone and hands its input to the blocks the later layers mix.
-        let ffn_in = if ip.is_multiple_of(self.block) {
+        let ffn_in = if self.starts_block(ip) {
             blocks.push(cur);
             out
         } else {

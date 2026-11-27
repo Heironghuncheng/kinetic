@@ -1,4 +1,4 @@
-use kinetic_vulkan::{Commands, DeviceMatrix, Out, Rows};
+use kinetic_vulkan::{Commands, DeviceMatrix, Glu, Out, Rows};
 
 use super::layer::{unsupported, R};
 use super::work::Work;
@@ -44,7 +44,7 @@ impl VulkanFfn {
             Ok(())
         })?;
         let act = w.activations(n_ff);
-        k.swiglu(&w.batch, &w.gu, act, c)?;
+        k.swiglu(&w.batch, 1, Glu::Silu, &w.gu, act, c)?;
         let out = Out {
             stride: w.d,
             offset: 0,

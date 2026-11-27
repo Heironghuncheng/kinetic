@@ -13,7 +13,7 @@ use kinetic_cuda::{
 };
 use kinetic_quant::{dequantize, Matrix, TensorType};
 
-const TYPES: [(TensorType, usize); 15] = [
+const TYPES: [(TensorType, usize); 17] = [
     (TensorType::Q4_0, 41 * 32),
     (TensorType::Q4_1, 41 * 32),
     (TensorType::Q5_0, 41 * 32),
@@ -29,6 +29,8 @@ const TYPES: [(TensorType, usize); 15] = [
     (TensorType::TQ1_0, 5 * 256),
     (TensorType::TQ2_0, 5 * 256),
     (TensorType::PQ2_0, 11 * 128),
+    (TensorType::IQ3XXS, 5 * 256),
+    (TensorType::IQ4XS, 5 * 256),
 ];
 
 /// 37 rows leave the last thread block partly empty.
@@ -95,7 +97,12 @@ fn random_matrix(ty: TensorType, rows: usize, cols: usize, rng: &mut Lcg) -> Vec
         TensorType::Q4_0 | TensorType::Q5_0 | TensorType::IQ4NL => &[0],
         TensorType::Q2K => &[80, 82],
         TensorType::Q3K => &[108],
-        TensorType::IQ3S | TensorType::IQ2S | TensorType::IQ1S | TensorType::PQ2_0 => &[0],
+        TensorType::IQ3S
+        | TensorType::IQ2S
+        | TensorType::IQ1S
+        | TensorType::PQ2_0
+        | TensorType::IQ3XXS
+        | TensorType::IQ4XS => &[0],
         TensorType::TQ1_0 => &[52],
         TensorType::TQ2_0 => &[64],
         _ => &[],

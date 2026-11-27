@@ -2,8 +2,10 @@
 
 use std::io;
 
+use minijinja::value::Kwargs;
 use minijinja::{Environment, Error, ErrorKind, Value};
 use serde::Serialize;
+use serde_json::ser::{Formatter, PrettyFormatter, Serializer};
 
 const NAME: &str = "chat";
 /// Instructions one render may run; real templates need well under 1M, so
@@ -29,6 +31,7 @@ impl ChatTemplate {
         env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
+        env.add_filter("tojson", tojson);
         env.add_template_owned(NAME, without_generation_tags(source))?;
         Ok(ChatTemplate { env })
     }
@@ -68,6 +71,77 @@ impl io::Write for Capped {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// `tojson` as Hugging Face renders templates, with Python's `json.dumps`:
+/// `", "` and `": "` between items, `<`, `>` and `&` as they are, and
+/// `indent` and `ensure_ascii` as Python takes them. minijinja's own filter
+/// writes compact, HTML-safe JSON, which models never saw in training.
+fn tojson(value: &Value, indent: Option<usize>, args: Kwargs) -> Result<Value, Error> {
+    let indent = match indent {
+        Some(n) => Some(n),
+        None => args.get::<Option<usize>>("indent")?,
+    };
+    let ascii = args.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false);
+    args.assert_all_used()?;
+    let mut out = Vec::new();
+    let written = match indent {
+        Some(n) => {
+            let spaces = " ".repeat(n);
+            let pretty = PrettyFormatter::with_indent(spaces.as_bytes());
+            value.serialize(&mut Serializer::with_formatter(&mut out, pretty))
+        }
+        None => value.serialize(&mut Serializer::with_formatter(&mut out, Spaced)),
+    };
+    written
+        .map_err(|e| Error::new(ErrorKind::InvalidOperation, "cannot write JSON").with_source(e))?;
+    let json = String::from_utf8(out).expect("serde_json writes UTF-8");
+    if !ascii {
+        return Ok(Value::from(json));
+    }
+    let mut escaped = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c <= '~' {
+            escaped.push(c);
+        } else {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                escaped.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    Ok(Value::from(escaped))
+}
+
+/// Python's default separators, `", "` and `": "`.
+struct Spaced;
+
+impl Formatter for Spaced {
+    fn begin_array_value<W>(&mut self, w: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        match first {
+            true => Ok(()),
+            false => w.write_all(b", "),
+        }
+    }
+
+    fn begin_object_key<W>(&mut self, w: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        match first {
+            true => Ok(()),
+            false => w.write_all(b", "),
+        }
+    }
+
+    fn begin_object_value<W>(&mut self, w: &mut W) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        w.write_all(b": ")
     }
 }
 
@@ -111,6 +185,28 @@ mod tests {
     }
 
     #[test]
+    fn tojson_writes_json_as_python_does() {
+        let render = |source: &str| {
+            let t = ChatTemplate::new(source).unwrap();
+            t.render(json!({"v": {"b": [1, "é <a & 'b'>"], "a": null}}))
+                .unwrap()
+        };
+        assert_eq!(
+            render("{{ v | tojson }}"),
+            r#"{"b": [1, "é <a & 'b'>"], "a": null}"#
+        );
+        assert_eq!(
+            render("{{ v.b | tojson(ensure_ascii=true) }}"),
+            r#"[1, "\u00e9 <a & 'b'>"]"#
+        );
+        assert_eq!(
+            render("{{ v.b | tojson(indent=2) }}"),
+            "[\n  1,\n  \"é <a & 'b'>\"\n]"
+        );
+        assert_eq!(render("{{ v.a | tojson(4) }}"), "null");
+    }
+
+    #[test]
     fn renders_with_python_methods_and_trimmed_blocks() {
         let t = ChatTemplate::new(
             "{%- for m in messages %}\n{{ m.role }}: {{ m.content.strip() }}\n{% endfor %}\n{%- if add_generation_prompt %}>{% endif %}",
@@ -130,6 +226,16 @@ mod tests {
         let t = ChatTemplate::new("{{ raise_exception('no system role') }}").unwrap();
         let err = t.render(json!({})).unwrap_err();
         assert!(err.to_string().contains("no system role"));
+    }
+
+    #[test]
+    fn mappings_keep_the_order_they_came_in() {
+        let t = ChatTemplate::new("{% for k, v in args.items() %}{{ k }} {% endfor %}").unwrap();
+        let args = json!({"file_path": "a.py", "old_string": "x", "new_string": "y"});
+        assert_eq!(
+            t.render(json!({ "args": args })).unwrap(),
+            "file_path old_string new_string "
+        );
     }
 
     #[test]
