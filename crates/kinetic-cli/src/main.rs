@@ -67,8 +67,8 @@ const WARM_DISK: u64 = 2 << 30;
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// Skip the daily check for a newer release, as KINETIC_NO_UPDATE_CHECK=1
-    /// does
+    /// Skip the daily check for a newer release even when Settings turn it
+    /// on, as KINETIC_NO_UPDATE_CHECK=1 does
     #[arg(long, global = true)]
     no_update_check: bool,
 }
@@ -599,8 +599,9 @@ fn main() -> ExitCode {
             return finish(start::run());
         }
     }
+    let settings = config::Settings::load();
     let args = match llama_flags::translate(llama_flags::dispatch(std::env::args().collect())) {
-        Ok(args) => config::Settings::load().apply(args),
+        Ok(args) => settings.apply(args),
         Err(msg) => {
             eprintln!("kinetic: {msg}");
             return ExitCode::from(2);
@@ -620,9 +621,7 @@ fn main() -> ExitCode {
             _ => e.exit(),
         },
     };
-    if !cli.no_update_check {
-        update::notice(&args);
-    }
+    update::notice(&args, &settings, cli.no_update_check);
     finish(run(cli))
 }
 

@@ -45,6 +45,9 @@ const fn flag(
     }
 }
 
+/// The daily check for a new release, `on` when turned on; not a flag.
+pub const UPDATE_CHECK: &str = "update-check";
+
 /// Saved values by flag, in the order of [`FLAGS`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings(pub Vec<(String, String)>);
@@ -65,6 +68,11 @@ impl Settings {
             let at = |f: &str| FLAGS.iter().position(|x| x.long == f);
             self.0.sort_by_key(|(f, _)| at(f));
         }
+    }
+
+    /// Whether the daily check for a new release is turned on.
+    pub fn checks_updates(&self) -> bool {
+        self.get(UPDATE_CHECK) == Some("on")
     }
 
     /// Puts the saved sampling settings into `s`.
@@ -91,8 +99,9 @@ impl Settings {
         let mut s = Settings::default();
         for line in text.lines() {
             if let Some((flag, value)) = line.trim().split_once('=') {
-                if FLAGS.iter().any(|f| f.long == flag.trim()) {
-                    s.set(flag.trim(), value.trim());
+                let flag = flag.trim();
+                if flag == UPDATE_CHECK || FLAGS.iter().any(|f| f.long == flag) {
+                    s.set(flag, value.trim());
                 }
             }
         }
@@ -211,5 +220,21 @@ mod tests {
         assert_eq!(s.text(), "--device=cpu\n--top-k=40\n");
         assert_eq!(Settings::parse(&s.text()), s);
         assert_eq!(s.flags_for("serve"), args("--device cpu"));
+    }
+
+    #[test]
+    fn the_release_check_is_off_until_turned_on_and_is_never_a_flag() {
+        let mut s = Settings::default();
+        assert!(!s.checks_updates());
+        s.set(UPDATE_CHECK, "on");
+        let back = Settings::parse(&s.text());
+        assert!(back.checks_updates());
+        assert_eq!(
+            back.apply(args("kinetic chat m.gguf")),
+            args("kinetic chat m.gguf")
+        );
+        assert!(back.flags_for("chat").is_empty());
+        s.set(UPDATE_CHECK, "");
+        assert!(!Settings::parse(&s.text()).checks_updates());
     }
 }

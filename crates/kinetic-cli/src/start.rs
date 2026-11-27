@@ -10,7 +10,9 @@ use crate::{console, Result};
 pub fn run() -> Result<()> {
     println!("Welcome to Kinetic. Checking this computer...");
     let here = Here::check();
-    let badge = crate::update::available().map(|v| format!("Kinetic {v} is out   u updates"));
+    let settings = crate::config::Settings::load();
+    let badge = crate::update::available(&settings, false)
+        .map(|v| format!("Kinetic {v} is out   u updates"));
     let mut term = Term::enter()?;
     let mut focus = 0;
     loop {

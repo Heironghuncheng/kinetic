@@ -7,7 +7,7 @@ use super::keys::Key;
 use super::list::{Item, List};
 use super::paint::{Ink, Line};
 use super::{frame, quit, Here, Term};
-use crate::config::Settings;
+use crate::config::{Settings, UPDATE_CHECK};
 
 /// The speed technologies `--off` takes, as shown and as typed.
 const TECHS: [(&str, &str); 6] = [
@@ -29,6 +29,8 @@ enum Row {
     },
     /// A speed technology, on unless `--off` names it.
     Tech(&'static str, &'static str),
+    /// The daily check for a new release, off unless turned on.
+    UpdateCheck,
 }
 
 fn steps(from: f32, to: f32, step: f32, digits: usize) -> Vec<String> {
@@ -120,6 +122,7 @@ fn rows(here: &Here) -> Vec<Row> {
         choice("Reasoning", "--reasoning", list(&["off"]), "on"),
     ];
     rows.extend(TECHS.iter().map(|&(name, id)| Row::Tech(name, id)));
+    rows.push(Row::UpdateCheck);
     rows
 }
 
@@ -160,6 +163,14 @@ impl Row {
                 ],
                 false => vec![format!("{name} (speed)"), "[ ✓ ] on".into(), String::new()],
             },
+            Row::UpdateCheck => vec![
+                "Check for new releases once a day".into(),
+                match s.checks_updates() {
+                    true => "[ ✓ ] on".into(),
+                    false => "[   ] off".into(),
+                },
+                "asks GitHub's releases API, sends nothing else".into(),
+            ],
         }
     }
 
@@ -181,6 +192,10 @@ impl Row {
                     None => off.push((*id).to_owned()),
                 }
                 s.set("--off", &off.join(","));
+            }
+            Row::UpdateCheck => {
+                let on = if s.checks_updates() { "" } else { "on" };
+                s.set(UPDATE_CHECK, on);
             }
         }
     }
