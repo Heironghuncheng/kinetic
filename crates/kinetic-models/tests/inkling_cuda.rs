@@ -10,6 +10,7 @@
 use half::f16;
 use kinetic_gguf::{Gguf, TensorInfo, TensorOut, TensorSource, TensorType, Value};
 use std::cell::Cell;
+use std::sync::{Mutex, MutexGuard};
 
 use kinetic_models::cuda::{CudaModel, CudaRunner, CudaState, Placement, Run};
 use kinetic_models::speculative::{Decoder, Greedy, Lookup, Policy};
@@ -345,6 +346,7 @@ fn bits(x: &[f32]) -> Vec<u32> {
 #[test]
 #[ignore = "needs a CUDA device"]
 fn inkling_on_cuda_matches_the_cpu_and_changes_no_bit() {
+    let _device = alone();
     for experts in [TensorType::IQ4NL, TensorType::NVFP4] {
         let mut looped_logits = None;
         for unrolled in [false, true] {
@@ -407,11 +409,45 @@ fn inkling_on_cuda_matches_the_cpu_and_changes_no_bit() {
     }
 }
 
+/// Holds the device for one test: the tests share a context, where one
+/// recording a graph fails another's copies, and measure its free memory.
+fn alone() -> MutexGuard<'static, ()> {
+    static DEVICE: Mutex<()> = Mutex::new(());
+    DEVICE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The first sequence is the state the expert cache was placed around: it
+/// takes no more device memory, and the next one is a new state.
+#[test]
+#[ignore = "needs a CUDA device"]
+fn the_first_sequence_is_the_one_the_cache_was_placed_around() {
+    let _device = alone();
+    let file = tiny_model(Tiny {
+        dense: TensorType::Q8_0,
+        experts: TensorType::IQ4NL,
+        used: 2,
+        unrolled: false,
+        wide: false,
+    });
+    let model = kinetic_models::load(&file).unwrap();
+    let gpu = CudaModel::load(&model, 128).unwrap();
+    let (before, _) = gpu.memory_info().unwrap();
+    let first = gpu.new_state().unwrap();
+    let (after, _) = gpu.memory_info().unwrap();
+    let second = gpu.new_state().unwrap();
+    let (last, _) = gpu.memory_info().unwrap();
+    // other programs may take or give back a little meanwhile
+    let (one, two) = (before.saturating_sub(after), after.saturating_sub(last));
+    assert!(4 * one < two, "first took {one} bytes, second {two}");
+    drop((first, second));
+}
+
 /// A verify pass of the widest draft keeps the bits of decoding, with every
 /// expert on the device and with most of them on the host.
 #[test]
 #[ignore = "needs a CUDA device"]
 fn wide_verify_passes_change_no_bit() {
+    let _device = alone();
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         wide_verify_on_both_expert_types();

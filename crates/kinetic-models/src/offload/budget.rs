@@ -55,16 +55,13 @@ impl BudgetSearch {
             self.fit = 0;
         }
         self.over = budget;
+        // Shortfalls of a few bytes would take a placement each.
+        let short = (self.need - left).max(GROW_STEP);
         Some(
             budget
-                .saturating_sub(self.need - left)
+                .saturating_sub(short)
                 .max(self.fit + (budget - self.fit) / 2),
         )
-    }
-
-    /// Whether no budget has left the room needed yet.
-    pub fn short(&self) -> bool {
-        self.fit == 0
     }
 }
 
@@ -118,6 +115,14 @@ mod tests {
     }
 
     #[test]
+    fn small_shortfalls_end_within_a_few_placements() {
+        // every placement takes a little more than its budget leaves
+        let (need, free) = (300 * MIB, 5000 * MIB);
+        let tried = search(need, free - 2 * MIB, 50_000 * MIB, 0.0005);
+        assert!(tried.len() <= 3, "{tried:?}");
+    }
+
+    #[test]
     fn a_device_that_lost_room_shrinks_the_cache() {
         let need = 500 * MIB;
         let mut s = BudgetSearch::new(need);
@@ -125,6 +130,7 @@ mod tests {
         // the same budget no longer fits
         let next = s.next(4000 * MIB, 300 * MIB, 4000 * MIB).unwrap();
         assert!(next < 4000 * MIB);
-        assert!(s.short());
+        // and a budget that leaves the room again is the one kept
+        assert_eq!(s.next(next, 600 * MIB, next), Some(next + 100 * MIB));
     }
 }
