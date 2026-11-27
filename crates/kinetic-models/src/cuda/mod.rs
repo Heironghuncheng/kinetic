@@ -569,7 +569,7 @@ impl<'m> CudaModel<'m> {
             match search.next(budget, left, off.plan.cache_bytes()) {
                 Some(next) if placed < MOST_PLACEMENTS => {
                     drop(off);
-                    if left < need && search.short() {
+                    if left < need && placed == 1 {
                         eprintln!(
                             "kinetic: the GPU has {} MiB less free than planned; the expert cache shrinks to fit",
                             (need - left) >> 20
