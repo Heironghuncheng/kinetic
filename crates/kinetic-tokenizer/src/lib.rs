@@ -79,6 +79,33 @@ pub struct Tokenizer {
     sep: Option<u32>,
 }
 
+struct FamilyRules {
+    trim_after: Option<fn(&str) -> bool>,
+    extra_stops: &'static [&'static str],
+}
+
+// Tokenizer overrides by GGUF architecture; add one entry here per family that needs them.
+static FAMILY_RULES: &[(&str, FamilyRules)] = &[(
+    "phi3",
+    FamilyRules {
+        trim_after: Some(|text| !matches!(text, "<unk>" | "<s>" | "<|endoftext|>")),
+        // The model can emit </s> even when the GGUF names a different EOS.
+        extra_stops: &["</s>"],
+    },
+)];
+
+static DEFAULT_FAMILY_RULES: FamilyRules = FamilyRules {
+    trim_after: None,
+    extra_stops: &[],
+};
+
+fn family_rules(arch: Option<&str>) -> &'static FamilyRules {
+    FAMILY_RULES
+        .iter()
+        .find(|(name, _)| Some(*name) == arch)
+        .map_or(&DEFAULT_FAMILY_RULES, |(_, rules)| rules)
+}
+
 enum Model {
     Bpe {
         vocab: Vocab,
@@ -94,16 +121,7 @@ enum Model {
 impl Tokenizer {
     /// Builds the tokenizer described by the `tokenizer.ggml.*` keys.
     pub fn from_gguf(gguf: &Gguf) -> Result<Tokenizer, Error> {
-        type TrimAfter = fn(&str) -> bool;
-        let (trim_after, extra_stops): (Option<TrimAfter>, &'static [&'static str]) =
-            match gguf.architecture() {
-                Some("phi3") => (
-                    Some(|text| !matches!(text, "<unk>" | "<s>" | "<|endoftext|>")),
-                    // The model can emit </s> even when the GGUF names a different EOS.
-                    &["</s>"],
-                ),
-                _ => (None, &[]),
-            };
+        let rules = family_rules(gguf.architecture());
         let (model, default_add_bos, default_ids) = match string(gguf, "tokenizer.ggml.model")? {
             "gpt2" => {
                 let pre = string(gguf, "tokenizer.ggml.pre")?;
@@ -130,12 +148,12 @@ impl Tokenizer {
             }
             // Files written before the ids were stored use these.
             "llama" => (
-                Model::Spm(Spm::load(gguf, trim_after)?),
+                Model::Spm(Spm::load(gguf, rules.trim_after)?),
                 true,
                 (Some(1), Some(2)),
             ),
             "gemma4" => (
-                Model::Spm(Spm::load_with_merges(gguf, trim_after)?),
+                Model::Spm(Spm::load_with_merges(gguf, rules.trim_after)?),
                 true,
                 (None, None),
             ),
@@ -187,7 +205,7 @@ impl Tokenizer {
 
         Ok(Tokenizer {
             model,
-            extra_stops,
+            extra_stops: rules.extra_stops,
             bos,
             eos,
             add_bos,
