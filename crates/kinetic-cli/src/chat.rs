@@ -2,9 +2,9 @@
 
 use std::borrow::Cow;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::Once;
 
 use kinetic_server::{Completion, Engine, Request, Split};
 use rustyline::completion::Completer;
@@ -23,8 +23,14 @@ use crate::render::Markdown;
 use crate::{sampling_command, GenArgs, Result};
 
 // name, what it takes, what it does; /help and the hints both read this
-const COMMANDS: [(&str, &str, &str); 15] = [
+const COMMANDS: [(&str, &str, &str); 17] = [
     ("/clear", "", "start a new conversation"),
+    ("/model", "", "switch to another model"),
+    (
+        "/settings",
+        "",
+        "change sampling and reasoning for the next answers",
+    ),
     (
         "/receipt",
         " [FILE]",
@@ -54,7 +60,8 @@ fn help() -> String {
         .iter()
         .map(|(name, args, what)| format!("{:<15}{what}\n", format!("{name}{args}")))
         .collect();
-    text += "Type / and Tab to complete a command. End a line with \\ to go on writing\n";
+    text += "/ and Enter lists the commands to pick from; / and Tab completes them.\n";
+    text += "End a line with \\ to go on writing\n";
     text += "on the next one. Ctrl+C stops an answer.";
     text
 }
@@ -117,9 +124,16 @@ const MORE: &str = "  ";
 
 type Rgb = (u8, u8, u8);
 
-pub fn chat(engine: &Engine, gen: &GenArgs, device: &str) -> Result<()> {
+/// Ctrl+C stops the answer being written while a chat is open, and ends
+/// the program as usual otherwise.
+static STOP: AtomicBool = AtomicBool::new(false);
+static CHATTING: AtomicBool = AtomicBool::new(false);
+
+/// Chats until the user leaves, or picks another model with `/model`,
+/// whose file this returns.
+pub fn chat(engine: &Engine, gen: &GenArgs, device: &str) -> Result<Option<PathBuf>> {
     if !io::stdin().is_terminal() {
-        return plain(engine, gen);
+        return plain(engine, gen).map(|()| None);
     }
     let typing = Typing::default();
     std::thread::scope(|s| {
@@ -130,12 +144,32 @@ pub fn chat(engine: &Engine, gen: &GenArgs, device: &str) -> Result<()> {
     })
 }
 
-fn talk(engine: &Engine, gen: &GenArgs, device: &str, typing: &Typing) -> Result<()> {
+fn talk(engine: &Engine, gen: &GenArgs, device: &str, typing: &Typing) -> Result<Option<PathBuf>> {
     let style = Style::detect();
-    let stop = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&stop);
-    // the brakes: Ctrl+C stops the answer, never the program
-    ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))?;
+    static HANDLER: Once = Once::new();
+    let mut handler = Ok(());
+    // the brakes: Ctrl+C stops the answer, never the chat
+    HANDLER.call_once(|| {
+        handler = ctrlc::set_handler(|| match CHATTING.load(Ordering::Relaxed) {
+            true => STOP.store(true, Ordering::Relaxed),
+            false => std::process::exit(130),
+        });
+    });
+    handler?;
+    CHATTING.store(true, Ordering::Relaxed);
+    let talked = conversation(engine, gen, device, typing, style);
+    CHATTING.store(false, Ordering::Relaxed);
+    talked
+}
+
+fn conversation(
+    engine: &Engine,
+    gen: &GenArgs,
+    device: &str,
+    typing: &Typing,
+    style: Style,
+) -> Result<Option<PathBuf>> {
+    let stop = &STOP;
     let mut editor = Editor::new()?;
     editor.set_helper(Some(Line { style, typing }));
     let mut pending: Vec<Attachment> = Vec::new();
@@ -165,9 +199,26 @@ fn talk(engine: &Engine, gen: &GenArgs, device: &str, typing: &Typing) -> Result
             1 => format!("[1 image] {PROMPT}"),
             n => format!("[{n} images] {PROMPT}"),
         };
-        let Some(text) = read(&mut editor, &style, typing, &prompt)? else {
+        let Some(mut text) = read(&mut editor, &style, typing, &prompt)? else {
             break;
         };
+        if text.trim() == "/" {
+            let rows = COMMANDS
+                .iter()
+                .map(|(name, args, what)| vec![format!("{name}{args}"), (*what).to_owned()])
+                .collect();
+            let Some(i) = crate::tui::choose("Commands", rows)? else {
+                continue;
+            };
+            let (name, args, _) = COMMANDS[i];
+            text = match args {
+                "" => name.to_owned(),
+                _ => match editor.readline_with_initial(PROMPT, (&format!("{name} "), "")) {
+                    Ok(line) => line,
+                    Err(_) => continue,
+                },
+            };
+        }
         let dropped = attach::dropped_path(&text).filter(|_| sees);
         let note = match text.trim() {
             "" => continue,
@@ -190,10 +241,24 @@ fn talk(engine: &Engine, gen: &GenArgs, device: &str, typing: &Typing) -> Result
                     }
                 }
             }
-            "/exit" | "/quit" => return Ok(()),
+            "/exit" | "/quit" => return Ok(None),
+            "/model" => match crate::tui::pick_model("Switch to which model?")? {
+                Some(path) => return Ok(Some(path)),
+                None => format!("Still {}.", engine.name()),
+            },
+            "/settings" => {
+                crate::tui::settings()?;
+                let saved = crate::config::Settings::load();
+                saved.sample(&mut request.sampling);
+                request.max_tokens = saved.get("--n-predict").and_then(|n| n.parse().ok());
+                think = saved.get("--reasoning") != Some("off");
+                "Sampling and reasoning from Settings apply to the next answers, the rest from the next start.".to_owned()
+            }
             "/help" => help(),
             // not in /help on purpose
             "/vroom" => "E = ½mv². The model fixes m, so Kinetic works on v.".to_owned(),
+            "/brake" => "Brakes turn motion into heat. The fans do that already.".to_owned(),
+            "/inertia" => "A model at rest stays at rest until a prompt acts on it.".to_owned(),
             "/clear" => {
                 messages = opening(system.as_deref());
                 images.clear();
@@ -258,12 +323,12 @@ fn talk(engine: &Engine, gen: &GenArgs, device: &str, typing: &Typing) -> Result
                 let mut request = request.clone();
                 kinetic_server::receipt::seed(&mut request.sampling);
                 let c = answer(
-                    engine, &messages, &images, &request, think, &style, raw, &stop,
+                    engine, &messages, &images, &request, think, &style, raw, stop,
                 )?;
                 pace.add(&c);
                 println!(
                     "\n\n{}\n",
-                    numbers(&style, &c, &pace, engine.context_length(), stopped(&stop))
+                    numbers(&style, &c, &pace, engine.context_length(), stopped(stop))
                 );
                 let input = Value::from(messages.clone());
                 messages.push(json!({"role": "assistant", "content": c.content}));
@@ -273,7 +338,7 @@ fn talk(engine: &Engine, gen: &GenArgs, device: &str, typing: &Typing) -> Result
         };
         println!("{}\n", style.dim(&note));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Adds `found`, if any, to the images waiting for the next message and
@@ -875,7 +940,9 @@ mod tests {
         assert_eq!(names("/").len(), COMMANDS.len());
         assert!(names("/think on").is_empty());
         assert!(names("hello").is_empty());
-        assert!(names("/vroom").is_empty());
+        assert!(["/vroom", "/brake", "/inertia"]
+            .iter()
+            .all(|c| names(c).is_empty()));
         assert!(COMMANDS.iter().all(|(name, ..)| help().contains(name)));
     }
 

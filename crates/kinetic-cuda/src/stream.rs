@@ -101,6 +101,16 @@ impl Event {
         })
     }
 
+    /// Whether the stream has passed this event.
+    pub fn is_done(&self) -> Result<bool> {
+        let api = self.ctx.enter()?;
+        // SAFETY: `raw` is a live event.
+        match unsafe { (api.event_query)(self.raw) } {
+            NOT_READY => Ok(false),
+            status => api.check("cuEventQuery", status).map(|()| true),
+        }
+    }
+
     /// Waits until the stream has passed this event or `timeout` has gone
     /// by, polling; returns whether it passed.
     pub fn wait_for(&self, timeout: std::time::Duration) -> Result<bool> {

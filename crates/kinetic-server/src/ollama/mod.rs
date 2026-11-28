@@ -155,7 +155,7 @@ fn common(
             .and_then(|_| send_json(out, &response::ps(model.name, model.info, model.context))),
         "/api/show" => expect(head, "POST")
             .and_then(|_| parse::<Value>(body))
-            .and_then(|_| send_json(out, &response::show(model.info, model.capabilities))),
+            .and_then(|_| send_json(out, &response::show(model))),
         _ => return None,
     })
 }

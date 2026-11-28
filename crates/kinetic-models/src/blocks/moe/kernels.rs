@@ -302,6 +302,39 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + exp(-x))
 }
 
+/// `1 / (1 + e^-x)` from the same `exp`, as the device computes it.
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + exp(-x))
+}
+
+/// `beta tanh(x / beta)`, written out operation by operation as the device
+/// computes it: Cephes' odd polynomial below 0.625, where `1 - 2 / (e^2y + 1)`
+/// would cancel, and that from the same `exp` above.
+pub fn soft_clip(x: f32, beta: f32) -> f32 {
+    const P: [f32; 5] = [
+        -5.704_988_7e-3,
+        2.063_909e-2,
+        -5.373_971_6e-2,
+        1.333_144_2e-1,
+        -3.333_328e-1,
+    ];
+    let y = x / beta;
+    let a = y.abs();
+    let t = if a < 0.625 {
+        let z = y * y;
+        let p = P[1..].iter().fold(P[0], |p, &c| p * z + c);
+        p * z * y + y
+    } else {
+        let t = 1.0 - 2.0 / (exp(2.0 * a) + 1.0);
+        if y < 0.0 {
+            -t
+        } else {
+            t
+        }
+    };
+    beta * t
+}
+
 /// `e^x` to about one unit in the last place: `x = n ln 2 + r` with `|r|`
 /// at most `ln 2 / 2`, a degree-6 polynomial for `e^r`, and `2^n` from the
 /// exponent bits.

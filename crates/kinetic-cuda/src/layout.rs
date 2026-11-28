@@ -9,6 +9,7 @@
 use std::borrow::Cow;
 
 use kinetic_quant::grids::{IQ1S_GRID, IQ2S_GRID, IQ3S_GRID};
+use kinetic_quant::iq::IQ3XXS_GRID;
 use kinetic_quant::{Matrix, TensorType};
 
 /// (offset, length) of each field in a block, in plane order.
@@ -25,6 +26,8 @@ const Q3_K_FIELDS: &[(usize, usize)] = &[(32, 64), (0, 32), (96, 12), (108, 2)];
 const IQ3_S_FIELDS: &[(usize, usize)] = &[(2, 64), (66, 8), (74, 32), (106, 4), (0, 2)];
 const IQ2_S_FIELDS: &[(usize, usize)] = &[(2, 32), (34, 32), (66, 8), (74, 8), (0, 2)];
 const IQ1_S_FIELDS: &[(usize, usize)] = &[(2, 32), (34, 16), (0, 2)];
+const IQ3_XXS_FIELDS: &[(usize, usize)] = &[(2, 64), (66, 32), (0, 2)];
+const IQ4_XS_FIELDS: &[(usize, usize)] = &[(8, 128), (4, 4), (2, 2), (0, 2)];
 const IQ1_M_FIELDS: &[(usize, usize)] = &[(0, 32), (32, 16), (48, 8)];
 const TQ1_0_FIELDS: &[(usize, usize)] = &[(0, 48), (48, 4), (52, 2)];
 const TQ2_0_FIELDS: &[(usize, usize)] = &[(0, 64), (64, 2)];
@@ -46,6 +49,8 @@ pub(crate) fn device_layout<'a>(m: &Matrix<'a>) -> Cow<'a, [u8]> {
         TensorType::IQ3S => IQ3_S_FIELDS,
         TensorType::IQ2S => IQ2_S_FIELDS,
         TensorType::IQ1S => IQ1_S_FIELDS,
+        TensorType::IQ3XXS => IQ3_XXS_FIELDS,
+        TensorType::IQ4XS => IQ4_XS_FIELDS,
         TensorType::IQ1M => IQ1_M_FIELDS,
         TensorType::TQ1_0 => TQ1_0_FIELDS,
         TensorType::TQ2_0 => TQ2_0_FIELDS,
@@ -64,6 +69,7 @@ pub(crate) fn device_layout<'a>(m: &Matrix<'a>) -> Cow<'a, [u8]> {
 fn codebook(ty: TensorType) -> Option<Vec<u8>> {
     Some(match ty {
         TensorType::IQ3S => IQ3S_GRID.as_flattened().to_vec(),
+        TensorType::IQ3XXS => IQ3XXS_GRID.as_flattened().to_vec(),
         TensorType::IQ2S => IQ2S_GRID.as_flattened().to_vec(),
         TensorType::IQ1S | TensorType::IQ1M => {
             IQ1S_GRID.as_flattened().iter().map(|&v| v as u8).collect()
@@ -110,13 +116,15 @@ mod tests {
             TensorType::Q3K,
             TensorType::TQ1_0,
             TensorType::TQ2_0,
+            TensorType::IQ3XXS,
+            TensorType::IQ4XS,
         ] {
             let size = ty.block_bytes();
             let blocks: Vec<u8> = (0..16 * size).map(|i| (i % size) as u8).collect();
             let m = Matrix::new(ty, &blocks, 1, 16 * ty.block_len());
             let out = device_layout(&m);
             let mut counts = vec![0; size];
-            for &b in out.iter() {
+            for &b in &out[..blocks.len()] {
                 counts[b as usize] += 1;
             }
             assert!(counts.iter().all(|&c| c == 16), "{ty}");

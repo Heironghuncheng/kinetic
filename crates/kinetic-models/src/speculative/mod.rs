@@ -25,9 +25,15 @@
 //!
 //! A rejected draft costs a wider pass for nothing, so draft length follows
 //! how well recent drafts did, and drafting pauses for longer and longer
-//! after drafts that miss outright.
+//! after drafts that miss outright. A draft is also cut to the length whose
+//! expected tokens per second are highest at what steps of each width have
+//! taken on this model, and dropped when a plain step does as well, so a
+//! wide pass is run only where it pays, wherever its rows run.
+
+use std::time::Instant;
 
 mod companion;
+mod cost;
 mod draft;
 mod dry;
 mod dspark;
@@ -37,6 +43,7 @@ mod logprobs;
 mod lookup;
 mod mtp;
 mod policy;
+mod reach;
 mod sampler;
 mod session;
 mod target;
@@ -44,6 +51,7 @@ mod target;
 mod tests;
 
 pub use companion::{find_companion, load_companion, Companion, CompanionDrafter};
+pub use cost::Costs;
 pub use draft::Draft;
 pub use dry::dry_breakers;
 pub use dspark::DsparkCompanion;
@@ -52,6 +60,7 @@ pub use logprobs::{Logprobs, TokenLogprob};
 pub use lookup::Lookup;
 pub use mtp::{MtpDrafter, Predictor};
 pub use policy::{Greedy, Policy};
+pub use reach::Reach;
 pub use sampler::{Sampler, Sampling};
 pub use session::SessionIndex;
 pub use target::Target;
@@ -102,7 +111,9 @@ impl<M: Target, D: Drafter<M> + ?Sized> Drafter<M> for Box<D> {
 /// to a new sequence.
 pub struct Decoder<D> {
     pub drafter: D,
-    /// Most tokens proposed per step; zero never drafts.
+    /// Most tokens proposed per step; zero never drafts. The default fills
+    /// a pass of sixteen rows, the most a GPU verifies at once; how many of
+    /// them are verified is up to [`Decoder::costs`].
     pub max_draft: usize,
     /// Most steps drafting pauses for after repeated misses; zero never
     /// pauses, which suits drafters whose guesses are cheap and usually right.
@@ -112,7 +123,13 @@ pub struct Decoder<D> {
     /// unit of cost beat those of its leading chain; infinity always
     /// verifies only the chain.
     pub row_cost: f32,
+    /// What steps cost by rows and how far drafts come true; a chain is
+    /// cut to the length that pays most for them.
+    pub costs: Costs,
+    pub reach: Reach,
     draft_len: usize,
+    /// Whether the last draft verified was accepted whole.
+    whole: bool,
     pause: usize,
     paused_for: usize,
     /// The token the next step starts with, chosen from the scores after
@@ -134,10 +151,13 @@ impl<D> Decoder<D> {
     pub fn new(drafter: D) -> Self {
         Decoder {
             drafter,
-            max_draft: 8,
+            max_draft: 15,
             max_pause: 16,
             row_cost: ROW_COST,
+            costs: Costs::default(),
+            reach: Reach::default(),
             draft_len: 8,
+            whole: false,
             pause: 0,
             paused_for: 0,
             next: None,
@@ -156,6 +176,7 @@ impl<D> Decoder<D> {
         D: Drafter<M>,
     {
         self.drafter.reset(model);
+        self.reach.close();
         self.next = None;
     }
 
@@ -165,8 +186,11 @@ impl<D> Decoder<D> {
     where
         D: Drafter<M>,
     {
+        model.set_prompt(state, true);
         let (_, hidden) = model.score(state, tokens, false);
+        model.set_prompt(state, false);
         self.drafter.observe(model, tokens, &hidden);
+        self.reach.close();
         self.next = None;
     }
 
@@ -183,8 +207,11 @@ impl<D> Decoder<D> {
         D: Drafter<M>,
     {
         let tokens = &context[start..];
+        model.set_prompt(state, true);
         let (scores, hidden) = policy.score(model, state, tokens, false);
+        model.set_prompt(state, false);
         self.drafter.observe(model, tokens, &hidden);
+        self.reach.close();
         self.next = Some(policy.choose(model, &scores, 0, context));
     }
 
@@ -210,7 +237,9 @@ impl<D> Decoder<D> {
         D: Drafter<M>,
     {
         let next = self.next.take().expect("no token chosen: prefill first");
+        let start = Instant::now();
         context.push(next);
+        self.reach.judge(context);
         let len = self
             .draft_len
             .min(self.max_draft)
@@ -222,19 +251,25 @@ impl<D> Decoder<D> {
             self.drafter.propose_tree(model, context, len)
         };
         draft.truncate(len);
+        if !self.tree_pays(&draft) {
+            draft.keep_chain();
+        }
+        if draft.is_chain() {
+            self.reach.guess(context.len(), &draft.tokens, self.whole);
+            let chances = self.reach.chances(draft.len(), self.whole);
+            draft.truncate(self.costs.best_len(&chances));
+        }
         if draft.is_empty() {
             let (scores, hidden) = policy.score(model, state, &[next], false);
             self.drafter.observe(model, &[next], &hidden);
             if !stop(next) {
                 self.next = Some(policy.choose(model, &scores, 0, context));
             }
+            self.costs.record(1, start.elapsed());
             return Step {
                 tokens: 1,
                 drafted: 0,
             };
-        }
-        if !self.tree_pays(&draft) {
-            draft.keep_chain();
         }
 
         model.checkpoint(state);
@@ -278,6 +313,7 @@ impl<D> Decoder<D> {
             .collect();
         self.drafter.observe(model, &kept, &kept_hidden);
         self.tune_draft_len(path.len() - 1, draft.depth());
+        self.costs.record(tokens.len(), start.elapsed());
         self.next = drawn;
         Step {
             tokens: path.len(),
@@ -297,6 +333,7 @@ impl<D> Decoder<D> {
     }
 
     fn tune_draft_len(&mut self, accepted: usize, drafted: usize) {
+        self.whole = accepted == drafted;
         if accepted == drafted {
             self.draft_len = (self.draft_len * 2).min(self.max_draft);
         } else {

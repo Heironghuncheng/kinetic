@@ -12,7 +12,9 @@ use rayon::prelude::*;
 use super::ACTIVATION_CHUNK;
 #[cfg(all(test, feature = "cuda"))]
 pub(crate) use kernels::scale_offsets;
-use kernels::Unpacked;
+pub(crate) use kernels::Unpacked;
+#[cfg(feature = "cuda")]
+pub(crate) use kernels::{dot as unpacked_dot, packed_dot, unpack};
 
 /// Equally shaped expert matrices stored one after another, as in a 3-D
 /// GGUF tensor.
@@ -96,16 +98,16 @@ pub enum Glu {
 }
 
 impl Glu {
-    fn apply(self, gate: f32, up: f32) -> f32 {
+    pub(crate) fn apply(self, gate: f32, up: f32) -> f32 {
         match self {
             Glu::Silu => kernels::silu(gate) * up,
             Glu::Situ { beta, linear } => {
                 let up = if linear == 0.0 {
                     up
                 } else {
-                    linear * (up / linear).tanh()
+                    kernels::soft_clip(up, linear)
                 };
-                beta * (gate / beta).tanh() * sigmoid(gate) * up
+                kernels::soft_clip(gate, beta) * kernels::sigmoid(gate) * up
             }
             Glu::Gelu => super::gelu(gate) * up,
         }
@@ -186,17 +188,6 @@ impl Moe<'_> {
                 ..p
             })
             .collect()
-    }
-
-    /// Whether the block uses only what the GPU backends run: SiLU experts
-    /// on the shared feed-forward input, with no scales or norms of their
-    /// own.
-    #[cfg(feature = "cuda")]
-    pub fn plain(&self) -> bool {
-        self.glu == Glu::Silu
-            && self.weight_scale == 1.0
-            && self.scales.iter().all(Option::is_none)
-            && self.norms.is_none()
     }
 
     /// [`Moe::forward`] in a layer whose input is `x` and whose normalized

@@ -8,7 +8,7 @@ use crate::gemm::gemm_functions;
 use crate::gemv::{GEMV_NAMES, MAX_BATCH, WEIGHT_TYPES};
 use crate::memory::DeviceBuffer;
 use crate::module::{Function, LaunchConfig, Module};
-use crate::moe::{EXPERT_TYPES, MOE_NAMES};
+use crate::moe::{wide_form, EXPERT_TYPES, MOE_NAMES};
 use crate::stream::Stream;
 
 /// Fatbin images start with a header the driver reads in 8-byte words.
@@ -46,6 +46,7 @@ pub struct Kernels {
     pub(crate) embed: Function,
     pub(crate) rms_norm_q8: Function,
     pub(crate) add_norm_q8: Function,
+    pub(crate) rms_norm2_q8: Function,
     pub(crate) swiglu_q8: Function,
     pub(crate) geglu_q8: Function,
     pub(crate) per_layer_inputs: Function,
@@ -79,19 +80,34 @@ pub struct Kernels {
     pub(crate) ssm_scan: Function,
     pub(crate) ssm_gated_norm: Function,
     pub(crate) add_f32: Function,
+    pub(crate) sum_f32: Function,
+    pub(crate) to_host: Function,
     pub(crate) quantize_q8k: Function,
     /// Routed-expert kernels by weight type; see `moe.rs`.
     pub(crate) moe_gate_up: [Function; EXPERT_TYPES.len()],
     pub(crate) moe_down: [Function; EXPERT_TYPES.len()],
+    /// The tensor-core forms for wide groups, of the types that have one,
+    /// on devices with tensor cores.
+    pub(crate) moe_wide_gate_up: [Option<Function>; EXPERT_TYPES.len()],
+    pub(crate) moe_wide_down: [Option<Function>; EXPERT_TYPES.len()],
     pub(crate) moe_combine: Function,
     pub(crate) moe_route: Function,
     pub(crate) moe_assign: Function,
+    pub(crate) rel_conv: Function,
+    pub(crate) rel_conv_store: Function,
+    pub(crate) rel_prepare: Function,
+    pub(crate) rel_attend: Function,
+    pub(crate) rel_combine: Function,
+    pub(crate) depth_mix: Function,
+    pub(crate) loop_control: Function,
     read_sum: Function,
     pub(crate) multiprocessors: u32,
     /// See [`DeviceInfo::tensor_cores`](crate::DeviceInfo::tensor_cores).
     pub(crate) tensor_cores: bool,
     /// See [`Kernels::half_products`].
     pub(crate) half: bool,
+    /// See [`Kernels::set_exact_rows`].
+    pub(crate) exact_rows: std::cell::Cell<bool>,
 }
 
 impl Kernels {
@@ -156,6 +172,16 @@ impl Kernels {
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("a kernel per type")))
         };
+        let wide = |prefix: &str| -> Result<[Option<Function>; EXPERT_TYPES.len()]> {
+            let mut functions = [const { None }; EXPERT_TYPES.len()];
+            for (f, (ty, name)) in functions.iter_mut().zip(EXPERT_TYPES.iter().zip(MOE_NAMES)) {
+                if tensor_cores && wide_form(*ty) {
+                    let name = CString::new(format!("{prefix}_{name}")).expect("no NUL");
+                    *f = Some(module.function(&name)?);
+                }
+            }
+            Ok(functions)
+        };
         Ok(Kernels {
             gemv,
             gemv_mma,
@@ -165,12 +191,14 @@ impl Kernels {
                 .transpose()?,
             unpacked: std::cell::RefCell::new(Vec::new()),
             unpack_limit: std::cell::Cell::new(usize::MAX),
+            exact_rows: std::cell::Cell::new(false),
             quantize_q8: module.function(c"quantize_q8")?,
             fold_rows: module.function(c"fold_rows")?,
             unfold_rows: module.function(c"unfold_rows")?,
             embed: module.function(c"embed")?,
             rms_norm_q8: module.function(c"rms_norm_q8")?,
             add_norm_q8: module.function(c"add_norm_q8")?,
+            rms_norm2_q8: module.function(c"rms_norm2_q8")?,
             swiglu_q8: module.function(c"swiglu_q8")?,
             geglu_q8: module.function(c"geglu_q8")?,
             per_layer_inputs: module.function(c"per_layer_inputs")?,
@@ -203,12 +231,23 @@ impl Kernels {
             ssm_scan: module.function(c"ssm_scan")?,
             ssm_gated_norm: module.function(c"ssm_gated_norm")?,
             add_f32: module.function(c"add_f32")?,
+            sum_f32: module.function(c"sum_f32")?,
+            to_host: module.function(c"to_host")?,
             quantize_q8k: module.function(c"quantize_q8k")?,
             moe_gate_up: moe("moe_gate_up")?,
             moe_down: moe("moe_down")?,
+            moe_wide_gate_up: wide("moe_wide_gate_up")?,
+            moe_wide_down: wide("moe_wide_down")?,
             moe_combine: module.function(c"moe_combine")?,
             moe_route: module.function(c"moe_route")?,
             moe_assign: module.function(c"moe_assign")?,
+            rel_conv: module.function(c"rel_conv")?,
+            rel_conv_store: module.function(c"rel_conv_store")?,
+            rel_prepare: module.function(c"rel_prepare")?,
+            rel_attend: module.function(c"rel_attend")?,
+            rel_combine: module.function(c"rel_combine")?,
+            depth_mix: module.function(c"depth_mix")?,
+            loop_control: module.function(c"loop_control")?,
             read_sum: module.function(c"read_sum")?,
             multiprocessors: info.multiprocessors,
             tensor_cores,
@@ -223,6 +262,14 @@ impl Kernels {
     /// chunks on the CUDA cores.
     pub fn large_batches(&self) -> bool {
         self.attn_flash.is_some() || !self.tensor_cores
+    }
+
+    /// While on, weight products of any batch run on the GEMV, in launches
+    /// of [`MAX_BATCH`] inputs, so each input keeps the bits it has alone
+    /// instead of taking the matrix product's for batches past that. A pass
+    /// that verifies a long draft turns it on.
+    pub fn set_exact_rows(&self, on: bool) {
+        self.exact_rows.set(on);
     }
 
     /// Whether the device has the tensor-core instructions the kernels use;

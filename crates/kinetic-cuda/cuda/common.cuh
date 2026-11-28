@@ -177,6 +177,11 @@ __device__ __forceinline__ float block_sum(float v) {
     return warp_sum(lane < blockDim.x / WARP ? part[lane] : 0.0f);
 }
 
+// Eight sign bits from a 7-bit index; the eighth keeps the count even.
+__device__ __forceinline__ unsigned iq_signs(unsigned i) {
+    return i | ((__popc(i) & 1u) << 7);
+}
+
 __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }

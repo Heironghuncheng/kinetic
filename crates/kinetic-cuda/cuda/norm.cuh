@@ -27,8 +27,8 @@ struct NormArgs {
 };
 
 // out[row] = rms_norm(x[row]) * weight, or x[row] without a weight.
-extern "C" __global__ void __launch_bounds__(NORM_THREADS) rms_norm_q8(NormArgs a) {
-    const float* x = a.x + static_cast<size_t>(blockIdx.x) * a.len;
+__device__ __forceinline__ void norm_row(const NormArgs& a, unsigned row) {
+    const float* x = a.x + static_cast<size_t>(row) * a.len;
     float v[NORM_ITEMS];
     float ss = 0.0f;
 #pragma unroll
@@ -38,12 +38,25 @@ extern "C" __global__ void __launch_bounds__(NORM_THREADS) rms_norm_q8(NormArgs 
         ss = fmaf(v[k], v[k], ss);
     }
     const float scale = rms_scale(block_sum(ss), a.len, a.eps);
-    const size_t out = static_cast<size_t>(blockIdx.x) * a.out_stride + a.out_offset;
+    const size_t out = static_cast<size_t>(row) * a.out_stride + a.out_offset;
 #pragma unroll
     for (unsigned k = 0; k < NORM_ITEMS; ++k) {
         const unsigned i = threadIdx.x + k * NORM_THREADS;
         if (i < a.len) a.out.put(out + i, a.weight ? v[k] * (scale * a.weight[i]) : v[k]);
     }
+}
+
+extern "C" __global__ void __launch_bounds__(NORM_THREADS) rms_norm_q8(NormArgs a) {
+    norm_row(a, blockIdx.x);
+}
+
+struct NormPairArgs {
+    NormArgs norms[2];
+};
+
+// Two norms of each row at once, picked by blockIdx.y.
+extern "C" __global__ void __launch_bounds__(NORM_THREADS) rms_norm2_q8(NormPairArgs a) {
+    norm_row(a.norms[blockIdx.y], blockIdx.x);
 }
 
 struct AddNormArgs {
@@ -130,4 +143,10 @@ extern "C" __global__ void per_layer_gate_q8(const float* gate, const float* inp
 extern "C" __global__ void add_f32(float* y, const float* x, unsigned n) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += x[i];
+}
+
+// out[i] = a[i] + b[i] for the first n values.
+extern "C" __global__ void sum_f32(float* out, const float* a, const float* b, unsigned n) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i];
 }

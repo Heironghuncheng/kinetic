@@ -301,14 +301,15 @@ impl Kernels {
         Ok(true)
     }
 
-    /// The kernel for `n` inputs of `w` and its tile: the narrowest that
+    /// The kernel for `n` inputs of `w` and its tile, none while
+    /// [`Kernels::set_exact_rows`] is on: the narrowest that
     /// takes them all, or the widest; without tensor cores, the wide tile
     /// where its blocks fill every multiprocessor, one each, unless the
     /// products run in f16 pairs.
     fn gemm_kernel(&self, w: &DeviceMatrix, n: usize) -> Option<(&Function, &'static Tile)> {
         // Formats without a tiled kernel run their prompts through the GEMV.
         let i = weight_index(w.ty())?;
-        if !w.cols().is_multiple_of(STAGE) {
+        if !w.cols().is_multiple_of(STAGE) || self.exact_rows.get() {
             return None;
         }
         let tiles = tiles(w.ty(), self.tensor_cores, self.half);

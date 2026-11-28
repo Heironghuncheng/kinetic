@@ -1,9 +1,9 @@
-//! A double click in Explorer: instead of a window that flashes help and
-//! closes, a terminal ready to use, with `kinetic` on its path.
+//! A double click in Explorer: the home screen, and after it, instead of a
+//! window that closes, a terminal ready to use, with `kinetic` on its path.
 
 use std::process::ExitCode;
 
-const GREETING: &str = "Kinetic is ready. Try:
+const GREETING: &str = "Kinetic is ready. kinetic opens its home screen again; or try:
   kinetic pull LiquidAI/LFM3-1.7B-GGUF:Q4_K_M
   kinetic chat LiquidAI/LFM3-1.7B-GGUF
 kinetic --help lists every command.";

@@ -319,7 +319,7 @@ fn headers_alone_parse_and_garbage_fails_cleanly() {
     for len in 0..head.len() - DEFAULT_ALIGNMENT as usize {
         assert!(Gguf::parse_header(&head[..len]).is_err(), "accepted {len}");
     }
-    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut rng = Rng(0x5f3b_e73d_89d7_4ee2);
     for _ in 0..20_000 {
         let mut buf = head.to_vec();
         for _ in 0..1 + rng.below(4) {

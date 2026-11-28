@@ -102,21 +102,35 @@ impl PhysicalDevice {
                 && p11
                     .subgroup_supported_operations
                     .contains(vk::SubgroupFeatureFlags::ARITHMETIC);
-            features.subgroup_size_required = p13
-                .required_subgroup_size_stages
-                .contains(vk::ShaderStageFlags::COMPUTE)
-                && (p13.min_subgroup_size..=p13.max_subgroup_size).contains(&SUBGROUP);
+            let can_require = |size| {
+                p13.required_subgroup_size_stages
+                    .contains(vk::ShaderStageFlags::COMPUTE)
+                    && (p13.min_subgroup_size..=p13.max_subgroup_size).contains(&size)
+            };
             // A pipeline that neither requires a size nor allows a varying
             // one runs at the device's default size.
-            features.subgroup_size_32 = f13.subgroup_size_control == vk::TRUE
-                && f13.compute_full_subgroups == vk::TRUE
-                && (features.subgroup_size_required || p11.subgroup_size == SUBGROUP);
+            let runs = |size| {
+                f13.subgroup_size_control == vk::TRUE
+                    && f13.compute_full_subgroups == vk::TRUE
+                    && (can_require(size) || p11.subgroup_size == size)
+            };
+            features.subgroup_size_32 = runs(SUBGROUP);
+            features.subgroup_size_64 = runs(2 * SUBGROUP);
+            features.subgroup_size_required = can_require(features.subgroup_width());
             features.integer_dot_product = f13.shader_integer_dot_product == vk::TRUE;
             features.integer_dot_product_accelerated =
                 p13.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE;
             features.storage_16bit = f11.storage_buffer16_bit_access == vk::TRUE;
             features.storage_8bit = f12.storage_buffer8_bit_access == vk::TRUE;
             features.cooperative_matrix = has_coop && coop.cooperative_matrix == vk::TRUE;
+            features.matrix_f16 = features.cooperative_matrix
+                && features.subgroup_size_32
+                && f12.shader_float16 == vk::TRUE
+                && f12.vulkan_memory_model == vk::TRUE
+                && f12.vulkan_memory_model_device_scope == vk::TRUE
+                && f11.storage_buffer16_bit_access == vk::TRUE
+                && f11.uniform_and_storage_buffer16_bit_access == vk::TRUE
+                && has_matrix_f16(instance, raw);
             driver_name = c_text(p12.driver_name_as_c_str());
             driver_info = c_text(p12.driver_info_as_c_str());
         }
@@ -140,6 +154,7 @@ impl PhysicalDevice {
             ),
             driver_name,
             driver_info,
+            driver_version: props.driver_version,
             device_local_bytes,
             max_buffer_bytes: props.limits.max_storage_buffer_range.into(),
             timestamp_period: f64::from(props.limits.timestamp_period) * 1e-9,
@@ -158,4 +173,23 @@ impl PhysicalDevice {
 fn c_text<E>(s: std::result::Result<&CStr, E>) -> String {
     s.map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Whether a subgroup of `raw` multiplies 16x16 f16 matrices into a 16x16
+/// f32 one, the only shape the matrix kernels take.
+fn has_matrix_f16(instance: &Instance, raw: vk::PhysicalDevice) -> bool {
+    let coop = ash::khr::cooperative_matrix::Instance::new(&instance.entry, &instance.raw);
+    // SAFETY: `raw` came from this instance, which has the extension's
+    // entry point when the device lists the extension, as the caller checked.
+    let shapes = unsafe { coop.get_physical_device_cooperative_matrix_properties(raw) };
+    shapes.unwrap_or_default().iter().any(|p| {
+        p.m_size == 16
+            && p.n_size == 16
+            && p.k_size == 16
+            && p.a_type == vk::ComponentTypeKHR::FLOAT16
+            && p.b_type == vk::ComponentTypeKHR::FLOAT16
+            && p.c_type == vk::ComponentTypeKHR::FLOAT32
+            && p.result_type == vk::ComponentTypeKHR::FLOAT32
+            && p.scope == vk::ScopeKHR::SUBGROUP
+    })
 }

@@ -39,6 +39,9 @@ pub struct Features {
     /// Compute pipelines run with full subgroups of 32: either they can
     /// require that size, or it is the only size the device has.
     pub subgroup_size_32: bool,
+    /// The same for subgroups of 64, which the kernels run at where 32 is
+    /// not offered, each half of a subgroup doing the work of one of 32.
+    pub subgroup_size_64: bool,
     /// Compute pipelines can require a subgroup size. Without it (the
     /// Vulkan drivers on Metal) the size is the device's own.
     pub subgroup_size_required: bool,
@@ -52,10 +55,25 @@ pub struct Features {
     pub storage_8bit: bool,
     /// Cooperative matrix operations (`VK_KHR_cooperative_matrix`).
     pub cooperative_matrix: bool,
+    /// What the f16 matrix kernels for prompt passes need: cooperative
+    /// 16x16x16 f16 products into f32 in a subgroup of 32, f16 arithmetic,
+    /// 16-bit storage and the Vulkan memory model.
+    pub matrix_f16: bool,
     /// Descriptors pushed straight into command buffers (`VK_KHR_push_descriptor`).
     pub push_descriptor: bool,
     /// The compute queue can write timestamps.
     pub timestamps: bool,
+}
+
+impl Features {
+    /// The subgroup size the kernels run at on the device.
+    pub fn subgroup_width(&self) -> u32 {
+        if self.subgroup_size_32 {
+            SUBGROUP
+        } else {
+            2 * SUBGROUP
+        }
+    }
 }
 
 /// Properties of a physical device.
@@ -70,6 +88,8 @@ pub struct DeviceInfo {
     pub driver_name: String,
     /// The driver's own version string.
     pub driver_info: String,
+    /// The driver's version number, encoded as its vendor chooses.
+    pub driver_version: u32,
     /// Size of the largest device-local memory heap.
     pub device_local_bytes: u64,
     /// The largest storage buffer a kernel can bind.
@@ -90,14 +110,16 @@ impl DeviceInfo {
         }
         let subgroups = match (self.subgroups_too_wide(), f.subgroup_size_range) {
             (true, (min, max)) if min == max => {
-                format!("subgroups of 32 (this GPU only runs {min})")
+                format!("subgroups of 32 or 64 (this GPU only runs {min})")
             }
-            (true, (min, max)) => format!("subgroups of 32 (this GPU only runs {min} to {max})"),
-            (false, _) => "subgroups of 32".into(),
+            (true, (min, max)) => {
+                format!("subgroups of 32 or 64 (this GPU only runs {min} to {max})")
+            }
+            (false, _) => "subgroups of 32 or 64".into(),
         };
         for (have, what) in [
             (f.subgroup_arithmetic, "subgroup arithmetic"),
-            (f.subgroup_size_32, subgroups.as_str()),
+            (f.subgroup_size_32 || f.subgroup_size_64, subgroups.as_str()),
             (f.integer_dot_product, "integer dot products"),
             (f.push_descriptor, "push descriptors"),
         ] {
@@ -108,11 +130,11 @@ impl DeviceInfo {
         (!lacks.is_empty()).then(|| format!("needs {}", lacks.join(", ")))
     }
 
-    /// The device only runs subgroups wider than the 32 the kernels are
-    /// written for, which is the hardware and not its driver.
+    /// The device only runs subgroups wider than the 64 the kernels can
+    /// run at, which is the hardware and not its driver.
     pub fn subgroups_too_wide(&self) -> bool {
         let (min, _) = self.features.subgroup_size_range;
-        !self.features.subgroup_size_32 && min > SUBGROUP
+        !self.features.subgroup_size_32 && !self.features.subgroup_size_64 && min > 2 * SUBGROUP
     }
 }
 
@@ -129,6 +151,7 @@ mod tests {
             api_version,
             driver_name: String::new(),
             driver_info: String::new(),
+            driver_version: 0,
             device_local_bytes: 0,
             max_buffer_bytes: 0,
             timestamp_period: 1.0,
@@ -146,19 +169,35 @@ mod tests {
     }
 
     #[test]
-    fn a_wave64_gpu_is_too_wide() {
+    fn a_gpu_with_only_subgroups_of_64_runs_at_64() {
         let gcn = device(
             (1, 3, 260),
             Features {
                 subgroup_size: 64,
                 subgroup_size_range: (64, 64),
+                subgroup_size_64: true,
                 ..capable()
             },
         );
-        assert!(gcn.subgroups_too_wide());
+        assert!(!gcn.subgroups_too_wide());
+        assert_eq!(gcn.missing(), None);
+        assert_eq!(gcn.features.subgroup_width(), 64);
+    }
+
+    #[test]
+    fn a_wave128_gpu_is_too_wide() {
+        let wide = device(
+            (1, 3, 260),
+            Features {
+                subgroup_size: 128,
+                subgroup_size_range: (128, 128),
+                ..capable()
+            },
+        );
+        assert!(wide.subgroups_too_wide());
         assert_eq!(
-            gcn.missing().as_deref(),
-            Some("needs subgroups of 32 (this GPU only runs 64)")
+            wide.missing().as_deref(),
+            Some("needs subgroups of 32 or 64 (this GPU only runs 128)")
         );
     }
 
@@ -168,7 +207,7 @@ mod tests {
         assert!(!old.subgroups_too_wide());
         assert_eq!(
             old.missing().as_deref(),
-            Some("needs Vulkan 1.3 (driver offers 1.2), subgroups of 32")
+            Some("needs Vulkan 1.3 (driver offers 1.2), subgroups of 32 or 64")
         );
     }
 
@@ -180,10 +219,12 @@ mod tests {
                 subgroup_size: 64,
                 subgroup_size_range: (32, 64),
                 subgroup_size_32: true,
+                subgroup_size_64: true,
                 ..capable()
             },
         );
         assert!(!rdna.subgroups_too_wide());
         assert_eq!(rdna.missing(), None);
+        assert_eq!(rdna.features.subgroup_width(), 32);
     }
 }

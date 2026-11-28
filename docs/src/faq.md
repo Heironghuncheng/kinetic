@@ -20,8 +20,10 @@ as supported and the file loads, yes, unchanged. See
 [Models and formats](models.md).
 
 **Does Kinetic collect data or need an account?** No. Kinetic never connects
-to the network, except when you run `kinetic pull`. `run`, `chat` and `serve`
-never download anything, and there is no telemetry and no update check.
+to the network, except when you run `kinetic pull` or `kinetic update` or
+download with `-hf`. `run`, `chat` and `serve` never download anything, and
+there is no telemetry and no update check unless you turn on the daily
+check in Settings.
 
 **What does Kinetic store on my disk?** Only Warm Start's prompt states, in
 `kinetic/warm` under your cache directory (`%LOCALAPPDATA%` on Windows,

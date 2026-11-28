@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gemv_legacy.cuh"
 #include "gemv_low_k.cuh"
 
 // GEMV for the codebook formats IQ3_S, IQ2_S, IQ1_S and IQ1_M and the
@@ -27,6 +28,17 @@ __device__ __forceinline__ float plane_half(const uint8_t* p) {
 
 __device__ __forceinline__ unsigned plane_u16(const uint8_t* p) {
     return __ldg(reinterpret_cast<const unsigned short*>(p));
+}
+
+__device__ __forceinline__ unsigned plane_u32(const uint8_t* p) {
+    return __ldg(reinterpret_cast<const unsigned*>(p));
+}
+
+// The scale of IQ4_XS sub-block p, its 6 bits less 32.
+__device__ __forceinline__ int iq4_xs_scale(const uint8_t* w, size_t total, size_t blk, unsigned p) {
+    const unsigned low = __ldg(w + total * 128 + blk * 4 + p / 2) >> (4 * (p % 2)) & 0xF;
+    const unsigned high = plane_u16(w + total * 132 + blk * 2) >> (2 * p) & 3;
+    return static_cast<int>(low | high << 4) - 32;
 }
 
 // The two words of IQ2_S and IQ1 codebook entry `i`, eight bytes each.
@@ -311,12 +323,76 @@ struct GemvTQ2_0 {
     }
 };
 
+// IQ3_XXS: qs (64), then per 32 values a word of four 7-bit sign indices
+// and a 4-bit scale `s`, then d. Lane p reads groups of four 8p..8p+7 and
+// word p; d (0.5 + s) / 2 is d / 4 times the integer 2s + 1.
+struct GemvIQ3_XXS {
+    static constexpr unsigned LANES = 8;
+    static constexpr unsigned ELEMS = 256;
+
+    struct Block {
+        Words q[2];
+        int scale;
+        float d;
+    };
+
+    __device__ static Block load(const uint8_t* w, size_t total, size_t blk, unsigned p) {
+        Block k;
+        const uint8_t* grid = w + grid_at(total, 98);
+        const uint2 qs = __ldg(reinterpret_cast<const uint2*>(w + blk * 64) + p);
+        const unsigned aux = __ldg(reinterpret_cast<const unsigned*>(w + total * 64 + blk * 32) + p);
+#pragma unroll
+        for (unsigned g = 0; g < 8; ++g) {
+            const unsigned index = ((g < 4 ? qs.x : qs.y) >> (8 * (g % 4))) & 0xFF;
+            const int v = __ldg(reinterpret_cast<const int*>(grid) + index);
+            k.q[g / 4].w[g % 4] = negate_bytes(v, iq_signs(aux >> (7 * (g / 2)) & 127) >> (4 * (g % 2)));
+        }
+        k.scale = 2 * static_cast<int>(aux >> 28) + 1;
+        k.d = __fmul_rn(plane_half(w + total * 96 + blk * 2), 0.25f);
+        return k;
+    }
+
+    __device__ static float dot(const Block& k, unsigned b, unsigned p, Q8Input x) {
+        const int q = k.scale * lane_dot(k.q, b, p, x);
+        return __fmul_rn(__fmul_rn(k.d, input_scale(b, p, x)), static_cast<float>(q));
+    }
+};
+
+// IQ4_XS: qs (128), the low nibbles of the eight 6-bit scales (4), their
+// high bits (2), d. Lane p reads the sixteen bytes of its 32 values, low
+// nibbles first, through the IQ4_NL table, with the scale s - 32.
+struct GemvIQ4_XS {
+    static constexpr unsigned LANES = 8;
+    static constexpr unsigned ELEMS = 256;
+
+    struct Block {
+        Words q[2];
+        int scale;
+        float d;
+    };
+
+    __device__ static Block load(const uint8_t* w, size_t total, size_t blk, unsigned p) {
+        const unsigned table[4] = IQ4NL_TABLE;
+        const Words codes = load_weights(w + blk * 128 + 16 * p);
+        return {{lookup16(nibbles(codes, 0), table), lookup16(nibbles(codes, 1), table)},
+                iq4_xs_scale(w, total, blk, p),
+                plane_half(w + total * 134 + blk * 2)};
+    }
+
+    __device__ static float dot(const Block& k, unsigned b, unsigned p, Q8Input x) {
+        const int q = k.scale * lane_dot(k.q, b, p, x);
+        return __fmul_rn(__fmul_rn(k.d, input_scale(b, p, x)), static_cast<float>(q));
+    }
+};
+
 GEMV_KERNELS(GEMV_KERNEL_Q8, gemv_iq3_s, GemvIQ3_S)
 GEMV_KERNELS(GEMV_KERNEL_Q8, gemv_iq2_s, GemvIQ2_S)
 GEMV_KERNELS(GEMV_KERNEL_Q8, gemv_iq1_s, GemvIQ1_S)
 GEMV_KERNELS(GEMV_KERNEL_Q8, gemv_iq1_m, GemvIQ1_M)
 GEMV_KERNELS(GEMV_KERNEL_Q8, gemv_tq1_0, GemvTQ1_0)
 GEMV_KERNELS(GEMV_KERNEL_Q8, gemv_tq2_0, GemvTQ2_0)
+GEMV_KERNELS(GEMV_KERNEL_Q8, gemv_iq3_xxs, GemvIQ3_XXS)
+GEMV_KERNELS(GEMV_KERNEL_Q8, gemv_iq4_xs, GemvIQ4_XS)
 
 // Element i of block `blk`, for the embedding lookup, with the reference
 // dequantization's roundings.
@@ -329,6 +405,24 @@ __device__ float iq3_s_element(const uint8_t* w, size_t total, size_t blk, unsig
     const bool negative = w[total * 72 + blk * 32 + k / 2] >> (4 * (k % 2) + i % 4) & 1;
     const float v = __fmul_rn(db, g);
     return negative ? -v : v;
+}
+
+__device__ float iq3_xxs_element(const uint8_t* w, size_t total, size_t blk, unsigned i) {
+    const unsigned aux = plane_u32(w + total * 64 + blk * 32 + 4 * (i / 32));
+    const float g = w[grid_at(total, 98) + 4 * w[blk * 64 + i / 4] + i % 4];
+    const float d = plane_half(w + total * 96 + blk * 2);
+    const float db = __fmul_rn(__fmul_rn(d, 0.5f + static_cast<float>(aux >> 28)), 0.5f);
+    const bool negative = iq_signs(aux >> (7 * (i % 32 / 8)) & 127) >> (i % 8) & 1;
+    const float v = __fmul_rn(db, g);
+    return negative ? -v : v;
+}
+
+__device__ float iq4_xs_element(const uint8_t* w, size_t total, size_t blk, unsigned i) {
+    const unsigned table[4] = IQ4NL_TABLE;
+    const unsigned byte = w[blk * 128 + 16 * (i / 32) + i % 16];
+    const int v = static_cast<int8_t>(lookup16((i % 32 < 16 ? byte : byte >> 4) & 0xF, table));
+    const float dl = __fmul_rn(plane_half(w + total * 134 + blk * 2), static_cast<float>(iq4_xs_scale(w, total, blk, i / 32)));
+    return __fmul_rn(dl, static_cast<float>(v));
 }
 
 __device__ float iq2_s_element(const uint8_t* w, size_t total, size_t blk, unsigned i) {

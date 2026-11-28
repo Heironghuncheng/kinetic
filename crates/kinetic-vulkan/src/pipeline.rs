@@ -21,14 +21,24 @@ pub(crate) struct Kernel {
 impl Kernel {
     /// Builds the `main` entry point of `spirv`, which binds `bindings`
     /// storage buffers in set 0 and reads `push_words` 32-bit push constants.
-    /// Every kernel runs with full subgroups of [`SUBGROUP`] invocations.
+    /// `spirv` holds the kernel for subgroups of 32 and the one for 64; the
+    /// device's [`Features::subgroup_width`] picks one, and it runs with
+    /// full subgroups of that size.
+    ///
+    /// [`Features::subgroup_width`]: crate::Features::subgroup_width
     pub(crate) fn new(
         device: &Rc<Device>,
         name: &str,
-        spirv: &[u8],
+        spirv: [&[u8]; 2],
         bindings: usize,
         push_words: usize,
     ) -> Result<Rc<Kernel>> {
+        let width = device.info().features.subgroup_width();
+        let spirv = if width == SUBGROUP {
+            spirv[0]
+        } else {
+            spirv[1]
+        };
         let code = ash::util::read_spv(&mut Cursor::new(spirv))
             .map_err(|e| Error::Shape(format!("embedded SPIR-V of {name}: {e}")))?;
         let raw = &device.raw;
@@ -74,14 +84,18 @@ impl Kernel {
         let module = unsafe { raw.create_shader_module(&module_info, None) }
             .check("vkCreateShaderModule")?;
         let mut subgroup = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-            .required_subgroup_size(SUBGROUP);
+            .required_subgroup_size(width);
         let mut stage = vk::PipelineShaderStageCreateInfo::default()
-            .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
             .name(c"main");
+        // A workgroup of 32 cannot fill a subgroup of 64; it runs as one
+        // half of it, which is all the 64-wide kernels reduce over.
+        if workgroup_width(&code).is_some_and(|w| w % width == 0) {
+            stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+        }
         // Where a size cannot be required, the device's own is already
-        // SUBGROUP; `DeviceInfo::missing` refused every other device.
+        // `width`; `DeviceInfo::missing` refused every other device.
         if device.info().features.subgroup_size_required {
             stage = stage.push_next(&mut subgroup);
         }
@@ -99,6 +113,22 @@ impl Kernel {
             .check("vkCreateComputePipelines")?[0];
         Ok(Rc::new(kernel))
     }
+}
+
+/// The workgroup width `code` gives in its `LocalSize` execution mode.
+fn workgroup_width(code: &[u32]) -> Option<u32> {
+    const OP_EXECUTION_MODE: u32 = 16;
+    const LOCAL_SIZE: u32 = 17;
+    // Instructions start after the five-word header; each one's first word
+    // holds its length in the high half and its opcode in the low half.
+    let mut at = 5;
+    while let Some(&word) = code.get(at) {
+        if word & 0xFFFF == OP_EXECUTION_MODE && code.get(at + 2) == Some(&LOCAL_SIZE) {
+            return code.get(at + 3).copied();
+        }
+        at += (word >> 16).max(1) as usize;
+    }
+    None
 }
 
 impl Drop for Kernel {

@@ -104,14 +104,40 @@ GPU is used unless `--gpus` names others; see [Several GPUs](#several-gpus).
 
 `--device vulkan` runs models on any GPU with a Vulkan driver: AMD, Intel and
 NVIDIA. Today it runs `llama`, `qwen2`, `qwen3`, `lfm3` and `qwen35` models,
-with drafting and Warm Start; MoE models and the other architectures are
-[coming](roadmap.md). Under `auto`, Vulkan is tried after CUDA, so an NVIDIA
+with drafting and Warm Start, and mixture-of-experts models such as
+Inkling 2 (see [Mixture-of-experts offload](#mixture-of-experts-offload));
+the other architectures are [coming](roadmap.md). Under `auto`, Vulkan is tried after CUDA, so an NVIDIA
 GPU uses CUDA and an AMD or Intel GPU uses Vulkan.
 
-The Vulkan kernels need subgroups of 32. NVIDIA, Intel and AMD's RDNA GPUs
-have them; AMD's older GCN and Vega GPUs, among them the integrated graphics
-of many Ryzen APUs, only run subgroups of 64, which no driver changes, so
-models run on the CPU there and `kinetic doctor` says so.
+The Vulkan kernels run in subgroups of 32 where the GPU offers them, as
+NVIDIA, Intel and AMD's RDNA GPUs do. AMD's older GCN and Vega GPUs, among
+them the integrated graphics of many Ryzen APUs, only run subgroups of 64;
+there each half of a subgroup does the work of a subgroup of 32, and models
+run on them as on the others.
+
+LFM2.5 mixture of experts (`lfm2moe`) runs through Vulkan but does not match
+the CPU yet: its logits differ by up to about 14% of the largest one, and
+the first tokens of an answer can differ. Use `--device cpu`, or CUDA on an
+NVIDIA GPU, for it until that is fixed.
+
+On GPUs with cooperative f16 matrices (`VK_KHR_cooperative_matrix`, such as
+AMD's RDNA3 cards and NVIDIA's RTX cards), prompts run on the matrix units:
+Q8_0 and K-quant products of passes of up to 512 tokens take 16x16x16 f16
+products into f32, three to four times as fast as the decode kernels on
+long prompts. The status line says so, `(Vulkan, cooperative matrices)`. As
+on CUDA, a prompt's state then differs slightly from the same tokens decoded
+one at a time; where the prompt is cut changes no bit, and decoding and
+drafts give exactly what they give without it. So that a chat's next turn
+gives what it gives run cold, it runs the last reply again as prompt, from
+the prompt cache when that is on. With `--no-prompt-cache` there is nothing
+to resume from, so each turn runs the whole chat again and a long chat's
+turns grow slow; keep Warm Start on for chats, or turn the matrix units off.
+Warm Start keeps states made this way apart from the others and from other
+driver versions, receipts record them, and `--off coopmat` runs prompts with
+the decode kernels. Prompt passes keep buffers for 512 tokens in every
+state; when those don't fit in the GPU's memory, or one is larger than the
+GPU allows for a single buffer, Kinetic says so and runs prompts with the
+decode kernels instead.
 
 ## Dense models larger than the GPU
 
@@ -227,10 +253,26 @@ needed.
 When every expert fits on the GPU, there is no offload: routing runs on the
 GPU too.
 
+Kinetic keeps part of the GPU's memory free for the driver and other
+programs: 300 MiB or a twentieth of the GPU, whichever is larger. The
+expert cache gets the largest size that leaves that reserve, measured on
+the state the model really builds. A looped model such as Inkling 2 runs
+some layers several times a token, and those layers get a larger share of
+the cache.
+
+Gemma 4 26B A4B runs on the CPU only for now: the GPU paths have no kernels
+yet for its experts, which use a GELU gate.
+
+On Vulkan, a model whose experts do not all fit keeps every expert of as
+many layers as fit on the GPU, the layers a token runs most often first: a
+looped model such as Inkling 2 runs the layers of its loop once per pass.
+The experts of the other layers run on the CPU where they are, in the
+memory-mapped file, so nothing is copied to the GPU while the model runs.
+Experts of a weight type without a Vulkan kernel run on the CPU as well.
+
 ## Coming
 
-- **More on Vulkan**: more architectures, speculative decoding, Warm Start
-  and layer splits.
+- **More on Vulkan**: more architectures and layer splits.
 - **Several GPUs** for mixture-of-experts models, Gemma 4 E2B/E4B and
   shared passes; dense models already spread over them with `--gpus`.
 

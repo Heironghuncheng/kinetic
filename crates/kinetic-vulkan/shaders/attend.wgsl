@@ -9,7 +9,14 @@
 // A token sees the last `window` positions up to its own; position p sits
 // in cache slot p % slots. With gate 1 the output is multiplied by the
 // sigmoid of the gate values after each query head; with gate 2 by that of
-// the head's one gate value at `gate_at` in the token's row.
+// the head's one gate value at `gate_at` in the token's row; with gate 3 by
+// that of the head's own gate values from `gate_at`.
+//
+// With `n_rel` above zero, attention is by relative distance: a key `dist`
+// positions back gets the bias of row `dist` of `rel_bias` (none from
+// `extent` on) dotted with the head's `n_rel` terms at `rel_at`, minus the
+// head's sink logit at `sink_at`; the sink itself is one more logit of zero
+// with a value of zero.
 
 struct Shape {
     n_head: u32,
@@ -21,6 +28,10 @@ struct Shape {
     gate_at: u32,
     window: u32,
     slots: u32,
+    n_rel: u32,
+    extent: u32,
+    rel_at: u32,
+    sink_at: u32,
 }
 
 var<immediate> shape: Shape;
@@ -32,11 +43,13 @@ var<immediate> shape: Shape;
 @group(0) @binding(4) var<storage, read_write> ox: array<f32>;
 @group(0) @binding(5) var<storage, read_write> oq: array<u32>;
 @group(0) @binding(6) var<storage, read_write> od: array<vec2<f32>>;
+@group(0) @binding(7) var<storage, read> rel_bias: array<f32>;
 
 const HD: u32 = 64u * PAIRS;
 const SUBGROUPS: u32 = 4u;
 const THREADS: u32 = 32u * SUBGROUPS;
 const LOWEST: f32 = -3.4e38;
+const MAX_REL: u32 = 16u;
 
 var<workgroup> top: array<f32, SUBGROUPS>;
 var<workgroup> total: array<f32, SUBGROUPS>;
@@ -67,6 +80,15 @@ fn main(
         q[k] = vec2<f32>(qkv[e], qkv[e + 1u]) * shape.scale;
         acc[k] = vec2<f32>(0.0);
     }
+    var r: array<f32, MAX_REL>;
+    var sink = 0.0;
+    if shape.n_rel > 0u {
+        let rb = t * shape.stride + shape.rel_at + head * shape.n_rel;
+        for (var i = 0u; i < shape.n_rel; i++) {
+            r[i] = qkv[rb + i];
+        }
+        sink = qkv[t * shape.stride + shape.sink_at + head];
+    }
     var m = LOWEST;
     var l = 0.0;
     let first = kv_head * HD / 2u + lane;
@@ -76,7 +98,17 @@ fn main(
         for (var k = 0u; k < PAIRS; k++) {
             qk += dot(q[k], unpack2x16float(kc[row + 32u * k]));
         }
-        let s = subgroupAdd(qk);
+        var s = subgroupAdd(qk);
+        if shape.n_rel > 0u {
+            let dist = len - 1u - p;
+            var bias = 0.0;
+            if dist < shape.extent {
+                for (var i = 0u; i < shape.n_rel; i++) {
+                    bias += rel_bias[dist * shape.n_rel + i] * r[i];
+                }
+            }
+            s += bias - sink;
+        }
         let next = max(m, s);
         let c = exp(m - next);
         let e = exp(s - next);
@@ -101,9 +133,15 @@ fn main(
     for (var s = 1u; s < SUBGROUPS; s++) {
         best = max(best, top[s]);
     }
+    if shape.n_rel > 0u {
+        best = max(best, 0.0);
+    }
     var den = 0.0;
     for (var s = 0u; s < SUBGROUPS; s++) {
         den += total[s] * exp(top[s] - best);
+    }
+    if shape.n_rel > 0u {
+        den += exp(-best);
     }
     let out = (t * shape.n_head + head) * HD;
     // HD is a multiple of 64, so subgroups run whole.
@@ -117,6 +155,8 @@ fn main(
             o /= 1.0 + exp(-qkv[qb + HD + e]);
         } else if shape.gate == 2u {
             o /= 1.0 + exp(-qkv[t * shape.stride + shape.gate_at + head]);
+        } else if shape.gate == 3u {
+            o /= 1.0 + exp(-qkv[t * shape.stride + shape.gate_at + head * HD + e]);
         }
         put_q8(out + e, o, lane);
     }

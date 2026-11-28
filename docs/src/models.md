@@ -40,15 +40,16 @@ The names are the GGUF `general.architecture` values.
 |---|---|:-:|:-:|
 | `qwen35` | Qwen3.5, with its multi-token prediction block | yes | yes |
 | `qwen35moe` | Qwen3.5 mixture of experts, such as 35B-A3B | yes | yes, also larger than GPU memory |
+| `inkling2_loop`, `inkling2` | Inkling 2 Mini, a mixture of experts, in ggml-org's looped layout and Unsloth's unrolled one | yes | yes, also larger than GPU memory |
 | `lfm3` | LFM3 | yes | yes |
 | `lfm2` | LFM2 | yes | yes |
 | `lfm2moe` | LFM2.5 mixture of experts, such as 8B-A1B (experimental, slower than llama.cpp on CUDA for now) | yes | yes, also larger than GPU memory |
-| `llama` | Llama 3, Mistral, SmolLM2 and other models built like Llama | yes | yes |
+| `llama` | Llama 3, Mistral, Mistral Nemo, SmolLM2 and other models built like Llama | yes | yes |
 | `phi3` | Microsoft Phi-3 Mini 4K Instruct (official Q4_K_M); use `--device cpu` for the tested configuration. 128K is not supported | yes | no |
 | `qwen2` | Qwen2.5 | yes | yes |
 | `qwen3` | Qwen3 | yes | yes |
 | `gemma3` | Gemma 3 | yes | yes |
-| `gemma4` | Gemma 4 E2B and E4B; the 26B A4B mixture of experts is not supported yet | yes | yes |
+| `gemma4` | Gemma 4 E2B, E4B, 12B and 31B, and the 26B A4B mixture of experts | yes | yes, but not the 26B A4B |
 | `ernie4_5` | ERNIE 4.5 | yes | yes |
 | `hunyuan-dense` | Hunyuan dense models | yes | yes |
 | `exaone4` | EXAONE 4.0 | yes | yes |
@@ -60,7 +61,8 @@ The names are the GGUF `general.architecture` values.
 
 With `--device auto`, a model that cannot run on the GPU runs on the CPU and
 Kinetic prints why. Through Vulkan (`--device vulkan`), `llama`, `qwen2`,
-`qwen3`, `lfm3` and `qwen35` models run today; see [Devices](devices.md#vulkan).
+`qwen3`, `lfm3` and `qwen35` models run today, and mixture-of-experts models
+such as Inkling 2; see [Devices](devices.md#vulkan).
 
 ### Embedding and ranking models
 
@@ -120,8 +122,8 @@ The tokenizer is read from the file. Kinetic has byte-level BPE
 (`tokenizer.ggml.model` = `gpt2`), SentencePiece (`llama`) and WordPiece
 (`bert`). BPE models also name a pre-tokenizer (`tokenizer.ggml.pre`); these
 are supported: `qwen35`, `qwen2`, `llama3`, `llama-v3`, `llama-bpe`, `lfm2`,
-`falcon-h1`, `dbrx`, `smollm`, `refact`, `gpt-2`, `exaone4` and
-`hunyuan-dense`. `kinetic info` names a missing one on its tokenizer line.
+`falcon-h1`, `dbrx`, `smollm`, `refact`, `gpt-2`, `exaone4`,
+`hunyuan-dense`, `tekken` and `inkling2`. `kinetic info` names a missing one on its tokenizer line.
 
 ### Chat templates and tool calls
 
@@ -138,30 +140,37 @@ mixes several (Q4_K_M, for one, is mostly Q4_K with some Q6_K).
 |---|---:|:-:|:-:|
 | F32 | 32 | yes | yes |
 | F16 | 16 | yes | yes |
-| BF16 | 16 | yes | coming |
+| BF16 | 16 | yes | expanded |
 | Q8_0 | 8.5 | yes | yes |
+| F8_E4M3 | 8 | yes | expanded |
 | Q6_K | 6.56 | yes | yes |
 | Q5_K | 5.5 | yes | yes |
 | Q5_0, Q5_1 | 5.5, 6 | yes | yes |
 | Q4_K | 4.5 | yes | yes |
 | Q4_0, Q4_1 | 4.5, 5 | yes | yes |
 | IQ4_NL | 4.5 | yes | yes |
-| IQ4_XS | 4.25 | yes | experts only |
+| NVFP4 | 4.5 | yes | experts; expanded elsewhere |
+| IQ4_XS | 4.25 | yes | yes |
 | MXFP4 | 4.25 | yes | yes |
 | Q3_K | 3.44 | yes | yes |
 | IQ3_S | 3.44 | yes | yes |
-| IQ3_XXS | 3.06 | yes | experts only |
+| IQ3_XXS | 3.06 | yes | yes |
 | Q2_K | 2.63 | yes | yes |
 | IQ2_S | 2.56 | yes | yes |
-| IQ2_XS | 2.31 | yes | experts only |
-| IQ2_XXS | 2.06 | yes | experts only |
+| IQ2_XS | 2.31 | yes | experts; expanded elsewhere |
+| IQ2_XXS | 2.06 | yes | experts; expanded elsewhere |
 | TQ2_0 | 2.06 | yes | yes |
 | IQ1_M | 1.75 | yes | yes |
 | TQ1_0 | 1.69 | yes | yes |
 | IQ1_S | 1.56 | yes | yes |
 
-"Experts only" means the type runs on the GPU as the routed experts of a
-mixture-of-experts model; in any other tensor it keeps the model on the CPU. The format
+"Expanded" means CUDA has no kernel for the type there: the weights are
+expanded to Q8_0 when the model loads and run from that, which takes more
+GPU memory than the file and rounds the weights once more, so answers can
+differ a little from the CPU's; the load says in one line which types were
+expanded and what that costs.
+"Experts" means the routed experts of a mixture-of-experts model have a
+kernel of their own. The format
 definitions follow ggml's, so a GGUF file means the same in Kinetic as in
 llama.cpp.
 

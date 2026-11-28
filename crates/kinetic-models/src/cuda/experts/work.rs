@@ -1,6 +1,4 @@
-use kinetic_cuda::{
-    DeviceBuffer, ExpertGroup, PinnedBuffer, Stream, EXPERT_GROUP, MAX_BATCH, Q8K_BLOCK,
-};
+use kinetic_cuda::{DeviceBuffer, Event, ExpertGroup, PinnedBuffer, Stream, MAX_BATCH};
 
 use super::place::Place;
 use super::Gpu;
@@ -37,8 +35,10 @@ pub(in crate::cuda) struct ExpertWork {
     pub weights: DeviceBuffer<f32>,
     /// Per token and pick, its expert, when routing stays on the device.
     pub experts: DeviceBuffer<u32>,
-    /// Scores, then the feed-forward input, read back each layer.
+    /// Scores, then the feed-forward input, read back each layer, and the
+    /// event after their copy.
     pub down: PinnedBuffer<f32>,
+    pub ready: Event,
     /// Groups, inputs and rows on their way to the device.
     route: PinnedBuffer<u32>,
     route_weights: PinnedBuffer<f32>,
@@ -68,23 +68,26 @@ impl ExpertWork {
         } = *dims;
         let assigned = rows * picks;
         let f32s = |len: usize| DeviceBuffer::<f32>::new(ctx, len.max(1));
+        // two scales per 32 values, the most any expert type's inputs take
+        let scales = |len: usize| f32s(len / 16);
         let u32s = |len: usize| DeviceBuffer::<u32>::new(ctx, len.max(1));
         let i8s = |len: usize| DeviceBuffer::<i8>::new(ctx, len.max(1));
         Ok(ExpertWork {
             gates: f32s(rows * scores)?,
             chunk_gates: f32s(MAX_BATCH * scores)?,
             hq: i8s(rows * d)?,
-            hd: f32s(rows * d / Q8K_BLOCK)?,
+            hd: scales(rows * d)?,
             groups: u32s(4 * assigned)?,
             inputs: u32s(assigned)?,
             act: f32s(assigned * n_ff)?,
             actq: i8s(assigned * n_ff)?,
-            actd: f32s(assigned * n_ff / Q8K_BLOCK)?,
+            actd: scales(assigned * n_ff)?,
             out: f32s(assigned * d)?,
             rows: u32s(assigned)?,
             weights: f32s(assigned)?,
             experts: u32s(assigned)?,
             down: PinnedBuffer::new(ctx, rows * (scores + d))?,
+            ready: Event::new(ctx)?,
             route: PinnedBuffer::new(ctx, 6 * assigned)?,
             route_weights: PinnedBuffer::new(ctx, assigned)?,
             host_out: PinnedBuffer::new(ctx, assigned * d)?,
@@ -111,12 +114,13 @@ impl ExpertWork {
     }
 
     /// Assigns every pick, [`ExpertWork::picks`] per token, to a device
-    /// group or a host job as `place` says, and uploads the groups, inputs
-    /// and per-pick rows and weights.
+    /// group of at most `size` or a host job as `place` says, and uploads
+    /// the groups, inputs and per-pick rows and weights.
     pub(super) fn assign(
         &mut self,
         picks: &[Pick],
         place: &[Place],
+        size: usize,
         stream: &Stream,
     ) -> kinetic_cuda::Result<Assigned> {
         let k = self.picks;
@@ -138,17 +142,14 @@ impl ExpertWork {
                 None => list.push((slot, vec![s])),
             }
         }
-        let n_cached: usize = cached
-            .iter()
-            .map(|(_, s)| s.len().div_ceil(EXPERT_GROUP))
-            .sum();
+        let n_cached: usize = cached.iter().map(|(_, s)| s.len().div_ceil(size)).sum();
         let n = picks.len();
         let route = self.route.as_mut_slice();
         let (groups_at, inputs_at, rows_at) = (0, 4 * n, 5 * n);
         let mut groups = 0;
         let mut a = 0;
         for (slot, list) in cached.iter().chain(&transit) {
-            for chunk in list.chunks(EXPERT_GROUP) {
+            for chunk in list.chunks(size) {
                 let group = ExpertGroup {
                     slot: *slot,
                     first: a as u32,

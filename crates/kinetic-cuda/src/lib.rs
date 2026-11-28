@@ -42,6 +42,7 @@ mod attention;
 mod batch;
 mod context;
 mod delta_net;
+mod depth;
 mod device;
 mod driver;
 mod error;
@@ -52,12 +53,14 @@ mod gemv;
 mod graph;
 mod kernels;
 mod layout;
+mod mapped;
 mod memory;
 mod module;
 mod moe;
 mod norm;
 pub mod peer;
 mod pinned;
+mod relative;
 mod short_conv;
 mod ssm;
 mod stream;
@@ -68,6 +71,7 @@ pub use attention::{AttentionIo, AttentionParams, AttentionShape, KvCache, KvTyp
 pub use batch::Batch;
 pub use context::{peer_access_allowed, Context};
 pub use delta_net::{DeltaIo, DeltaParams, DeltaShape, DeltaState, Flow, HostState};
+pub use depth::DEPTH_MAX_STATES;
 pub use device::{driver_version, Device, DeviceInfo};
 pub use error::{Error, Result};
 pub use fold::ValueHeads;
@@ -77,11 +81,13 @@ pub use kernels::Kernels;
 pub use memory::{DeviceBuffer, DeviceCopy};
 pub use module::{Function, LaunchConfig, Module};
 pub use moe::{
-    ExpertArena, ExpertGroup, ExpertMix, ExpertProduct, ExpertTables, GateLogits, Q8kRows, Routing,
-    ASSIGN_MAX_PICKS, EXPERT_GROUP, EXPERT_TYPES, Q8K_BLOCK, ROUTE_MAX_EXPERTS,
+    expert_block, ExpertArena, ExpertGroup, ExpertMix, ExpertProduct, ExpertTables, GateLogits,
+    Q8kRows, Routing, ASSIGN_MAX_PICKS, EXPERT_GROUP, EXPERT_TYPES, EXPERT_WIDE, Q8K_BLOCK,
+    ROUTE_MAX_EXPERTS,
 };
 pub use norm::{AddNorm, RmsNorm};
 pub use pinned::PinnedBuffer;
+pub use relative::{RelIo, RelShape, RelWeights};
 pub use short_conv::ConvState;
 pub use ssm::{SsmParams, SsmShape, SsmState};
 pub use stream::{Event, Stream};

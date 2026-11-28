@@ -218,23 +218,27 @@ fn generate_timed(backend: &mut dyn Backend, prompt: &[u32]) -> (Vec<u32>, Timin
     (out, timings)
 }
 
+/// `n` token ids of a model with `vocab` tokens, a different run of them
+/// for each `seed`.
+fn ids(vocab: u32, n: u32, seed: u32) -> Vec<u32> {
+    (0..n)
+        .map(|i| 100 + (i * 7919 + seed * 104_729) % (vocab / 2))
+        .collect()
+}
+
 /// An agent loop on the CPU: a system prompt, then five requests that each
 /// add a short tool result to the one before, without its reply as it was
 /// generated, as when a template writes it back differently. Each runs only
 /// the tokens after where the one before started its last batch, from the
 /// cached sequence alone or, with another conversation in between, from
-/// the prompt cache, and answers exactly as a cold run does.
+/// the prompt cache, and answers exactly as a cold run does. Of several
+/// backends, the one with the sequence says it reuses as much.
 #[test]
 #[ignore = "needs KINETIC_TEST_GGUF"]
 fn agent_loops_resume_where_the_last_request_ended() {
     let (path, file, _) = model_file();
     let model = kinetic_models::load(&file).unwrap();
-    let vocab = model.n_vocab() as u32;
-    let ids = |n: u32, seed: u32| -> Vec<u32> {
-        (0..n)
-            .map(|i| 100 + (i * 7919 + seed * 104_729) % (vocab / 2))
-            .collect()
-    };
+    let ids = |n: u32, seed: u32| ids(model.n_vocab() as u32, n, seed);
     let id = warm::model_id(&path).unwrap();
     let mut alone = CpuBackend::new(&model);
     let mut shared = CpuBackend::new(&model).with_warm(Warm::new(&model, id, 1 << 30));
@@ -248,6 +252,7 @@ fn agent_loops_resume_where_the_last_request_ended() {
         let want = previous.map_or(0, |len| (len - 1) / PREFILL_GRID * PREFILL_GRID);
         let cold = generate_timed(&mut CpuBackend::new(&model), &prompt).0;
 
+        assert_eq!(alone.reuses(&prompt), want, "cached sequence, request {i}");
         let (tokens, timings) = generate_timed(&mut alone, &prompt);
         assert_eq!(timings.cached_tokens, want, "cached sequence, request {i}");
         assert_eq!(tokens, cold, "cached sequence, request {i}");
@@ -289,6 +294,41 @@ mod gpu {
             plain(gpu, &mut Greedy, prompt)
         } else {
             plain(gpu, &mut Sampler::new(sampling.clone()), prompt)
+        }
+    }
+
+    /// An agent loop on the GPU, as on the CPU in
+    /// [`agent_loops_resume_where_the_last_request_ended`]: each request
+    /// leaves the reply before it unsettled, cuts the sequence back to
+    /// before that reply rather than starting over, reuses what
+    /// [`Backend::reuses`] says it will and answers as a cold run does.
+    #[test]
+    #[ignore = "needs KINETIC_TEST_GGUF and a CUDA device"]
+    fn gpu_agent_loops_resume_before_the_reply() {
+        let (_, file, _) = model_file();
+        let model = kinetic_models::load(&file).unwrap();
+        let ids = |n: u32, seed: u32| ids(model.n_vocab() as u32, n, seed);
+        let mut prompt = ids(144, 1);
+        let prompts: Vec<_> = [21, 25, 20, 23, 22]
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| {
+                prompt.extend(ids(n, i as u32 + 2));
+                prompt.clone()
+            })
+            .collect();
+        let cold: Vec<_> = prompts
+            .iter()
+            .map(|p| generate_timed(&mut CudaBackend::new(&model, 4096).unwrap(), p).0)
+            .collect();
+
+        let mut backend = CudaBackend::new(&model, 4096).unwrap();
+        for (i, (prompt, cold)) in prompts.iter().zip(&cold).enumerate() {
+            let reuses = backend.reuses(prompt);
+            let (tokens, timings) = generate_timed(&mut backend, prompt);
+            assert_eq!(&tokens, cold, "request {i}");
+            assert_eq!(timings.cached_tokens, reuses, "request {i}");
+            assert!(i == 0 || reuses > 0, "request {i} started over");
         }
     }
 
@@ -415,6 +455,48 @@ fn f{i}(a: i32) -> i32 {{"
                         backend.settle_some();
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+mod vulkan {
+    use super::*;
+    use kinetic_server::VulkanBackend;
+
+    /// Every turn of a chat continued from the cache gives what the whole
+    /// conversation gives on a fresh backend, which runs it all as prompt:
+    /// on the matrix units the reply's decode steps sum unlike a prompt.
+    #[test]
+    #[ignore = "needs KINETIC_TEST_GGUF and a Vulkan device"]
+    fn vulkan_chat_continues_like_a_cold_run() {
+        let (_, file, tokenizer) = model_file();
+        let model = kinetic_models::load(&file).unwrap();
+        let turns: Vec<Vec<u32>> = [
+            CODE.repeat(3),
+            "\nfn neg(a: i32) -> i32 {".into(),
+            CODE.into(),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, text)| tokenizer.encode(&format!("{text}\nfn f{i}(a: i32) -> i32 {{"), i == 0))
+        .collect();
+        let settings = settings();
+        let mut chat = VulkanBackend::new(&model, 4096, true).unwrap();
+        eprintln!("{}", chat.device());
+        for sampling in [&settings[0], &settings[2]] {
+            let mut prompt = Vec::new();
+            for (turn, text) in turns.iter().enumerate() {
+                prompt.extend_from_slice(text);
+                let answer = generate(&mut chat, &prompt, sampling);
+                let mut cold = VulkanBackend::new(&model, 4096, true).unwrap();
+                assert_eq!(
+                    generate(&mut cold, &prompt, sampling),
+                    answer,
+                    "turn {turn}, {sampling:?}"
+                );
+                prompt.extend_from_slice(&answer[..answer.len() - 1]);
             }
         }
     }

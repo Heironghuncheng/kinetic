@@ -18,29 +18,31 @@
 //! `blocks/moe/kernels.rs`), and outputs are mixed in pick order on the
 //! device, so where an expert ran never changes a token's result.
 
-mod cache;
+mod exact;
+mod form;
+#[cfg(target_arch = "x86_64")]
+mod grouped;
 mod offload;
 mod place;
-mod plan;
-mod stats;
 #[cfg(test)]
 mod tests;
 mod work;
 
 use kinetic_cuda::{
-    DeviceBuffer, DeviceMatrix, ExpertArena, ExpertMix, ExpertProduct, GateLogits, GemvInput,
-    Q8kRows, Routing, EXPERT_TYPES,
+    expert_block, DeviceBuffer, DeviceMatrix, ExpertArena, ExpertMix, ExpertProduct, GateLogits,
+    GemvInput, Kernels, Q8kRows, Routing, Stream, EXPERT_GROUP, EXPERT_WIDE, Q8K_BLOCK,
 };
 use kinetic_quant::{Matrix, TensorType};
 
 use super::{cuda_error, Gpu};
-use crate::blocks::{Gating, Moe, Pick};
+use crate::blocks::{Gating, Glu, Job, Moe, Pick};
+use crate::offload::{cache, plan, stats};
 use crate::LoadError;
 
 pub(super) use offload::Offload;
+pub(super) use plan::device_reserve;
 pub use plan::Plan;
 pub use plan::PoolPlan;
-pub(super) use plan::DEVICE_RESERVE;
 pub use stats::Stats;
 pub(super) use work::{ExpertDims, ExpertWork};
 
@@ -66,10 +68,15 @@ impl CudaExperts {
         shared: bool,
     ) -> Result<CudaExperts, LoadError> {
         check_types(moe)?;
-        if !moe.plain() {
+        for m in [&moe.gate, &moe.up, &moe.down] {
+            if form::device_type(m.ty) != m.ty {
+                let grown = form::matrix_bytes(m) as isize - m.expert_bytes() as isize;
+                gpu.expanded.add(m.ty, grown * moe.n_experts() as isize);
+            }
+        }
+        if moe.norms.is_some() || moe.glu == Glu::Gelu {
             return Err(LoadError(
-                "expert scales, norms and activations other than SiLU do not run on CUDA yet"
-                    .into(),
+                "expert norms and GELU experts do not run on CUDA yet".into(),
             ));
         }
         let routers = [Some(&moe.router), next];
@@ -135,59 +142,120 @@ impl CudaExperts {
         off: &mut Offload,
         n: usize,
     ) -> kinetic_cuda::Result<()> {
+        self.send(l, gpu, h, work, off, n)?;
+        self.finish(l, gpu, h, y, work, off, n)?;
+        self.gather(l, gpu, y, work, off, n)
+    }
+
+    /// The part of [`CudaExperts::mix`] before the host reads the routing,
+    /// which a graph can record: `h` quantized for the experts, and the
+    /// scores and `h` queued to be read back. Nothing with every expert on
+    /// the device.
+    pub fn send(
+        &self,
+        l: usize,
+        gpu: &Gpu,
+        h: &DeviceBuffer<f32>,
+        work: &mut ExpertWork,
+        off: &Offload,
+        n: usize,
+    ) -> kinetic_cuda::Result<()> {
         if off.is_resident() {
-            return self.mix_resident(l, gpu, h, y, work, off, n);
+            return Ok(());
         }
         let (k, stream) = (&gpu.kernels, &gpu.stream);
         let moe = &off.moes[l];
-        let (d, n_exp, picks_per) = (moe.router.cols, self.n_experts, moe.n_used);
-        let gating = moe.gating.clone();
-        let g = self.gates.rows();
-        k.quantize_q8k(h, n, d, &mut work.hq, &mut work.hd, stream)?;
-        // SAFETY: the host reads the buffer only after the synchronization
-        // below.
+        let (d, g) = (moe.router.cols, self.gates.rows());
+        let ty = form::device_type(moe.gate.ty);
+        quantize(k, ty, h, n, d, &mut work.hq, &mut work.hd, stream)?;
+        // SAFETY: the host reads the buffer only after `work.ready`, which
+        // [`CudaExperts::finish`] records next.
         unsafe {
-            work.down.download(0, &work.gates, 0..n * g, stream)?;
-            work.down.download(n * g, h, 0..n * d, stream)?;
+            k.to_host(&mut work.down, 0, &work.gates, 0..n * g, stream)?;
+            k.to_host(&mut work.down, n * g, h, 0..n * d, stream)
         }
-        stream.synchronize()?;
+    }
+
+    /// The part of [`CudaExperts::mix`] after [`CudaExperts::send`] that
+    /// reads the routing: the experts run, and the host's outputs queued
+    /// to be copied over.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish(
+        &self,
+        l: usize,
+        gpu: &Gpu,
+        h: &DeviceBuffer<f32>,
+        y: &mut DeviceBuffer<f32>,
+        work: &mut ExpertWork,
+        off: &mut Offload,
+        n: usize,
+    ) -> kinetic_cuda::Result<()> {
+        if off.is_resident() {
+            return self.mix_resident(l, gpu, h, y, work, off, n);
+        }
+        let stream = &gpu.stream;
+        let moe = &off.moes[l];
+        let (d, n_exp, picks_per) = (moe.router.cols, self.n_experts, moe.n_used);
+        let (gating, weight_scale) = (moe.gating.clone(), moe.weight_scale);
+        let size = group_size(&gpu.kernels, moe, n);
+        let g = self.gates.rows();
+        work.ready.record(stream)?;
+        off.wait(&work.ready)?;
         let down = work.down.as_slice();
         let (gates, h) = (down[..n * g].to_vec(), down[n * g..n * g + n * d].to_vec());
 
         let picks: Vec<Pick> = gates
             .chunks_exact(g)
             .flat_map(|row| gating.pick(&mut row[..n_exp].to_vec(), picks_per))
+            .map(|p| Pick {
+                weight: p.weight * weight_scale,
+                ..p
+            })
             .collect();
         let place = off.route(l, &picks, gpu)?;
-        let assigned = work.assign(&picks, &place, stream)?;
+        let assigned = work.assign(&picks, &place, size, stream)?;
         // Cached groups come first, then transit groups.
         let parts = [
             (off.arena(l), 0, assigned.cached),
             (off.transit_arena(), assigned.cached, assigned.transit),
         ];
-        self.queue_device(l, gpu, work, off, assigned.device, &parts)?;
-
-        let predicted = if self.predicts {
-            predict(&gates, &gating, n_exp, picks_per, g)
-        } else {
-            Vec::new()
-        };
-        let prefetch = off.admit_predicted(l + 1, &predicted)?;
-        let (lens, outputs) = off.stage_and_run(l, &prefetch, &h, &assigned.host);
-        off.queue_prefetch(l + 1, &prefetch, &lens)?;
+        self.queue_device(l, gpu, work, off, (assigned.device, n.min(size)), &parts)?;
+        if self.predicts {
+            off.admit_predicted(l + 1, &predict(&gates, &gating, n_exp, picks_per, g));
+        }
+        let outputs = off.run_jobs(l, &h, &assigned.host);
         if !assigned.host.is_empty() {
             let len = outputs.len();
             work.host_out.as_mut_slice()[..len].copy_from_slice(&outputs);
             // SAFETY: the region is rewritten only after the next layer's
-            // synchronization of this stream.
+            // event on this stream has passed.
             unsafe {
                 work.host_out
                     .upload(0..len, &mut work.out, assigned.device * d, stream)?
             };
         }
-        // SAFETY: every row index points at a device or host output written
-        // above, inside the room for a full batch of assignments.
-        unsafe { self.combine(gpu, work, y, n, d, picks_per) }
+        Ok(())
+    }
+
+    /// The rest of [`CudaExperts::mix`] after [`CudaExperts::finish`], which
+    /// a graph can record: the picks' outputs weighted into `y`. Nothing
+    /// with every expert on the device, whose finish does it.
+    pub fn gather(
+        &self,
+        l: usize,
+        gpu: &Gpu,
+        y: &mut DeviceBuffer<f32>,
+        work: &ExpertWork,
+        off: &Offload,
+        n: usize,
+    ) -> kinetic_cuda::Result<()> {
+        if off.is_resident() {
+            return Ok(());
+        }
+        let moe = &off.moes[l];
+        // SAFETY: finish pointed every row index at a device or host output,
+        // inside the room for a full batch of assignments.
+        unsafe { self.combine(gpu, work, y, n, moe.router.cols, moe.n_used) }
     }
 
     /// [`CudaExperts::mix`] with every expert on the device: the routing,
@@ -208,7 +276,8 @@ impl CudaExperts {
         let moe = &off.moes[l];
         let (d, picks_per) = (moe.router.cols, moe.n_used);
         let a = n * picks_per;
-        k.quantize_q8k(h, n, d, &mut work.hq, &mut work.hd, stream)?;
+        let ty = form::device_type(moe.gate.ty);
+        quantize(k, ty, h, n, d, &mut work.hq, &mut work.hd, stream)?;
         let routing = Routing {
             gates: &work.gates,
             tokens: n,
@@ -217,9 +286,11 @@ impl CudaExperts {
             stride: self.gates.rows(),
             sigmoid: matches!(moe.gating, Gating::Sigmoid { .. }),
             bias: self.bias.as_ref(),
+            scale: moe.weight_scale,
         };
         k.moe_route(&routing, &mut work.experts, &mut work.weights, stream)?;
         let slots = &off.resident.as_ref().expect("resident experts")[l];
+        let size = group_size(k, moe, n);
         k.moe_assign(
             &work.experts,
             a,
@@ -227,11 +298,12 @@ impl CudaExperts {
             slots,
             &mut work.groups,
             a,
+            size,
             &mut work.inputs,
             &mut work.rows,
             stream,
         )?;
-        self.queue_device(l, gpu, work, off, a, &[(off.arena(l), 0, a)])?;
+        self.queue_device(l, gpu, work, off, (a, n.min(size)), &[(off.arena(l), 0, a)])?;
         if l == 0 {
             off.stats.tokens += n as u64;
         }
@@ -275,16 +347,17 @@ impl CudaExperts {
         unsafe { gpu.kernels.moe_combine(&mix, y, &gpu.stream) }
     }
 
-    /// Queues the device's `assignments`: gate and up products, their
-    /// activation quantized again, and the down products into `work.out`,
-    /// each part's groups, from its first, reading that part's arena.
+    /// Queues the device's `assignments`, in groups of at most `most`: gate
+    /// and up products, their activation quantized again, and the down
+    /// products into `work.out`, each part's groups, from its first, reading
+    /// that part's arena.
     fn queue_device(
         &self,
         l: usize,
         gpu: &Gpu,
         work: &mut ExpertWork,
         off: &Offload,
-        assignments: usize,
+        (assignments, most): (usize, usize),
         parts: &[(ExpertArena, usize, usize)],
     ) -> kinetic_cuda::Result<()> {
         if assignments == 0 {
@@ -294,7 +367,7 @@ impl CudaExperts {
         let moe = &off.moes[l];
         let layout = off.layouts[l];
         let product = |first_group, n_groups, gated: bool| ExpertProduct {
-            ty: if gated { moe.gate.ty } else { moe.down.ty },
+            ty: form::device_type(if gated { moe.gate.ty } else { moe.down.ty }),
             groups: &work.groups,
             first_group,
             n_groups,
@@ -304,6 +377,16 @@ impl CudaExperts {
             second: gated.then_some(layout.gate),
             rows: if gated { moe.gate.rows } else { moe.down.rows },
             cols: if gated { moe.gate.cols } else { moe.down.cols },
+            situ: match moe.glu {
+                Glu::Silu => None,
+                Glu::Situ { beta, linear } => Some((beta, linear)),
+                Glu::Gelu => unreachable!("GELU experts are refused at upload"),
+            },
+            scales: (layout.scales > 0).then_some((
+                layout.gate + layout.up + layout.down,
+                if gated { 0 } else { 2 },
+            )),
+            most,
         };
         let hq = Q8kRows {
             qs: &work.hq,
@@ -317,7 +400,9 @@ impl CudaExperts {
             // of the batch.
             unsafe { k.moe_product(&p, arena, &off.tables, &hq, &mut work.act, stream)? };
         }
-        k.quantize_q8k(
+        quantize(
+            k,
+            form::device_type(moe.down.ty),
             &work.act,
             assignments,
             moe.down.cols,
@@ -338,6 +423,46 @@ impl CudaExperts {
     }
 }
 
+/// Assignments per group for a batch of `tokens` through `moe`'s experts:
+/// wide groups, run on tensor cores, once the batch is large enough to give
+/// experts many tokens each, if the device has forms for both types.
+fn group_size(k: &Kernels, moe: &Moe, tokens: usize) -> usize {
+    let wide = [moe.gate.ty, moe.down.ty]
+        .into_iter()
+        .all(|ty| k.moe_wide(form::device_type(ty)));
+    match wide && tokens >= EXPERT_WIDE {
+        true => EXPERT_WIDE,
+        false => EXPERT_GROUP,
+    }
+}
+
+/// Queues quantizing `rows` rows of `cols` values of `x` for experts of type
+/// `ty`, in its blocks.
+#[allow(clippy::too_many_arguments)]
+fn quantize(
+    k: &Kernels,
+    ty: TensorType,
+    x: &DeviceBuffer<f32>,
+    rows: usize,
+    cols: usize,
+    qs: &mut DeviceBuffer<i8>,
+    ds: &mut DeviceBuffer<f32>,
+    stream: &Stream,
+) -> kinetic_cuda::Result<()> {
+    match expert_block(ty) {
+        Q8K_BLOCK => k.quantize_q8k(x, rows, cols, qs, ds, stream),
+        _ => k.quantize_q8(x, rows * cols, qs, ds, stream),
+    }
+}
+
+/// [`Moe::run_experts`] as the device computes it, bit for bit.
+fn run_host(moe: &Moe, h: &[f32], jobs: &[Job]) -> Vec<f32> {
+    match exact::host_path_is_exact(moe) {
+        true => moe.run_experts(h, jobs),
+        false => exact::run_experts(moe, h, jobs),
+    }
+}
+
 /// The distinct experts the next layer's router picks for any token, from
 /// the scores after this layer's own in each row of `gates`; a guess, so
 /// this layer's gating stands in for the next one's.
@@ -353,10 +478,7 @@ fn predict(gates: &[f32], gating: &Gating, n_exp: usize, k: usize, g: usize) -> 
 }
 
 fn check_types(m: &Moe) -> Result<(), LoadError> {
-    let ok = [m.gate.ty, m.down.ty]
-        .iter()
-        .all(|t| EXPERT_TYPES.contains(t))
-        && m.gate.ty == m.up.ty;
+    let ok = [m.gate.ty, m.down.ty].into_iter().all(form::supported) && m.gate.ty == m.up.ty;
     if ok {
         Ok(())
     } else {

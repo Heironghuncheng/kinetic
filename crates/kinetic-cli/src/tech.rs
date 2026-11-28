@@ -15,16 +15,19 @@ pub enum Tech {
     Shortlist,
     Torque,
     Convoy,
+    /// Vulkan prompt passes on the matrix units (cooperative matrices).
+    Coopmat,
 }
 
 impl Tech {
-    pub const ALL: [Tech; 6] = [
+    pub const ALL: [Tech; 7] = [
         Tech::Rad1,
         Tech::WarmStart,
         Tech::ZeroWait,
         Tech::Shortlist,
         Tech::Torque,
         Tech::Convoy,
+        Tech::Coopmat,
     ];
 
     pub fn name(self) -> &'static str {
@@ -35,6 +38,7 @@ impl Tech {
             Tech::Shortlist => "Shortlist",
             Tech::Torque => "Torque",
             Tech::Convoy => "Convoy",
+            Tech::Coopmat => "cooperative matrices",
         }
     }
 
@@ -45,6 +49,7 @@ impl Tech {
             Tech::ZeroWait | Tech::Convoy => matches!(device, Device::Cpu | Device::Cuda),
             Tech::Shortlist => device == Device::Cpu,
             Tech::Torque => matches!(device, Device::Cuda | Device::Vulkan),
+            Tech::Coopmat => device == Device::Vulkan,
         }
     }
 
@@ -59,7 +64,9 @@ impl Tech {
 pub fn status(off: &[Tech], device: Device, among: &[Tech]) -> String {
     let (mut on, mut down) = (Vec::new(), Vec::new());
     for t in Tech::ALL.into_iter().filter(|t| among.contains(t)) {
-        if !t.runs_on(device) {
+        // a kernel path, not one of the named technologies: the device's
+        // name says when it runs
+        if !t.runs_on(device) || t == Tech::Coopmat {
             continue;
         }
         match (off.contains(&t), t.switchable_on(device)) {

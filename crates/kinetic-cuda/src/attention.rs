@@ -344,6 +344,18 @@ impl KvCache {
         self.k.load(at * self.kv_dim, k)?;
         self.v.load(at * self.kv_dim, v)
     }
+
+    /// The device addresses of the keys and values of an f16 cache.
+    pub(crate) fn f16_ptrs(&self) -> Result<(u64, u64)> {
+        match (&self.k, &self.v) {
+            (Store::F16(k), Store::F16(v)) => Ok((k.device_ptr(), v.device_ptr())),
+            _ => Err(Error::Shape("this attention needs an f16 cache".into())),
+        }
+    }
+
+    pub(crate) fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
 }
 
 #[repr(C)]

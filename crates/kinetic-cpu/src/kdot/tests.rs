@@ -228,7 +228,7 @@ fn pq2_0_matches_dequantized_dot() {
     check::<Q8K>(TensorType::PQ2_0);
     let scalar = scalar_kernel(TensorType::PQ2_0).unwrap();
     let fast = kernel(TensorType::PQ2_0).unwrap();
-    let mut rng = Lcg(5);
+    let mut rng = Lcg(0xb76e_579c_99e7_ab8a);
     for row in [
         random_row(TensorType::PQ2_0, 16, &mut rng),
         extreme_row(TensorType::PQ2_0, 16, &mut rng),
